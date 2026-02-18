@@ -1,0 +1,25 @@
+@import url('https://fonts.googleapis.com/css2?family=Exo+2:wght@400;500;600&display=swap');
+@import './base.css';
+@import './theme.css';
+@import './typography.css';
+
+a,
+.green {
+  text-decoration: none;
+  color: var(--vera-accent);
+  transition: 0.4s;
+  padding: 3px;
+}
+
+@media (hover: hover) {
+  a:hover {
+    background-color: var(--vera-accent-faint);
+  }
+}
+
+#app {
+  min-width: 20vw;
+  width: 100vw;
+  font-weight: normal;
+  z-index: 0;
+}

@@ -1,0 +1,549 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VERA MCP Server Configuration",
+  "description": "Configuration for Model Context Protocol servers managed by VERA's MCPOrchestrator",
+
+  "filesystem": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/nizbot-macmini/projects/Vera_2.0", "/tmp"],
+    "env": {},
+    "auto_start": true,
+    "startup_grace": 5,
+    "health_check_interval": 60,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["files"],
+    "description": "File system access for project directories"
+  },
+
+  "memory": {
+    "command": "scripts/run_memory_mcp.sh",
+    "args": [],
+    "env": {},
+    "auto_start": true,
+    "health_check_interval": 0,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["memory"],
+    "description": "Knowledge graph memory for persistent context"
+  },
+
+  "brave-search": {
+    "command": "python",
+    "args": ["mcp_server_and_tools/brave_search/mcp_server.py"],
+    "env": {
+      "BRAVE_API_KEY": "${BRAVE_API_KEY}",
+      "BRAVE_API_BASE_URL": "${BRAVE_API_BASE_URL}"
+    },
+    "required_env": ["BRAVE_API_KEY"],
+    "auto_start": true,
+    "health_check_interval": 30,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["web", "media"],
+    "description": "Brave Search API (web/news/images/video/local + summaries)"
+  },
+
+  "github": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "env": {
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    },
+    "required_env": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+    "auto_start": true,
+    "health_check_interval": 30,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["dev"],
+    "description": "GitHub repository operations"
+  },
+
+  "wikipedia-mcp": {
+    "command": "python",
+    "args": ["-m", "wikipedia_mcp"],
+    "env": {
+      "PYTHONPATH": "mcp_server_and_tools/wikipedia-mcp",
+      "WIKIPEDIA_ACCESS_TOKEN": "${WIKIPEDIA_ACCESS_TOKEN}",
+      "MCP_TRANSPORT": "stdio"
+    },
+    "auto_start": true,
+    "health_check_interval": 30,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["knowledge"],
+    "description": "Wikipedia MCP (full toolset with sections, citations, related topics)"
+  },
+
+  "grokipedia": {
+    "command": "python",
+    "args": ["-m", "grokipedia_mcp"],
+    "env": {
+      "PYTHONPATH": "mcp_server_and_tools/grokipedia-mcp",
+      "MCP_TRANSPORT": "stdio"
+    },
+    "auto_start": true,
+    "health_check_interval": 30,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["knowledge"],
+    "description": "Grokipedia knowledge base search + retrieval"
+  },
+
+  "pdf-reader": {
+    "command": "python",
+    "args": ["mcp_server_and_tools/mcp_pdf_reader/src/server.py"],
+    "env": {},
+    "auto_start": true,
+    "health_check_interval": 30,
+    "tool_timeout": 60,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["pdf"],
+    "description": "PDF document parsing and extraction"
+  },
+
+  "obsidian-vault": {
+    "command": "scripts/run_obsidian_mcp.sh",
+    "args": [],
+    "env": {
+      "OBSIDIAN_VAULT_PATH": "/home/nizbot-macmini/Documents/Veras_Vault"
+    },
+    "required_env": ["OBSIDIAN_VAULT_PATH"],
+    "auto_start": true,
+    "health_check_interval": 30,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["notes", "memory"],
+    "description": "Obsidian vault access via filesystem MCP"
+  },
+
+  "composio": {
+    "command": "npx",
+    "args": ["-y", "mcp-remote", "https://backend.composio.dev/tool_router/trs_5vLNM9HJkcX8/mcp", "--header", "x-api-key:${COMPOSIO_API_KEY}"],
+    "env": {
+      "COMPOSIO_API_KEY": "${COMPOSIO_API_KEY}"
+    },
+    "required_env": ["COMPOSIO_API_KEY"],
+    "auto_start": true,
+    "startup_grace": 10,
+    "health_check_interval": 60,
+    "tool_timeout": 60,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["social", "email", "automation"],
+    "description": "Composio hub (500+ apps: Facebook, Twitter/X, AgentMail, and more)"
+  },
+
+  "memvid": {
+    "command": "scripts/run_memvid_mcp.sh",
+    "args": [],
+    "env": {
+      "MEMVID_USE_GPU": "${MEMVID_USE_GPU}",
+      "MEMVID_CUDA_VISIBLE_DEVICES": "${MEMVID_CUDA_VISIBLE_DEVICES}"
+    },
+    "auto_start": true,
+    "startup_grace": 10,
+    "health_check_interval": 120,
+    "tool_timeout": 120,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["media", "memory"],
+    "description": "Video memory archival with semantic search"
+  },
+
+  "youtube-transcript": {
+    "command": "scripts/run_youtube_transcript_mcp.sh",
+    "args": [],
+    "env": {
+      "YOUTUBE_API_KEY": "${YOUTUBE_API_KEY}",
+      "YOUTUBE_API_KEY_PATH": "${YOUTUBE_API_KEY_PATH}",
+      "YTDLP_PATH": "${YTDLP_PATH}",
+      "YTDLP_TIMEOUT_MS": "${YTDLP_TIMEOUT_MS}"
+    },
+    "auto_start": true,
+    "startup_grace": 5,
+    "health_check_interval": 30,
+    "tool_timeout": 60,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["media", "web", "knowledge"],
+    "description": "YouTube transcript retrieval with yt-dlp fallback"
+  },
+
+  "searxng": {
+    "command": "python",
+    "args": ["mcp_server_and_tools/searxng/mcp_server.py"],
+    "env": {
+      "SEARXNG_BASE_URL": "${SEARXNG_BASE_URL}"
+    },
+    "required_env": ["SEARXNG_BASE_URL"],
+    "auto_start": true,
+    "health_check_interval": 30,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["web"],
+    "description": "Privacy-focused web search via SearxNG"
+  },
+
+  "sequential-thinking": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+    "env": {},
+    "auto_start": true,
+    "health_check_interval": 30,
+    "tool_timeout": 60,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["reasoning"],
+    "description": "Dynamic problem decomposition and chain-of-thought reasoning"
+  },
+
+  "time": {
+    "command": "python",
+    "args": ["mcp_server_and_tools/mcp_time/server.py"],
+    "env": {},
+    "auto_start": true,
+    "startup_grace": 5,
+    "health_check_interval": 60,
+    "tool_timeout": 10,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["time"],
+    "description": "Time and timezone utilities (local MCP server)"
+  },
+
+  "calculator": {
+    "command": "python",
+    "args": ["mcp_server_and_tools/mcp_calculator/server.py"],
+    "env": {},
+    "auto_start": true,
+    "startup_grace": 5,
+    "health_check_interval": 60,
+    "tool_timeout": 10,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["math", "utility"],
+    "description": "Calculator: arithmetic, unit conversion, percentages, statistics"
+  },
+
+  "google-workspace": {
+    "command": "scripts/run_google_workspace_mcp.sh",
+    "args": [],
+    "env": {
+      "GOOGLE_CLIENT_SECRET_PATH": "${GOOGLE_CLIENT_SECRET_PATH}",
+      "GOOGLE_OAUTH_CLIENT_ID": "${GOOGLE_OAUTH_CLIENT_ID}",
+      "GOOGLE_OAUTH_CLIENT_SECRET": "${GOOGLE_OAUTH_CLIENT_SECRET}",
+      "GOOGLE_OAUTH_REDIRECT_URI": "${GOOGLE_OAUTH_REDIRECT_URI}",
+      "REDIRECT_URL": "${GOOGLE_OAUTH_REDIRECT_URI}",
+      "GOOGLE_REDIRECT_URI": "${GOOGLE_OAUTH_REDIRECT_URI}",
+      "WORKSPACE_MCP_PORT": "${WORKSPACE_MCP_PORT}",
+      "GOOGLE_WORKSPACE_CRED_DIR": "${GOOGLE_WORKSPACE_CRED_DIR}",
+      "OAUTHLIB_INSECURE_TRANSPORT": "${OAUTHLIB_INSECURE_TRANSPORT}",
+      "GOOGLE_WORKSPACE_TOOL_TIER": "${GOOGLE_WORKSPACE_TOOL_TIER}"
+    },
+    "required_env": [
+      "GOOGLE_OAUTH_CLIENT_ID",
+      "GOOGLE_OAUTH_CLIENT_SECRET",
+      "GOOGLE_OAUTH_REDIRECT_URI"
+    ],
+    "auto_start": true,
+    "startup_grace": 10,
+    "health_check_interval": 30,
+    "tool_timeout": 60,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["workspace"],
+    "description": "Google Workspace MCP (community server)"
+  },
+
+
+  "__comment_tier1": "=== VERA 2.0 Tier 1: Direct MCP Servers ===",
+
+  "stealth-browser": {
+    "command": "scripts/run_stealth_browser_mcp.sh",
+    "args": [],
+    "env": {},
+    "auto_start": true,
+    "startup_grace": 10,
+    "health_check_interval": 30,
+    "tool_timeout": 120,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["web", "browser", "scraping"],
+    "description": "Stealth browser automation (90 tools, Cloudflare bypass, anti-bot evasion)"
+  },
+
+  "x-twitter": {
+    "command": "scripts/run_x_twitter_mcp.sh",
+    "args": [],
+    "env": {
+      "TWITTER_API_KEY": "${TWITTER_API_KEY}",
+      "TWITTER_API_SECRET": "${TWITTER_API_SECRET}",
+      "TWITTER_ACCESS_TOKEN": "${TWITTER_ACCESS_TOKEN}",
+      "TWITTER_ACCESS_TOKEN_SECRET": "${TWITTER_ACCESS_TOKEN_SECRET}",
+      "TWITTER_BEARER_TOKEN": "${TWITTER_BEARER_TOKEN}"
+    },
+    "required_env": [
+      "TWITTER_API_KEY",
+      "TWITTER_API_SECRET",
+      "TWITTER_ACCESS_TOKEN",
+      "TWITTER_ACCESS_TOKEN_SECRET",
+      "TWITTER_BEARER_TOKEN"
+    ],
+    "auto_start": true,
+    "startup_grace": 5,
+    "health_check_interval": 30,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["social"],
+    "description": "X/Twitter: post, read, search, trends, user profiles, polls (30+ tools)"
+  },
+
+  "scrapeless": {
+    "command": "npx",
+    "args": ["-y", "scrapeless-mcp-server"],
+    "env": {
+      "SCRAPELESS_KEY": "${SCRAPELESS_KEY}"
+    },
+    "required_env": ["SCRAPELESS_KEY"],
+    "auto_start": true,
+    "startup_grace": 5,
+    "health_check_interval": 30,
+    "tool_timeout": 60,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["web", "scraping"],
+    "description": "Scrapeless structured web scraping and data extraction"
+  },
+
+  "marm-memory": {
+    "command": "scripts/run_marm_mcp.sh",
+    "args": [],
+    "env": {
+      "MARM_DB_PATH": "${MARM_DB_PATH}"
+    },
+    "auto_start": true,
+    "startup_grace": 10,
+    "health_check_interval": 30,
+    "tool_timeout": 30,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["memory"],
+    "description": "MARM cross-platform AI memory: sessions, notebooks, semantic search (18 tools)"
+  },
+
+  "browserbase": {
+    "command": "npx",
+    "args": ["-y", "@browserbasehq/mcp-server-browserbase"],
+    "env": {
+      "BROWSERBASE_API_KEY": "${BROWSERBASE_API_KEY}",
+      "BROWSERBASE_PROJECT_ID": "${BROWSERBASE_PROJECT_ID}",
+      "GEMINI_API_KEY": "${GEMINI_API_KEY}"
+    },
+    "required_env": ["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    "auto_start": true,
+    "startup_grace": 10,
+    "health_check_interval": 60,
+    "tool_timeout": 120,
+    "max_restart_attempts": 3,
+    "restart_backoff": 5,
+    "categories": ["web", "browser"],
+    "description": "Cloud browser automation via Browserbase + Stagehand (stealth, proxies)"
+  },
+
+  "call-me": {
+    "command": "scripts/run_call_me_mcp.sh",
+    "args": [],
+    "env": {
+      "CALLME_PHONE_PROVIDER": "${CALLME_PHONE_PROVIDER}",
+      "CALLME_PHONE_ACCOUNT_SID": "${CALLME_PHONE_ACCOUNT_SID}",
+      "CALLME_PHONE_AUTH_TOKEN": "${CALLME_PHONE_AUTH_TOKEN}",
+      "CALLME_PHONE_NUMBER": "${CALLME_PHONE_NUMBER}",
+      "CALLME_USER_PHONE_NUMBER": "${CALLME_USER_PHONE_NUMBER}",
+      "CALLME_USER_NAME": "${CALLME_USER_NAME}",
+      "CALLME_ASSISTANT_NAME": "${CALLME_ASSISTANT_NAME}",
+      "CALLME_GREETING_TEMPLATE": "${CALLME_GREETING_TEMPLATE}",
+      "CALLME_HANGUP_DELAY_MS": "${CALLME_HANGUP_DELAY_MS}",
+      "CALLME_OPENAI_API_KEY": "${CALLME_OPENAI_API_KEY}",
+      "CALLME_VOICE_PROVIDER": "${CALLME_VOICE_PROVIDER}",
+      "CALLME_VOICE_API_KEY": "${CALLME_VOICE_API_KEY}",
+      "CALLME_VOICE_WS_URL": "${CALLME_VOICE_WS_URL}",
+      "CALLME_VOICE_MODEL": "${CALLME_VOICE_MODEL}",
+      "CALLME_VOICE_NAME": "${CALLME_VOICE_NAME}",
+      "CALLME_TTS_VOICE": "${CALLME_TTS_VOICE}",
+      "CALLME_TTS_INSTRUCTIONS": "${CALLME_TTS_INSTRUCTIONS}",
+      "CALLME_TELNYX_PUBLIC_KEY": "${CALLME_TELNYX_PUBLIC_KEY}",
+      "CALLME_SMS_MODE": "${CALLME_SMS_MODE}",
+      "CALLME_SMS_ENABLED": "${CALLME_SMS_ENABLED}",
+      "CALLME_SMS_FROM_NUMBER": "${CALLME_SMS_FROM_NUMBER}",
+      "CALLME_MESSAGING_PROFILE_ID": "${CALLME_MESSAGING_PROFILE_ID}",
+      "CALLME_SMS_AUTOREPLY": "${CALLME_SMS_AUTOREPLY}",
+      "CALLME_SMS_CHAT_URL": "${CALLME_SMS_CHAT_URL}",
+      "CALLME_SMS_CHAT_MODEL": "${CALLME_SMS_CHAT_MODEL}",
+      "CALLME_SMS_CHAT_SYSTEM_PROMPT": "${CALLME_SMS_CHAT_SYSTEM_PROMPT}",
+      "CALLME_SMS_CHAT_API_KEY": "${CALLME_SMS_CHAT_API_KEY}",
+    "CALLME_SMS_CHAT_TIMEOUT_MS": "${CALLME_SMS_CHAT_TIMEOUT_MS}",
+    "CALLME_SMS_DELIVERY_WAIT_MS": "${CALLME_SMS_DELIVERY_WAIT_MS}",
+    "CALLME_SMS_DELIVERY_POLL_MS": "${CALLME_SMS_DELIVERY_POLL_MS}",
+    "CALLME_SMS_CHAT_MAX_TOKENS": "${CALLME_SMS_CHAT_MAX_TOKENS}",
+    "CALLME_SMS_CHAT_TEMPERATURE": "${CALLME_SMS_CHAT_TEMPERATURE}",
+    "CALLME_SMS_CHAT_MAX_HISTORY": "${CALLME_SMS_CHAT_MAX_HISTORY}",
+    "CALLME_SYNC_MESSAGING_WEBHOOK": "${CALLME_SYNC_MESSAGING_WEBHOOK}",
+    "CALLME_PUSH_ENABLED": "${CALLME_PUSH_ENABLED}",
+      "CALLME_PUSH_API_URL": "${CALLME_PUSH_API_URL}",
+      "CALLME_PUSH_API_KEY": "${CALLME_PUSH_API_KEY}",
+      "CALLME_PUSH_TITLE": "${CALLME_PUSH_TITLE}",
+      "CALLME_PUSH_ICON": "${CALLME_PUSH_ICON}",
+      "CALLME_PUSH_BADGE": "${CALLME_PUSH_BADGE}",
+      "CALLME_NATIVE_PUSH_ENABLED": "${CALLME_NATIVE_PUSH_ENABLED}",
+      "CALLME_NATIVE_PUSH_API_URL": "${CALLME_NATIVE_PUSH_API_URL}",
+      "CALLME_NATIVE_PUSH_API_KEY": "${CALLME_NATIVE_PUSH_API_KEY}",
+      "CALLME_NATIVE_PUSH_TITLE": "${CALLME_NATIVE_PUSH_TITLE}",
+      "CALLME_ALLOWED_RECIPIENTS_FILE": "${CALLME_ALLOWED_RECIPIENTS_FILE}",
+      "CALLME_NGROK_DOMAIN": "${CALLME_NGROK_DOMAIN}",
+      "CALLME_NGROK_POOLING": "${CALLME_NGROK_POOLING}",
+      "CALLME_NGROK_AUTHTOKEN": "${CALLME_NGROK_AUTHTOKEN}",
+      "CALLME_PORT": "${CALLME_PORT}"
+    },
+    "required_env": [
+      "CALLME_PHONE_ACCOUNT_SID",
+      "CALLME_PHONE_AUTH_TOKEN",
+      "CALLME_PHONE_NUMBER",
+      "CALLME_USER_PHONE_NUMBER",
+      "CALLME_VOICE_API_KEY",
+      "CALLME_NGROK_AUTHTOKEN"
+    ],
+    "auto_start": true,
+    "startup_grace": 10,
+    "health_check_interval": 60,
+    "tool_timeout": 300,
+    "max_restart_attempts": 2,
+    "restart_backoff": 10,
+    "categories": ["phone", "voice", "messaging", "sms", "mms"],
+    "description": "Phone/SMS/MMS via Telnyx/Twilio with one-way voice delivery"
+  },
+
+
+  "__comment_tier2": "=== VERA 2.0 Tier 2: Extended Capabilities ===",
+
+  "sandbox": {
+    "command": "scripts/run_sandbox_mcp.sh",
+    "args": [],
+    "env": {
+      "SANDBOX_PORT": "${SANDBOX_PORT}"
+    },
+    "auto_start": true,
+    "startup_grace": 15,
+    "health_check_interval": 120,
+    "tool_timeout": 120,
+    "max_restart_attempts": 2,
+    "restart_backoff": 10,
+    "categories": ["execution", "sandbox", "dev"],
+    "description": "AIO Sandbox: isolated shell, browser, file, Python, Node.js execution in Docker container"
+  },
+
+  "voxcpm": {
+    "command": "scripts/run_voxcpm_mcp.sh",
+    "args": [],
+    "env": {
+      "VOXCPM_MODEL": "${VOXCPM_MODEL}",
+      "VOXCPM_OUTPUT_DIR": "${VOXCPM_OUTPUT_DIR}"
+    },
+    "auto_start": false,
+    "startup_grace": 30,
+    "health_check_interval": 120,
+    "tool_timeout": 120,
+    "max_restart_attempts": 2,
+    "restart_backoff": 10,
+    "categories": ["voice", "media"],
+    "description": "VoxCPM text-to-speech and zero-shot voice cloning (800M params, 44.1kHz). Requires PyTorch manual setup — degraded on Pi ARM64."
+  },
+
+  "nofx-trading": {
+    "command": "scripts/run_nofx.sh",
+    "args": [],
+    "env": {
+      "JWT_SECRET": "${NOFX_JWT_SECRET}",
+      "NOFX_BACKEND_PORT": "${NOFX_BACKEND_PORT}"
+    },
+    "auto_start": false,
+    "startup_grace": 15,
+    "health_check_interval": 60,
+    "tool_timeout": 60,
+    "max_restart_attempts": 2,
+    "restart_backoff": 10,
+    "categories": ["finance", "trading"],
+    "description": "NOFX AI trading OS: multi-exchange crypto futures, AI debate arena, backtesting. Needs MCP bridge — not yet wired."
+  },
+
+  "os-computer-use": {
+    "command": "python",
+    "args": ["mcp_server_and_tools/os-ai-computer-use/main.py"],
+    "env": {
+      "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
+    },
+    "required_env": ["ANTHROPIC_API_KEY"],
+    "auto_start": false,
+    "startup_grace": 10,
+    "health_check_interval": 0,
+    "tool_timeout": 120,
+    "max_restart_attempts": 2,
+    "restart_backoff": 10,
+    "categories": ["desktop", "automation"],
+    "description": "OS-agnostic AI computer control (screenshots, mouse, keyboard, apps). Requires ANTHROPIC_API_KEY — pinned for x86."
+  },
+
+  "multibot-ollama": {
+    "command": "python",
+    "args": ["mcp_server_and_tools/MultiBot/multibot.py"],
+    "env": {
+      "OLLAMA_HOST": "${OLLAMA_HOST}"
+    },
+    "auto_start": false,
+    "startup_grace": 10,
+    "health_check_interval": 60,
+    "tool_timeout": 120,
+    "max_restart_attempts": 2,
+    "restart_backoff": 10,
+    "categories": ["llm", "local"],
+    "description": "MultiBot local LLM orchestration via Ollama (multi-agent living rooms). Requires Ollama — pinned for x86."
+  },
+
+  "android-emulator": {
+    "command": "docker",
+    "args": ["compose", "-f", "mcp_server_and_tools/docker-android/docker-compose.yml", "up", "android-emulator"],
+    "env": {},
+    "auto_start": false,
+    "startup_grace": 60,
+    "health_check_interval": 120,
+    "tool_timeout": 60,
+    "max_restart_attempts": 1,
+    "restart_backoff": 30,
+    "categories": ["mobile", "automation"],
+    "description": "Android emulator in Docker with ADB access (+ android-action-kernel for AI control). x86-only — pinned for x86."
+  },
+
+  "mcpcan": {
+    "command": "make",
+    "args": ["-C", "mcp_server_and_tools/mcpcan", "run"],
+    "env": {},
+    "auto_start": false,
+    "startup_grace": 30,
+    "health_check_interval": 120,
+    "tool_timeout": 60,
+    "max_restart_attempts": 1,
+    "restart_backoff": 30,
+    "categories": ["infrastructure", "management"],
+    "description": "MCPCAN: centralized MCP service management platform (Kubernetes, monitoring, auth). Requires Go build + multi-service deploy — pinned for x86."
+  }
+}

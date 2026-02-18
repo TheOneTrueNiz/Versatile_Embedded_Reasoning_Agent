@@ -1,0 +1,25 @@
+{
+  "triggers": [
+    {
+      "name": "reminder_push_bundle",
+      "enabled": true,
+      "contains": [
+        "set a reminder with a push",
+        "notify and remind me",
+        "calendar reminder plus push"
+      ],
+      "tool_chain": ["create_event", "send_native_push"],
+      "confidence": 0.95
+    },
+    {
+      "name": "archive_summary_bundle",
+      "enabled": true,
+      "contains": [
+        "summarize what we decided",
+        "recap this thread and archive context"
+      ],
+      "tool_chain": ["search_archive", "recursive_summarize"],
+      "confidence": 0.9
+    }
+  ]
+}

@@ -1,0 +1,639 @@
+:root {
+  color-scheme: dark;
+  --vera-font-sans: "Exo 2", "Segoe UI", "Helvetica Neue", sans-serif;
+  --vera-font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  --vera-font-header: var(--vera-font-sans);
+  --vera-font-sidebar: var(--vera-font-sans);
+  --vera-font-messages: var(--vera-font-sans);
+  --vera-font-input: var(--vera-font-sans);
+  --vera-text-header: var(--vera-text);
+  --vera-text-sidebar: var(--vera-text);
+  --vera-text-messages: var(--vera-text);
+  --vera-text-input: var(--vera-text);
+  --vera-text-muted-custom: var(--vera-text-muted);
+  --vera-bg: #0b0f14;
+  --vera-surface: #111823;
+  --vera-panel: #151c28;
+  --vera-panel-alt: #1a2230;
+  --vera-panel-muted: #0f141d;
+  --vera-text: #d4dee7;
+  --vera-text-muted: #8ea0b4;
+  --vera-border: rgba(120, 170, 255, 0.14);
+  --vera-accent: #0099ff;
+  --vera-accent-strong: #1aabff;
+  --vera-accent-soft: rgba(0, 153, 255, 0.22);
+  --vera-accent-faint: rgba(0, 153, 255, 0.12);
+  --vera-secondary: #a78bfa;
+  --vera-secondary-soft: rgba(167, 139, 250, 0.22);
+  --vera-secondary-faint: rgba(167, 139, 250, 0.12);
+  --vera-warning: #d28b2f;
+  --vera-success: #2bb37a;
+  --vera-danger: #e06464;
+  --vera-info: #60a5fa;
+  --vera-shadow: rgba(0, 0, 0, 0.45);
+  --vera-shadow-rgb: 0, 0, 0;
+  --vera-contrast-rgb: 255, 255, 255;
+  --vera-accent-rgb: 0, 153, 255;
+  --vera-secondary-rgb: 167, 139, 250;
+  --vera-success-rgb: 43, 179, 122;
+  --vera-warning-rgb: 210, 139, 47;
+  --vera-error-rgb: 224, 100, 100;
+  --vera-info-rgb: 96, 165, 250;
+  --vera-accent-02: rgba(var(--vera-accent-rgb), 0.02);
+  --vera-accent-03: rgba(var(--vera-accent-rgb), 0.03);
+  --vera-accent-04: rgba(var(--vera-accent-rgb), 0.04);
+  --vera-accent-06: rgba(var(--vera-accent-rgb), 0.06);
+  --vera-accent-08: rgba(var(--vera-accent-rgb), 0.08);
+  --vera-accent-10: rgba(var(--vera-accent-rgb), 0.10);
+  --vera-accent-12: rgba(var(--vera-accent-rgb), 0.12);
+  --vera-accent-15: rgba(var(--vera-accent-rgb), 0.15);
+  --vera-accent-18: rgba(var(--vera-accent-rgb), 0.18);
+  --vera-accent-20: rgba(var(--vera-accent-rgb), 0.20);
+  --vera-accent-25: rgba(var(--vera-accent-rgb), 0.25);
+  --vera-accent-30: rgba(var(--vera-accent-rgb), 0.30);
+  --vera-accent-35: rgba(var(--vera-accent-rgb), 0.35);
+  --vera-accent-40: rgba(var(--vera-accent-rgb), 0.40);
+  --vera-accent-45: rgba(var(--vera-accent-rgb), 0.45);
+  --vera-accent-50: rgba(var(--vera-accent-rgb), 0.50);
+  --vera-accent-60: rgba(var(--vera-accent-rgb), 0.60);
+  --vera-accent-70: rgba(var(--vera-accent-rgb), 0.70);
+  --vera-accent-80: rgba(var(--vera-accent-rgb), 0.80);
+  --vera-accent-85: rgba(var(--vera-accent-rgb), 0.85);
+  --vera-accent-90: rgba(var(--vera-accent-rgb), 0.90);
+  --vera-secondary-02: rgba(var(--vera-secondary-rgb), 0.02);
+  --vera-secondary-05: rgba(var(--vera-secondary-rgb), 0.05);
+  --vera-secondary-08: rgba(var(--vera-secondary-rgb), 0.08);
+  --vera-secondary-10: rgba(var(--vera-secondary-rgb), 0.10);
+  --vera-secondary-15: rgba(var(--vera-secondary-rgb), 0.15);
+  --vera-secondary-20: rgba(var(--vera-secondary-rgb), 0.20);
+  --vera-secondary-25: rgba(var(--vera-secondary-rgb), 0.25);
+  --vera-secondary-30: rgba(var(--vera-secondary-rgb), 0.30);
+  --vera-secondary-35: rgba(var(--vera-secondary-rgb), 0.35);
+  --vera-secondary-40: rgba(var(--vera-secondary-rgb), 0.40);
+  --vera-secondary-50: rgba(var(--vera-secondary-rgb), 0.50);
+  --vera-secondary-60: rgba(var(--vera-secondary-rgb), 0.60);
+  --vera-secondary-80: rgba(var(--vera-secondary-rgb), 0.80);
+  --vera-success-60: rgba(var(--vera-success-rgb), 0.60);
+  --vera-warning-60: rgba(var(--vera-warning-rgb), 0.60);
+  --vera-error-60: rgba(var(--vera-error-rgb), 0.60);
+  --vera-info-60: rgba(var(--vera-info-rgb), 0.60);
+  --vera-white-03: rgba(255, 255, 255, 0.03);
+  --vera-white-30: rgba(255, 255, 255, 0.30);
+  --vera-white-60: rgba(255, 255, 255, 0.60);
+  --vera-white-95: rgba(255, 255, 255, 0.95);
+  --vera-white-98: rgba(255, 255, 255, 0.98);
+  --vera-black-60: rgba(0, 0, 0, 0.60);
+  --vera-black-70: rgba(0, 0, 0, 0.70);
+  --vera-black-80: rgba(0, 0, 0, 0.80);
+  --vera-black-90: rgba(0, 0, 0, 0.90);
+  --vera-black-95: rgba(0, 0, 0, 0.95);
+  --avatar-border-color: var(--vera-accent);
+  --avatar-border-width: 2px;
+  --avatar-glow-color: var(--vera-accent);
+  --avatar-glow-intensity: 0.5;
+  --consume-duration: 3.2s;
+  --glow-strength: 0.3;
+  --indicator-size: 60px;
+  --line-delay: 0s;
+  --logo-height: 60px;
+  --logo-width: 200px;
+  --orbit-delay: 0s;
+  --orbit-duration: 6s;
+  --orbit-radius: 28px;
+  --orbit-rotation: 0deg;
+  --orbit-size: 5px;
+  --orbit-tilt: 1;
+  --split-offset: 0px;
+  --stream-opacity: 0.35;
+  --wing-token-rate: 1;
+  --vera-avatar-glow: none;
+  --vera-message-glow: var(--vera-glow-soft);
+  --vera-send-button-glow: none;
+  --vera-icon: #cdd6e3;
+  --vera-input-bg: #121a26;
+  --vera-input-text: #e6edf7;
+  --vera-scrollbar-track: #0f1621;
+  --vera-scrollbar-thumb: #1d2a3b;
+  --vera-scrollbar-thumb-hover: #2a3c55;
+  --vera-glass-bg: rgba(12, 20, 32, 0.12);
+  --vera-glass-strong: rgba(16, 26, 40, 0.15);
+  --vera-glass-border: rgba(120, 170, 255, 0.2);
+  --vera-glow-soft: 0 0 16px rgba(0, 153, 255, 0.25);
+  --vera-glow-strong: 0 0 28px rgba(0, 153, 255, 0.4);
+  --vera-panel-gradient: linear-gradient(145deg, rgba(26, 34, 48, 0.96), rgba(15, 22, 33, 0.96));
+  --vera-grid-line: rgba(0, 153, 255, 0.06);
+  --vera-app-bg: radial-gradient(1100px circle at 18% -10%, rgba(0, 153, 255, 0.14), transparent 45%),
+    radial-gradient(900px circle at 80% 0%, rgba(0, 90, 160, 0.12), transparent 52%),
+    #0b0f14;
+  --vera-bg-image: none;
+  --vera-bg-image-opacity: 0.35;
+  --vera-bg-image-blur: 8px;
+  --vera-header-bg: rgba(0, 0, 0, 0);
+  --vera-sidebar-bg: var(--vera-glass-strong);
+  --vera-sidebar-image: none;
+  --vera-sidebar-image-opacity: 0.25;
+  --vera-sidebar-image-blur: 6px;
+  --vera-input-bar-bg: var(--vera-glass-bg);
+  --vera-input-bar-border: var(--vera-glass-border);
+  --vera-input-bar-glow: var(--vera-glow-soft);
+  --vera-tool-card-bg: var(--vera-glass-bg);
+  --vera-tool-card-border: var(--vera-glass-border);
+  --vera-tool-card-glow: var(--vera-glow-soft);
+  --vera-message-user-bg: rgba(14, 30, 52, 0.88);
+  --vera-message-assistant-bg: rgba(12, 18, 28, 0.92);
+  --vera-message-user-border: rgba(0, 153, 255, 0.2);
+  --vera-message-assistant-border: rgba(120, 170, 255, 0.14);
+  --vera-effect-scanline-opacity: 0;
+  --vera-effect-noise-opacity: 0;
+  --vera-effect-grid-opacity: 0;
+  --vera-effect-vignette-strength: 0;
+  --vera-effect-aurora-opacity: 0;
+  --vera-effect-aurora-speed: 60s;
+  --vera-header-shimmer-opacity: 0;
+  --vera-header-shimmer-speed: 12s;
+  --vera-effect-glow-color: rgba(0, 153, 255, 0);
+  --vera-glow-animation: none;
+  --vera-message-motion-duration: 0.3s;
+  --vera-message-motion-leave: 0.2s;
+  --vera-message-motion-distance: 16px;
+  --vera-message-motion-slide-distance: 32px;
+  --vera-hover-lift: 1;
+  --vera-anim-bg-drift-speed: 45s;
+  --vera-button-hover-scale: 1;
+  --vera-button-active-scale: 1;
+  --vera-panel-shadow: 0 10px 26px rgba(0, 0, 0, 0.22);
+  --vera-message-shadow: none;
+  --vera-panel-edge: transparent;
+  --vera-message-edge: transparent;
+  --vera-panel-inner-glow: none;
+  --vera-panel-bevel: none;
+  --vera-bg-layer-blur: 0px;
+  --vera-header-blur: 18px;
+  --vera-ripple-color: rgba(0, 153, 255, 0.25);
+  --vera-code-bg: #0f1621;
+  --vera-code-border: rgba(120, 170, 255, 0.12);
+  --vera-font-scale: 1;
+  --vera-anim-speed: 1;
+  --vera-radius-sm: 4px;
+  --vera-radius-md: 8px;
+  --vera-radius-lg: 12px;
+  --vera-radius-xl: 16px;
+  --vera-radius-full: 9999px;
+  --vera-spacing-scale: 1;
+
+  /* Button glass backgrounds */
+  --vera-btn-bg: rgba(12, 20, 32, 0.6);
+  --vera-btn-bg-hover: var(--vera-panel-alt);
+  --vera-btn-bg-active: var(--vera-accent-faint);
+  --vera-btn-border: var(--vera-glass-border);
+  --vera-btn-glow: 0 0 12px var(--vera-accent-soft);
+
+  /* Rail and action button backgrounds */
+  --vera-rail-btn-bg: var(--vera-btn-bg);
+  --vera-action-btn-bg: var(--vera-btn-bg);
+  --vera-sidebar-btn-bg: var(--vera-btn-bg);
+
+  /* Thinking dropdown event colors */
+  --vera-event-routing: #a78bfa;
+  --vera-event-memory: #60a5fa;
+  --vera-event-tool: #4ade80;
+  --vera-event-decision: #22c55e;
+  --vera-event-quorum: #f59e0b;
+  --vera-event-error: #ef4444;
+
+  /* Voice state colors */
+  --vera-voice-listening: rgba(125, 205, 255, 0.9);
+  --vera-voice-listening-glow: rgba(125, 205, 255, 0.6);
+  --vera-voice-listening-text: #a7dcff;
+  --vera-voice-speaking: rgba(217, 173, 100, 0.85);
+  --vera-voice-speaking-glow: rgba(181, 123, 25, 0.5);
+  --vera-voice-speaking-text: #d9ad64;
+  --vera-voice-processing: rgba(106, 180, 255, 0.85);
+  --vera-voice-processing-glow: rgba(106, 180, 255, 0.7);
+  --vera-voice-connecting: rgba(106, 130, 251, 0.7);
+
+  /* Scroll to bottom button */
+  --vera-scroll-btn-bg: var(--vera-glass-strong);
+  --vera-scroll-btn-border: var(--vera-glass-border);
+  --vera-scroll-btn-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+
+  /* Stop button */
+  --vera-stop-btn-bg: var(--vera-danger);
+  --vera-stop-btn-text: white;
+
+  --primary-color: var(--vera-accent);
+  --primary-color-text: #ffffff;
+  --surface-0: var(--vera-bg);
+  --surface-1: var(--vera-surface);
+  --surface-2: var(--vera-panel);
+  --surface-3: var(--vera-panel-alt);
+  --surface-4: var(--vera-panel-muted);
+  --surface-card: var(--vera-panel);
+  --surface-border: var(--vera-border);
+  --text-color: var(--vera-text);
+  --text-color-secondary: var(--vera-text-muted);
+  --highlight-bg: var(--vera-accent-soft);
+  --highlight-text-color: var(--vera-text);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --vera-bg: #f5f7fa;
+  --vera-surface: #ffffff;
+  --vera-panel: #eef2f6;
+  --vera-panel-alt: #e3eaf1;
+  --vera-panel-muted: #dde4ec;
+  --vera-text: #1f2a36;
+  --vera-text-muted: #5c6b7c;
+  --vera-border: rgba(15, 28, 45, 0.14);
+  --vera-accent: #0f6ea8;
+  --vera-accent-strong: #0f82c2;
+  --vera-accent-soft: rgba(15, 110, 168, 0.18);
+  --vera-accent-faint: rgba(15, 110, 168, 0.1);
+  --vera-secondary: #a78bfa;
+  --vera-secondary-soft: rgba(167, 139, 250, 0.18);
+  --vera-secondary-faint: rgba(167, 139, 250, 0.1);
+  --vera-warning: #c27512;
+  --vera-success: #1f8a60;
+  --vera-danger: #c84b4b;
+  --vera-info: #3b82f6;
+  --vera-shadow: rgba(15, 28, 45, 0.12);
+  --vera-shadow-rgb: 15, 28, 45;
+  --vera-contrast-rgb: 0, 0, 0;
+  --vera-accent-rgb: 15, 110, 168;
+  --vera-secondary-rgb: 167, 139, 250;
+  --vera-success-rgb: 31, 138, 96;
+  --vera-warning-rgb: 194, 117, 18;
+  --vera-error-rgb: 200, 75, 75;
+  --vera-info-rgb: 59, 130, 246;
+  --vera-accent-02: rgba(var(--vera-accent-rgb), 0.02);
+  --vera-accent-03: rgba(var(--vera-accent-rgb), 0.03);
+  --vera-accent-04: rgba(var(--vera-accent-rgb), 0.04);
+  --vera-accent-06: rgba(var(--vera-accent-rgb), 0.06);
+  --vera-accent-08: rgba(var(--vera-accent-rgb), 0.08);
+  --vera-accent-10: rgba(var(--vera-accent-rgb), 0.10);
+  --vera-accent-12: rgba(var(--vera-accent-rgb), 0.12);
+  --vera-accent-15: rgba(var(--vera-accent-rgb), 0.15);
+  --vera-accent-18: rgba(var(--vera-accent-rgb), 0.18);
+  --vera-accent-20: rgba(var(--vera-accent-rgb), 0.20);
+  --vera-accent-25: rgba(var(--vera-accent-rgb), 0.25);
+  --vera-accent-30: rgba(var(--vera-accent-rgb), 0.30);
+  --vera-accent-35: rgba(var(--vera-accent-rgb), 0.35);
+  --vera-accent-40: rgba(var(--vera-accent-rgb), 0.40);
+  --vera-accent-45: rgba(var(--vera-accent-rgb), 0.45);
+  --vera-accent-50: rgba(var(--vera-accent-rgb), 0.50);
+  --vera-accent-60: rgba(var(--vera-accent-rgb), 0.60);
+  --vera-accent-70: rgba(var(--vera-accent-rgb), 0.70);
+  --vera-accent-80: rgba(var(--vera-accent-rgb), 0.80);
+  --vera-accent-85: rgba(var(--vera-accent-rgb), 0.85);
+  --vera-accent-90: rgba(var(--vera-accent-rgb), 0.90);
+  --vera-secondary-02: rgba(var(--vera-secondary-rgb), 0.02);
+  --vera-secondary-05: rgba(var(--vera-secondary-rgb), 0.05);
+  --vera-secondary-08: rgba(var(--vera-secondary-rgb), 0.08);
+  --vera-secondary-10: rgba(var(--vera-secondary-rgb), 0.10);
+  --vera-secondary-15: rgba(var(--vera-secondary-rgb), 0.15);
+  --vera-secondary-20: rgba(var(--vera-secondary-rgb), 0.20);
+  --vera-secondary-25: rgba(var(--vera-secondary-rgb), 0.25);
+  --vera-secondary-30: rgba(var(--vera-secondary-rgb), 0.30);
+  --vera-secondary-35: rgba(var(--vera-secondary-rgb), 0.35);
+  --vera-secondary-40: rgba(var(--vera-secondary-rgb), 0.40);
+  --vera-secondary-50: rgba(var(--vera-secondary-rgb), 0.50);
+  --vera-secondary-60: rgba(var(--vera-secondary-rgb), 0.60);
+  --vera-secondary-80: rgba(var(--vera-secondary-rgb), 0.80);
+  --vera-success-60: rgba(var(--vera-success-rgb), 0.60);
+  --vera-warning-60: rgba(var(--vera-warning-rgb), 0.60);
+  --vera-error-60: rgba(var(--vera-error-rgb), 0.60);
+  --vera-info-60: rgba(var(--vera-info-rgb), 0.60);
+  --vera-white-03: rgba(255, 255, 255, 0.03);
+  --vera-white-30: rgba(255, 255, 255, 0.30);
+  --vera-white-60: rgba(255, 255, 255, 0.60);
+  --vera-white-95: rgba(255, 255, 255, 0.95);
+  --vera-white-98: rgba(255, 255, 255, 0.98);
+  --vera-black-60: rgba(0, 0, 0, 0.60);
+  --vera-black-70: rgba(0, 0, 0, 0.70);
+  --vera-black-80: rgba(0, 0, 0, 0.80);
+  --vera-black-90: rgba(0, 0, 0, 0.90);
+  --vera-black-95: rgba(0, 0, 0, 0.95);
+  --vera-icon: #2f3a46;
+  --vera-input-bg: #ffffff;
+  --vera-input-text: #1f2a36;
+  --vera-scrollbar-track: #d7dde5;
+  --vera-scrollbar-thumb: #b7c2cf;
+  --vera-scrollbar-thumb-hover: #9aa8ba;
+  --vera-glass-bg: rgba(255, 255, 255, 0.12);
+  --vera-glass-strong: rgba(255, 255, 255, 0.15);
+  --vera-glass-border: rgba(15, 110, 168, 0.18);
+  --vera-glow-soft: 0 0 16px rgba(15, 110, 168, 0.2);
+  --vera-glow-strong: 0 0 26px rgba(15, 110, 168, 0.32);
+  --vera-panel-gradient: linear-gradient(145deg, rgba(255, 255, 255, 0.96), rgba(228, 236, 246, 0.96));
+  --vera-grid-line: rgba(15, 110, 168, 0.05);
+  --vera-app-bg: radial-gradient(1200px circle at 20% -10%, rgba(15, 110, 168, 0.08), transparent 45%),
+    radial-gradient(900px circle at 80% 0%, rgba(15, 110, 168, 0.06), transparent 55%),
+    #f5f7fa;
+  --vera-bg-image: none;
+  --vera-bg-image-opacity: 0.25;
+  --vera-bg-image-blur: 6px;
+  --vera-header-bg: rgba(0, 0, 0, 0);
+  --vera-sidebar-bg: var(--vera-glass-strong);
+  --vera-sidebar-image: none;
+  --vera-sidebar-image-opacity: 0.2;
+  --vera-sidebar-image-blur: 4px;
+  --vera-input-bar-bg: var(--vera-glass-bg);
+  --vera-input-bar-border: var(--vera-glass-border);
+  --vera-input-bar-glow: var(--vera-glow-soft);
+  --vera-tool-card-bg: var(--vera-glass-bg);
+  --vera-tool-card-border: var(--vera-glass-border);
+  --vera-tool-card-glow: var(--vera-glow-soft);
+  --vera-message-user-bg: rgba(218, 232, 248, 0.85);
+  --vera-message-assistant-bg: rgba(245, 247, 250, 0.95);
+  --vera-message-user-border: rgba(15, 110, 168, 0.2);
+  --vera-message-assistant-border: rgba(15, 28, 45, 0.12);
+  --vera-code-bg: #eef2f6;
+  --vera-code-border: rgba(15, 28, 45, 0.14);
+
+  /* Button glass backgrounds (light) */
+  --vera-btn-bg: rgba(255, 255, 255, 0.6);
+  --vera-btn-bg-hover: var(--vera-panel-alt);
+  --vera-btn-bg-active: var(--vera-accent-faint);
+  --vera-btn-border: var(--vera-glass-border);
+  --vera-btn-glow: 0 0 12px var(--vera-accent-soft);
+  --vera-rail-btn-bg: var(--vera-btn-bg);
+  --vera-action-btn-bg: var(--vera-btn-bg);
+  --vera-sidebar-btn-bg: var(--vera-btn-bg);
+
+  /* Thinking dropdown event colors (light - slightly darker for visibility) */
+  --vera-event-routing: #8b5cf6;
+  --vera-event-memory: #3b82f6;
+  --vera-event-tool: #22c55e;
+  --vera-event-decision: #16a34a;
+  --vera-event-quorum: #d97706;
+  --vera-event-error: #dc2626;
+
+  /* Voice state colors (light) */
+  --vera-voice-listening: rgba(59, 130, 246, 0.9);
+  --vera-voice-listening-glow: rgba(59, 130, 246, 0.5);
+  --vera-voice-listening-text: #2563eb;
+  --vera-voice-speaking: rgba(180, 130, 50, 0.85);
+  --vera-voice-speaking-glow: rgba(180, 130, 50, 0.4);
+  --vera-voice-speaking-text: #a16207;
+  --vera-voice-processing: rgba(59, 130, 246, 0.85);
+  --vera-voice-processing-glow: rgba(59, 130, 246, 0.6);
+  --vera-voice-connecting: rgba(99, 102, 241, 0.7);
+
+  /* Scroll to bottom button (light) */
+  --vera-scroll-btn-bg: var(--vera-glass-strong);
+  --vera-scroll-btn-border: var(--vera-glass-border);
+  --vera-scroll-btn-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+
+  /* Stop button (light) */
+  --vera-stop-btn-bg: var(--vera-danger);
+  --vera-stop-btn-text: white;
+}
+
+/* ============================================
+   Lite Mode - Disable all drawer animations
+   ============================================ */
+
+:root[data-lite-mode="on"] .drawer,
+:root[data-lite-mode="on"] .activity-drawer,
+:root[data-lite-mode="on"] .tools-drawer,
+:root[data-lite-mode="on"] .swarm-drawer,
+:root[data-lite-mode="on"] .self-improve-drawer,
+:root[data-lite-mode="on"] .canvas-drawer,
+:root[data-lite-mode="on"] .diagnostics-drawer {
+  /* Disable all animations in drawer components */
+  * {
+    animation: none !important;
+    transition-duration: 0s !important;
+  }
+}
+
+:root[data-lite-mode="on"] .bg-layer {
+  display: none !important;
+}
+
+:root[data-reduced-motion="on"] .drawer,
+:root[data-reduced-motion="on"] .activity-drawer,
+:root[data-reduced-motion="on"] .tools-drawer,
+:root[data-reduced-motion="on"] .swarm-drawer,
+:root[data-reduced-motion="on"] .self-improve-drawer,
+:root[data-reduced-motion="on"] .canvas-drawer,
+:root[data-reduced-motion="on"] .diagnostics-drawer {
+  /* Disable animations when reduced motion is preferred */
+  * {
+    animation: none !important;
+    transition-duration: 0.15s !important;
+  }
+}
+
+:root[data-reduced-motion="on"] .bg-layer {
+  animation: none !important;
+  opacity: 0.5;
+}
+
+/* ============================================
+   PrimeVue Component Overrides
+   Force PrimeVue to use VERA accent colors
+   ============================================ */
+
+/* Buttons */
+.p-button.p-button-primary,
+.p-button:not(.p-button-secondary):not(.p-button-success):not(.p-button-info):not(.p-button-warning):not(.p-button-danger):not(.p-button-text):not(.p-button-outlined):not(.p-button-link) {
+  background: var(--vera-accent);
+  border-color: var(--vera-accent);
+}
+
+.p-button.p-button-primary:hover,
+.p-button:not(.p-button-secondary):not(.p-button-success):not(.p-button-info):not(.p-button-warning):not(.p-button-danger):not(.p-button-text):not(.p-button-outlined):not(.p-button-link):hover {
+  background: var(--vera-accent-strong);
+  border-color: var(--vera-accent-strong);
+}
+
+.p-button.p-button-outlined {
+  color: var(--vera-accent);
+  border-color: var(--vera-accent);
+}
+
+.p-button.p-button-outlined:hover {
+  background: var(--vera-accent-soft);
+  color: var(--vera-accent);
+  border-color: var(--vera-accent);
+}
+
+.p-button.p-button-text {
+  color: var(--vera-accent);
+}
+
+.p-button.p-button-text:hover {
+  background: var(--vera-accent-faint);
+  color: var(--vera-accent);
+}
+
+/* Toggle Button */
+.p-togglebutton.p-highlight {
+  background: var(--vera-accent);
+  border-color: var(--vera-accent);
+  color: #ffffff;
+}
+
+.p-togglebutton.p-highlight:hover {
+  background: var(--vera-accent-strong);
+  border-color: var(--vera-accent-strong);
+}
+
+/* Select Button */
+.p-selectbutton .p-button.p-highlight {
+  background: var(--vera-accent);
+  border-color: var(--vera-accent);
+  color: #ffffff;
+}
+
+.p-selectbutton .p-button.p-highlight:hover {
+  background: var(--vera-accent-strong);
+  border-color: var(--vera-accent-strong);
+}
+
+/* Dropdown */
+.p-dropdown:not(.p-disabled).p-focus {
+  border-color: var(--vera-accent);
+  box-shadow: 0 0 0 1px var(--vera-accent-soft);
+}
+
+.p-dropdown-panel .p-dropdown-items .p-dropdown-item.p-highlight {
+  background: var(--vera-accent-soft);
+  color: var(--vera-accent);
+}
+
+.p-dropdown-panel .p-dropdown-items .p-dropdown-item:not(.p-highlight):not(.p-disabled):hover {
+  background: var(--vera-accent-faint);
+}
+
+/* Slider */
+.p-slider .p-slider-range {
+  background: var(--vera-accent);
+}
+
+.p-slider .p-slider-handle {
+  border-color: var(--vera-accent);
+}
+
+.p-slider .p-slider-handle:hover {
+  background: var(--vera-accent);
+  border-color: var(--vera-accent);
+}
+
+.p-slider:not(.p-disabled) .p-slider-handle:hover {
+  background: var(--vera-accent);
+  border-color: var(--vera-accent);
+}
+
+/* Input Switch */
+.p-inputswitch.p-inputswitch-checked .p-inputswitch-slider {
+  background: var(--vera-accent);
+}
+
+.p-inputswitch.p-inputswitch-checked:not(.p-disabled):hover .p-inputswitch-slider {
+  background: var(--vera-accent-strong);
+}
+
+.p-inputswitch.p-focus .p-inputswitch-slider {
+  box-shadow: 0 0 0 2px var(--vera-accent-soft);
+}
+
+/* Checkbox */
+.p-checkbox .p-checkbox-box.p-highlight {
+  border-color: var(--vera-accent);
+  background: var(--vera-accent);
+}
+
+.p-checkbox:not(.p-checkbox-disabled) .p-checkbox-box.p-highlight:hover {
+  border-color: var(--vera-accent-strong);
+  background: var(--vera-accent-strong);
+}
+
+.p-checkbox:not(.p-checkbox-disabled) .p-checkbox-box:hover {
+  border-color: var(--vera-accent);
+}
+
+.p-checkbox:not(.p-checkbox-disabled) .p-checkbox-box.p-focus {
+  box-shadow: 0 0 0 2px var(--vera-accent-soft);
+  border-color: var(--vera-accent);
+}
+
+/* Radio Button */
+.p-radiobutton .p-radiobutton-box.p-highlight {
+  border-color: var(--vera-accent);
+  background: var(--vera-accent);
+}
+
+.p-radiobutton .p-radiobutton-box.p-highlight:not(.p-disabled):hover {
+  border-color: var(--vera-accent-strong);
+  background: var(--vera-accent-strong);
+}
+
+.p-radiobutton .p-radiobutton-box:not(.p-disabled):not(.p-highlight):hover {
+  border-color: var(--vera-accent);
+}
+
+.p-radiobutton .p-radiobutton-box.p-focus {
+  box-shadow: 0 0 0 2px var(--vera-accent-soft);
+  border-color: var(--vera-accent);
+}
+
+/* Input Text */
+.p-inputtext:enabled:focus {
+  border-color: var(--vera-accent);
+  box-shadow: 0 0 0 1px var(--vera-accent-soft);
+}
+
+/* Listbox */
+.p-listbox .p-listbox-list .p-listbox-item.p-highlight {
+  background: var(--vera-accent-soft);
+  color: var(--vera-accent);
+}
+
+.p-listbox:not(.p-disabled) .p-listbox-item:not(.p-highlight):not(.p-disabled):hover {
+  background: var(--vera-accent-faint);
+}
+
+/* TabView */
+.p-tabview .p-tabview-nav li.p-highlight .p-tabview-nav-link {
+  border-color: var(--vera-accent);
+  color: var(--vera-accent);
+}
+
+/* Progress Bar */
+.p-progressbar .p-progressbar-value {
+  background: var(--vera-accent);
+}
+
+/* Chip */
+.p-chip.p-chip-highlight {
+  background: var(--vera-accent);
+  color: #ffffff;
+}
+
+/* Tag */
+.p-tag {
+  background: var(--vera-accent);
+}
+
+/* Badge */
+.p-badge {
+  background: var(--vera-accent);
+}
+
+/* Links and focus states */
+a {
+  color: var(--vera-accent);
+}
+
+a:hover {
+  color: var(--vera-accent-strong);
+}
+
+/* Selection highlight */
+::selection {
+  background: var(--vera-accent-soft);
+  color: var(--vera-text);
+}

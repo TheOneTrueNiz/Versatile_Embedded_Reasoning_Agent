@@ -1,0 +1,22 @@
+<svg width="200" height="60" viewBox="0 0 200 60" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="metal-grad" x1="0" y1="0" x2="0" y2="60">
+      <stop offset="0%" stop-color="#E0FFFF"/>
+      <stop offset="100%" stop-color="#00F0FF"/>
+    </linearGradient>
+  </defs>
+
+  <g id="VERA_Top">
+    <path d="M10 0 L25 30 H35 L50 0 H40 L30 20 L20 0 H10 Z" fill="url(#metal-grad)"/>
+    <path d="M60 0 H90 V8 H70 V11 H85 V19 H70 V30 H60 V0 Z" fill="url(#metal-grad)"/>
+    <path d="M100 0 H125 C135 0 135 15 125 18 L135 30 H123 L115 20 H110 V30 H100 V0 Z M110 8 V14 H120 C123 14 123 8 120 8 H110 Z" fill="url(#metal-grad)"/>
+    <path d="M150 30 L160 0 H170 L180 30 H170 L168 22 H158 V30 H148 L150 30 Z M160 15 H166 L163 5 L160 15 Z" fill="url(#metal-grad)"/>
+  </g>
+
+  <g id="VERA_Bottom">
+    <path d="M25 30 L30 45 L35 30 H25 Z" fill="url(#metal-grad)"/>
+    <path d="M60 30 V45 H90 V37 H70 V30 H60 Z" fill="url(#metal-grad)"/>
+    <path d="M100 30 V45 H110 V30 H100 Z M123 30 L128 36 L135 30 H123 Z" fill="url(#metal-grad)"/>
+    <path d="M148 30 H158 L155 45 H148 L148 30 Z M172 30 H182 L182 45 H175 L172 30 Z" fill="url(#metal-grad)"/>
+  </g>
+</svg>

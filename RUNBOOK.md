@@ -10,6 +10,18 @@ Build/refresh a local wheelhouse (and seed archive) when internet is available:
 ./scripts/build_wheelhouse.sh
 ```
 
+Configure dev secrets in OS keychain (recommended):
+
+```bash
+./scripts/vera_secret_store.sh set XAI_API_KEY "<your_key>"
+```
+
+Or migrate file-based credentials:
+
+```bash
+./scripts/vera_secret_store.sh migrate-creds "${HOME}/Documents/creds"
+```
+
 ## 2) Offline Bootstrap
 
 Point to a prepared wheelhouse/seed location and run dependency bootstrap without starting VERA:
@@ -87,3 +99,10 @@ Retention controls:
 - `dev/` (archival only; not current guidance)
 - `.venv/`
 - `wheelhouse/`
+
+## 9) Secrets Runtime Behavior
+
+- `scripts/run_vera.sh` and `scripts/run_vera_full.sh` auto-load secrets from OS keychain by default.
+- Disable keychain autoload with `VERA_KEYCHAIN_LOAD=0`.
+- `~/Documents/creds` remains as compatibility fallback.
+- Preferred production pattern is environment/secret-manager injection.

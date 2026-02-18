@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "version": "0.1.0",
+    "description": "Router table for genome selection"
+  },
+  "nodes": {
+    "default": {
+      "config_path": "config/vera_genome.json",
+      "description": "General purpose assistant for typical requests.",
+      "embedding_signature": "general help chat assist planning"
+    },
+    "coder_v1": {
+      "config_path": "config/vera_genome.json",
+      "description": "Coding and debugging tasks.",
+      "embedding_signature": "code debug error traceback python javascript"
+    }
+  }
+}

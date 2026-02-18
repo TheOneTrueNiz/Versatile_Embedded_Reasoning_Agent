@@ -41,6 +41,14 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
+try:
+    from core.services.dev_secrets import prime_environment_from_keychain
+
+    prime_environment_from_keychain()
+except Exception:
+    # Keychain integration is best-effort; env vars still work as normal.
+    pass
+
 # Phase 2 Components
 from orchestration.async_tool_executor import AsyncToolExecutor
 from orchestration.tool_output_filter import ToolOutputFilter

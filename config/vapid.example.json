@@ -1,0 +1,5 @@
+{
+  "public_key": "YOUR_PUBLIC_KEY_BASE64URL",
+  "private_key": "YOUR_PRIVATE_KEY_BASE64URL",
+  "subject": "mailto:you@example.com"
+}

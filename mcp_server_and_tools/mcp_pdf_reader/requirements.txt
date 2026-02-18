@@ -1,0 +1,17 @@
+# MCP PDF Reader Server Requirements
+
+# FastMCP framework for easy MCP server creation
+fastmcp>=0.2.0
+
+# PDF processing library
+PyMuPDF>=1.23.0
+
+# OCR library for reading text from images
+pytesseract>=0.3.10
+
+# Image processing library
+Pillow>=10.0.0
+
+# Optional: For better OCR results, you may want to install additional packages
+# opencv-python>=4.8.0  # For image preprocessing
+# numpy>=1.24.0  # For numerical operations on images

@@ -1,0 +1,17 @@
+use_default_settings: true
+
+general:
+  instance_name: "Archie Local SearxNG"
+
+search:
+  formats:
+    - html
+    - json
+
+server:
+  # Local-only: disable request limiting / bot detection to avoid 403s for localhost clients.
+  limiter: false
+  public_instance: false
+  # Replace this for anything beyond local dev.
+  secret_key: "CHANGE_ME_local_dev_only"
+

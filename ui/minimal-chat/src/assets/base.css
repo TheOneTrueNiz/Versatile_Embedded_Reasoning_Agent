@@ -1,0 +1,697 @@
+:root {
+  --color-background: var(--vera-bg);
+  --color-background-soft: var(--vera-surface);
+  --color-background-mute: var(--vera-panel-muted);
+  --color-border: var(--vera-border);
+  --color-border-hover: var(--vera-border);
+  --color-heading: var(--vera-text);
+  --color-text: var(--vera-text);
+
+  --section-gap: 160px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+body {
+  min-height: 100vh;
+  color: var(--color-text);
+  background: transparent;
+  position: relative;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: var(--vera-app-bg);
+  filter: blur(var(--vera-bg-layer-blur));
+  pointer-events: none;
+  z-index: -3;
+}
+
+.app-body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: var(--vera-bg-image);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  opacity: var(--vera-bg-image-opacity);
+  filter: blur(var(--vera-bg-image-blur));
+  pointer-events: none;
+  z-index: -2;
+}
+
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9998;
+}
+
+/* Scanlines overlay */
+.app-body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(var(--vera-shadow-rgb), var(--vera-effect-scanline-opacity)) 2px,
+      rgba(var(--vera-shadow-rgb), var(--vera-effect-scanline-opacity)) 4px
+    );
+  pointer-events: none;
+  z-index: 9997;
+}
+
+/* Noise/grain overlay */
+.vera-noise-overlay {
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  opacity: var(--vera-effect-noise-opacity);
+  pointer-events: none;
+  z-index: 9996;
+  mix-blend-mode: overlay;
+}
+
+/* Grid overlay */
+.vera-grid-overlay {
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--vera-accent-faint) 1px, transparent 1px),
+    linear-gradient(90deg, var(--vera-accent-faint) 1px, transparent 1px);
+  background-size: 60px 60px;
+  opacity: calc(var(--vera-effect-grid-opacity) * 2.5);
+  pointer-events: none;
+  z-index: 9995;
+}
+
+/* Aurora overlay container - fixed to viewport, clipped, isolated for blend-mode */
+.vera-aurora-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9994;
+  overflow: hidden; /* Clip overscanned layers cleanly */
+  isolation: isolate; /* Prevent blend-mode bleeding outside */
+  contain: strict; /* Stronger containment for paint optimization */
+}
+
+/*
+ * CACHED RASTER ARCHITECTURE for butter-smooth aurora:
+ * - .vera-aurora-layer = MOVING wrapper (cheap GPU transforms only)
+ * - .vera-aurora-layer::before = STATIC raster (gradient + blur, cached by browser)
+ * This separates the expensive blur from the animation, allowing the browser
+ * to cache the blurred raster and only animate the wrapper transform.
+ */
+
+/* Aurora wrapper - ONLY animates transforms (cheap compositor path) */
+.vera-aurora-layer {
+  position: absolute;
+  inset: 0; /* Wrapper stays viewport-sized */
+  will-change: transform, opacity;
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden; /* Force GPU layer, prevent flicker */
+  opacity: 0;
+  mix-blend-mode: screen; /* Blend at wrapper level */
+}
+
+/* Aurora blob - STATIC cached raster (gradient + blur) */
+.vera-aurora-layer::before {
+  content: "";
+  position: absolute;
+  /* px-based overscan = consistent behavior, ~520px keeps edges well off-screen */
+  inset: -520px;
+  filter: blur(60px) saturate(1.15); /* Blur on STATIC element = cached */
+  background-repeat: no-repeat;
+  pointer-events: none;
+  /* No animation here - this element is static and browser-cacheable */
+}
+
+/* Noise dither overlay to mask gradient banding (huge visual smoothness win) */
+.vera-aurora-overlay::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20width%3D%27128%27%20height%3D%27128%27%3E%3Cfilter%20id%3D%27n%27%3E%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%270.8%27%20numOctaves%3D%273%27%20stitchTiles%3D%27stitch%27/%3E%3C/filter%3E%3Crect%20width%3D%27128%27%20height%3D%27128%27%20filter%3D%27url(%23n)%27%20opacity%3D%270.35%27/%3E%3C/svg%3E");
+  background-size: 180px 180px;
+  opacity: 0.06;
+  mix-blend-mode: overlay;
+}
+
+/* Left aurora - gradient on STATIC ::before (cached raster) */
+.vera-aurora-left::before {
+  background-image: radial-gradient(
+    ellipse 80% 70% at 0% 45%,
+    rgba(var(--vera-accent-rgb), var(--vera-effect-aurora-opacity)),
+    rgba(var(--vera-accent-rgb), calc(var(--vera-effect-aurora-opacity) * 0.5)) 40%,
+    transparent 65%
+  );
+}
+
+/* Right aurora - gradient on STATIC ::before (cached raster) */
+.vera-aurora-right::before {
+  background-image: radial-gradient(
+    ellipse 80% 70% at 100% 45%,
+    rgba(var(--vera-secondary-rgb), calc(var(--vera-effect-aurora-opacity) * 0.9)),
+    rgba(var(--vera-secondary-rgb), calc(var(--vera-effect-aurora-opacity) * 0.4)) 40%,
+    transparent 65%
+  );
+}
+
+/* Bottom aurora - gradient on STATIC ::before (cached raster) */
+.vera-aurora-bottom::before {
+  background-image: radial-gradient(
+    ellipse 70% 80% at 50% 100%,
+    rgba(var(--vera-info-rgb), calc(var(--vera-effect-aurora-opacity) * 0.6)),
+    rgba(var(--vera-info-rgb), calc(var(--vera-effect-aurora-opacity) * 0.3)) 40%,
+    transparent 65%
+  );
+}
+
+/* Vignette overlay */
+.vera-vignette-overlay {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(ellipse at center, transparent 20%, rgba(var(--vera-shadow-rgb), var(--vera-effect-vignette-strength)) 100%);
+  pointer-events: none;
+  z-index: 9993;
+}
+
+/* Aurora animations - enable layers with smooth looping drift */
+:root[data-aurora="on"] .vera-aurora-layer {
+  opacity: 1;
+}
+
+/*
+ * Animation activation - user-controlled speed via --vera-effect-aurora-speed
+ * Each layer gets slightly different duration for organic desync
+ * Negative delays start mid-cycle for immediate visual interest
+ */
+:root[data-aurora="on"] .vera-aurora-left {
+  animation: veraAuroraLeftDrift var(--vera-effect-aurora-speed, 60s) linear infinite;
+  animation-delay: calc(var(--vera-effect-aurora-speed, 60s) * -0.23);
+}
+
+:root[data-aurora="on"] .vera-aurora-right {
+  animation: veraAuroraRightDrift calc(var(--vera-effect-aurora-speed, 60s) * 1.15) linear infinite;
+  animation-delay: calc(var(--vera-effect-aurora-speed, 60s) * -0.41);
+}
+
+:root[data-aurora="on"] .vera-aurora-bottom {
+  animation: veraAuroraBottomDrift calc(var(--vera-effect-aurora-speed, 60s) * 1.30) linear infinite;
+  animation-delay: calc(var(--vera-effect-aurora-speed, 60s) * -0.67);
+}
+
+:root[data-anim-bg-drift="on"] body {
+  background-size: 220% 220%;
+  animation: veraBackgroundDrift var(--vera-anim-bg-drift-speed) ease-in-out infinite;
+}
+
+@keyframes veraBackgroundDrift {
+  0% {
+    background-position: 0% 40%;
+  }
+  50% {
+    background-position: 100% 60%;
+  }
+  100% {
+    background-position: 0% 40%;
+  }
+}
+
+@keyframes veraGlowPulse {
+  0%,
+  100% {
+    box-shadow: var(--vera-glow-base);
+  }
+  50% {
+    box-shadow: var(--vera-glow-peak);
+  }
+}
+
+@keyframes veraGlowPulseAlt {
+  0%,
+  100% {
+    box-shadow: var(--vera-glow-base);
+  }
+  50% {
+    box-shadow: var(--vera-glow-peak);
+  }
+}
+
+/*
+ * Aurora keyframes - px-based transforms for consistent behavior
+ * Only transform + opacity animate (compositor-only, no re-raster)
+ * Gentle scale changes removed to keep it purely transform-based
+ * Very long durations (90-120s) + linear timing = silky smooth
+ */
+
+/* Left aurora drift - slow organic movement */
+@keyframes veraAuroraLeftDrift {
+  0%    { transform: translate3d(-80px, -20px, 0) rotate(-0.5deg); opacity: 0.90; }
+  6%    { transform: translate3d(-60px, -10px, 0) rotate(-0.3deg); opacity: 0.92; }
+  12%   { transform: translate3d(-35px,  5px, 0) rotate(-0.1deg); opacity: 0.94; }
+  18%   { transform: translate3d(-10px,  20px, 0) rotate(0.1deg); opacity: 0.96; }
+  25%   { transform: translate3d( 15px,  30px, 0) rotate(0.3deg); opacity: 0.98; }
+  31%   { transform: translate3d( 40px,  35px, 0) rotate(0.5deg); opacity: 0.99; }
+  37%   { transform: translate3d( 60px,  30px, 0) rotate(0.6deg); opacity: 1.00; }
+  44%   { transform: translate3d( 75px,  20px, 0) rotate(0.5deg); opacity: 0.99; }
+  50%   { transform: translate3d( 80px,  5px, 0) rotate(0.4deg); opacity: 0.97; }
+  56%   { transform: translate3d( 75px, -10px, 0) rotate(0.3deg); opacity: 0.95; }
+  62%   { transform: translate3d( 55px, -20px, 0) rotate(0.1deg); opacity: 0.94; }
+  69%   { transform: translate3d( 30px, -25px, 0) rotate(0deg); opacity: 0.93; }
+  75%   { transform: translate3d( 5px, -25px, 0) rotate(-0.1deg); opacity: 0.92; }
+  81%   { transform: translate3d(-25px, -25px, 0) rotate(-0.2deg); opacity: 0.91; }
+  88%   { transform: translate3d(-55px, -25px, 0) rotate(-0.4deg); opacity: 0.90; }
+  94%   { transform: translate3d(-70px, -22px, 0) rotate(-0.5deg); opacity: 0.90; }
+  100%  { transform: translate3d(-80px, -20px, 0) rotate(-0.5deg); opacity: 0.90; }
+}
+
+/* Right aurora drift - counter-phase movement */
+@keyframes veraAuroraRightDrift {
+  0%    { transform: translate3d( 80px,  15px, 0) rotate(0.5deg); opacity: 0.88; }
+  6%    { transform: translate3d( 65px,  5px, 0) rotate(0.3deg); opacity: 0.90; }
+  12%   { transform: translate3d( 45px, -10px, 0) rotate(0.1deg); opacity: 0.92; }
+  18%   { transform: translate3d( 25px, -20px, 0) rotate(-0.1deg); opacity: 0.94; }
+  25%   { transform: translate3d( 0px, -30px, 0) rotate(-0.3deg); opacity: 0.96; }
+  31%   { transform: translate3d(-30px, -32px, 0) rotate(-0.5deg); opacity: 0.98; }
+  37%   { transform: translate3d(-55px, -25px, 0) rotate(-0.6deg); opacity: 1.00; }
+  44%   { transform: translate3d(-75px, -15px, 0) rotate(-0.5deg); opacity: 0.99; }
+  50%   { transform: translate3d(-80px,  0px, 0) rotate(-0.4deg); opacity: 0.97; }
+  56%   { transform: translate3d(-75px,  15px, 0) rotate(-0.3deg); opacity: 0.95; }
+  62%   { transform: translate3d(-55px,  25px, 0) rotate(-0.1deg); opacity: 0.93; }
+  69%   { transform: translate3d(-30px,  28px, 0) rotate(0deg); opacity: 0.91; }
+  75%   { transform: translate3d( 0px,  25px, 0) rotate(0.1deg); opacity: 0.90; }
+  81%   { transform: translate3d( 30px,  22px, 0) rotate(0.2deg); opacity: 0.89; }
+  88%   { transform: translate3d( 55px,  20px, 0) rotate(0.4deg); opacity: 0.88; }
+  94%   { transform: translate3d( 72px,  18px, 0) rotate(0.5deg); opacity: 0.88; }
+  100%  { transform: translate3d( 80px,  15px, 0) rotate(0.5deg); opacity: 0.88; }
+}
+
+/* Bottom aurora drift - gentle vertical sway */
+@keyframes veraAuroraBottomDrift {
+  0%    { transform: translate3d( 0px,  70px, 0) rotate(0deg); opacity: 0.80; }
+  6%    { transform: translate3d( 8px,  55px, 0) rotate(0.15deg); opacity: 0.83; }
+  12%   { transform: translate3d( 15px,  40px, 0) rotate(0.3deg); opacity: 0.86; }
+  18%   { transform: translate3d( 20px,  25px, 0) rotate(0.4deg); opacity: 0.89; }
+  25%   { transform: translate3d( 22px,  10px, 0) rotate(0.5deg); opacity: 0.92; }
+  31%   { transform: translate3d( 18px, -5px, 0) rotate(0.5deg); opacity: 0.95; }
+  37%   { transform: translate3d( 10px, -18px, 0) rotate(0.4deg); opacity: 0.97; }
+  44%   { transform: translate3d( 0px, -28px, 0) rotate(0.3deg); opacity: 0.96; }
+  50%   { transform: translate3d(-10px, -32px, 0) rotate(0.2deg); opacity: 0.94; }
+  56%   { transform: translate3d(-18px, -28px, 0) rotate(0.1deg); opacity: 0.92; }
+  62%   { transform: translate3d(-22px, -18px, 0) rotate(0deg); opacity: 0.90; }
+  69%   { transform: translate3d(-20px, -5px, 0) rotate(-0.1deg); opacity: 0.87; }
+  75%   { transform: translate3d(-15px,  12px, 0) rotate(-0.1deg); opacity: 0.85; }
+  81%   { transform: translate3d(-8px,  30px, 0) rotate(-0.1deg); opacity: 0.83; }
+  88%   { transform: translate3d( 0px,  48px, 0) rotate(0deg); opacity: 0.81; }
+  94%   { transform: translate3d( 0px,  60px, 0) rotate(0deg); opacity: 0.80; }
+  100%  { transform: translate3d( 0px,  70px, 0) rotate(0deg); opacity: 0.80; }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  .vera-aurora-layer {
+    animation: none !important;
+  }
+}
+
+:root[data-anim-buttons="on"] .p-button:hover,
+:root[data-anim-buttons="on"] .save-prompt-button:hover,
+:root[data-anim-buttons="on"] .clear-prompt-button:hover,
+:root[data-anim-buttons="on"] .custom-upload-button:hover,
+:root[data-anim-buttons="on"] .icon-button:hover,
+:root[data-anim-buttons="on"] .tools-actions button:hover {
+  transform: translateY(-1px) scale(var(--vera-button-hover-scale));
+}
+
+:root[data-anim-buttons="on"] .p-button:active,
+:root[data-anim-buttons="on"] .save-prompt-button:active,
+:root[data-anim-buttons="on"] .clear-prompt-button:active,
+:root[data-anim-buttons="on"] .custom-upload-button:active,
+:root[data-anim-buttons="on"] .icon-button:active,
+:root[data-anim-buttons="on"] .tools-actions button:active {
+  transform: translateY(0) scale(var(--vera-button-active-scale));
+}
+
+:root[data-button-ripple="on"] .p-button,
+:root[data-button-ripple="on"] .save-prompt-button,
+:root[data-button-ripple="on"] .clear-prompt-button,
+:root[data-button-ripple="on"] .custom-upload-button,
+:root[data-button-ripple="on"] .action-btn,
+:root[data-button-ripple="on"] .icon-button,
+:root[data-button-ripple="on"] .shutdown-btn,
+:root[data-button-ripple="on"] .tools-actions button {
+  position: relative;
+  overflow: hidden;
+}
+
+:root[data-button-ripple="on"] .p-button::after,
+:root[data-button-ripple="on"] .save-prompt-button::after,
+:root[data-button-ripple="on"] .clear-prompt-button::after,
+:root[data-button-ripple="on"] .custom-upload-button::after,
+:root[data-button-ripple="on"] .action-btn::after,
+:root[data-button-ripple="on"] .icon-button::after,
+:root[data-button-ripple="on"] .shutdown-btn::after,
+:root[data-button-ripple="on"] .tools-actions button::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle, var(--vera-ripple-color) 0%, transparent 70%);
+  opacity: 0;
+  transform: scale(0);
+  transition: transform 0.45s ease, opacity 0.6s ease;
+  pointer-events: none;
+}
+
+:root[data-button-ripple="on"] .p-button:active::after,
+:root[data-button-ripple="on"] .save-prompt-button:active::after,
+:root[data-button-ripple="on"] .clear-prompt-button:active::after,
+:root[data-button-ripple="on"] .custom-upload-button:active::after,
+:root[data-button-ripple="on"] .action-btn:active::after,
+:root[data-button-ripple="on"] .icon-button:active::after,
+:root[data-button-ripple="on"] .shutdown-btn:active::after,
+:root[data-button-ripple="on"] .tools-actions button:active::after {
+  opacity: 0.35;
+  transform: scale(1.8);
+  transition: transform 0.1s ease, opacity 0.2s ease;
+}
+
+.vera-toast {
+  position: fixed !important;
+  top: 50% !important;
+  left: 50% !important;
+  right: auto !important;
+  bottom: auto !important;
+  transform: translate(-50%, -50%) !important;
+  max-width: min(420px, 90vw);
+  text-align: center;
+  z-index: 100000 !important;
+}
+
+:root[data-header-shimmer="on"] .header,
+:root[data-header-shimmer="on"] .dialog-header,
+:root[data-header-shimmer="on"] .tools-header {
+  position: relative;
+  overflow: hidden;
+}
+
+:root[data-header-shimmer="on"] .header::after,
+:root[data-header-shimmer="on"] .dialog-header::after,
+:root[data-header-shimmer="on"] .tools-header::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    110deg,
+    rgba(var(--vera-contrast-rgb), 0) 0%,
+    rgba(var(--vera-contrast-rgb), var(--vera-header-shimmer-opacity)) 45%,
+    rgba(var(--vera-contrast-rgb), 0) 60%
+  );
+  transform: translateX(-120%);
+  animation: veraHeaderShimmer var(--vera-header-shimmer-speed) ease-in-out infinite;
+  pointer-events: none;
+  mix-blend-mode: screen;
+}
+
+@keyframes veraHeaderShimmer {
+  0% {
+    transform: translateX(-120%);
+  }
+  50% {
+    transform: translateX(120%);
+  }
+  100% {
+    transform: translateX(120%);
+  }
+}
+
+/* Compact mode spacing adjustments */
+:root[data-compact-mode="on"] .message-item {
+  padding-block: calc(10px * var(--vera-spacing-scale));
+  margin-bottom: calc(8px * var(--vera-spacing-scale));
+}
+
+:root[data-compact-mode="on"] .dialog-content,
+:root[data-compact-mode="on"] .config-section {
+  padding: calc(16px * var(--vera-spacing-scale));
+  gap: calc(12px * var(--vera-spacing-scale));
+}
+
+:root[data-compact-mode="on"] .theme-row {
+  gap: calc(8px * var(--vera-spacing-scale));
+  margin-bottom: calc(6px * var(--vera-spacing-scale));
+}
+
+/* Border radius mode application */
+:root[data-radius-mode="sharp"] .p-button,
+:root[data-radius-mode="sharp"] .message-content,
+:root[data-radius-mode="sharp"] .config-section,
+:root[data-radius-mode="sharp"] .dialog-content,
+:root[data-radius-mode="sharp"] .tools-card {
+  border-radius: var(--vera-radius-sm) !important;
+}
+
+:root[data-radius-mode="rounded"] .p-button,
+:root[data-radius-mode="rounded"] .message-content,
+:root[data-radius-mode="rounded"] .config-section,
+:root[data-radius-mode="rounded"] .dialog-content,
+:root[data-radius-mode="rounded"] .tools-card {
+  border-radius: var(--vera-radius-xl) !important;
+}
+
+/* Animation speed application to transitions */
+:root {
+  --vera-transition-duration: calc(0.2s / var(--vera-anim-speed, 1));
+  --vera-transition-slow: calc(0.3s / var(--vera-anim-speed, 1));
+  --vera-transition-fast: calc(0.1s / var(--vera-anim-speed, 1));
+}
+
+/* ===== ACCESSIBILITY STYLES ===== */
+
+/* Reduced motion - respects user preference or manual setting */
+:root[data-reduced-motion="on"] *,
+:root[data-reduced-motion="on"] *::before,
+:root[data-reduced-motion="on"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+:root[data-reduced-motion="on"] .vera-aurora-overlay,
+:root[data-reduced-motion="on"] .vera-noise-overlay {
+  animation: none !important;
+}
+
+/* High contrast mode */
+:root[data-high-contrast="on"] {
+  --vera-glass-bg: var(--vera-black-90);
+  --vera-glass-strong: var(--vera-black-95);
+  --vera-glass-border: var(--vera-white-60);
+}
+
+:root[data-high-contrast="on"] .message-content,
+:root[data-high-contrast="on"] .config-section,
+:root[data-high-contrast="on"] .dialog-content,
+:root[data-high-contrast="on"] .tools-card {
+  border-width: 2px;
+}
+
+:root[data-high-contrast="on"][data-theme="light"] {
+  --vera-glass-bg: var(--vera-white-95);
+  --vera-glass-strong: var(--vera-white-98);
+  --vera-glass-border: var(--vera-black-50);
+}
+
+/* Line spacing */
+:root[data-line-spacing="tight"] .message-content,
+:root[data-line-spacing="tight"] .chat-input textarea {
+  line-height: var(--vera-line-height, 1.3);
+}
+
+:root[data-line-spacing="relaxed"] .message-content,
+:root[data-line-spacing="relaxed"] .chat-input textarea,
+:root[data-line-spacing="loose"] .message-content,
+:root[data-line-spacing="loose"] .chat-input textarea {
+  line-height: var(--vera-line-height, 1.9);
+}
+
+/* Letter spacing */
+:root[data-letter-spacing="tight"] .message-content,
+:root[data-letter-spacing="tight"] .chat-input textarea {
+  letter-spacing: var(--vera-letter-spacing, -0.02em);
+}
+
+:root[data-letter-spacing="relaxed"] .message-content,
+:root[data-letter-spacing="relaxed"] .chat-input textarea,
+:root[data-letter-spacing="loose"] .message-content,
+:root[data-letter-spacing="loose"] .chat-input textarea {
+  letter-spacing: var(--vera-letter-spacing, 0.03em);
+}
+
+/* Focus indicators */
+:root[data-focus-highlight="strong"] *:focus-visible,
+:root[data-focus-highlight="high"] *:focus-visible {
+  outline: var(--vera-focus-outline) !important;
+  outline-offset: 2px !important;
+}
+
+:root[data-focus-highlight="high"] *:focus-visible {
+  outline-offset: 3px !important;
+  box-shadow: 0 0 0 4px rgba(var(--vera-accent-rgb), 0.3) !important;
+}
+
+/* Skip link for keyboard navigation */
+.skip-link {
+  position: absolute;
+  top: -100px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--vera-accent);
+  color: var(--primary-color-text);
+  padding: 12px 24px;
+  border-radius: 8px;
+  z-index: 100001;
+  text-decoration: none;
+  font-weight: 600;
+  transition: top 0.2s ease;
+}
+
+.skip-link:focus {
+  top: 16px;
+}
+
+/* Screen reader only text */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ARIA live region for announcements */
+.aria-live-region {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ===== AVATAR STYLES ===== */
+
+/* Avatar size */
+.avatar-wrapper {
+  width: var(--vera-avatar-size, 36px);
+  height: var(--vera-avatar-size, 36px);
+  flex-shrink: 0;
+}
+
+/* Avatar border */
+.avatar-wrapper .avatar-image,
+.avatar-wrapper .p-avatar {
+  border: var(--vera-avatar-border, none);
+  border-image: var(--vera-avatar-border-image, none);
+  box-shadow: var(--vera-avatar-glow, none);
+}
+
+/* Avatar animations */
+:root[data-avatar-animation="pulse"] .avatar-wrapper {
+  animation: avatarPulse calc(2s / var(--vera-anim-speed, 1)) ease-in-out infinite;
+}
+
+:root[data-avatar-animation="glow"] .avatar-wrapper .avatar-image,
+:root[data-avatar-animation="glow"] .avatar-wrapper .p-avatar {
+  animation: avatarGlow calc(2.5s / var(--vera-anim-speed, 1)) ease-in-out infinite;
+}
+
+:root[data-avatar-animation="float"] .avatar-wrapper {
+  animation: avatarFloat calc(3s / var(--vera-anim-speed, 1)) ease-in-out infinite;
+}
+
+@keyframes avatarPulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 0.9;
+  }
+}
+
+@keyframes avatarGlow {
+  0%, 100% {
+    box-shadow: var(--vera-avatar-glow, 0 0 8px rgba(var(--vera-accent-rgb), 0.4));
+  }
+  50% {
+    box-shadow: 0 0 16px rgba(var(--vera-accent-rgb), 0.7), 0 0 24px rgba(var(--vera-accent-rgb), 0.3);
+  }
+}
+
+@keyframes avatarFloat {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+/* Status indicator */
+.avatar-status {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--vera-bg);
+  z-index: 1;
+}
+
+.avatar-status.online {
+  background-color: var(--vera-success);
+}
+
+.avatar-status.away {
+  background-color: var(--vera-warning);
+}
+
+.avatar-status.busy {
+  background-color: var(--vera-danger);
+}
+
+.avatar-status.offline {
+  background-color: var(--vera-text-muted);
+}
+
+/* Reduced motion for avatar animations */
+:root[data-reduced-motion="on"] .avatar-wrapper,
+:root[data-reduced-motion="on"] .avatar-wrapper .avatar-image,
+:root[data-reduced-motion="on"] .avatar-wrapper .p-avatar {
+  animation: none !important;
+}

@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "workflows": [
+    {
+      "name": "autonomy_followthrough",
+      "description": "Generic plan tracking and execution proof.",
+      "keywords": ["plan set", "autonomy engaged", "multitasking enabled"],
+      "required_tools": [],
+      "default_window_hours": 8.0,
+      "steps": [
+        {"id": "capture_plan", "title": "Capture commitment", "trigger": "discovered"},
+        {"id": "attempt_execution", "title": "Collect execution evidence", "trigger": "execution_evidence"},
+        {"id": "close_loop", "title": "Close loop with summary", "trigger": "terminal"}
+      ]
+    },
+    {
+      "name": "introspection_toolchain",
+      "description": "Run introspection/probe/toolchain checks and summarize outcomes.",
+      "keywords": ["introspection", "tool chain", "codex probe", "scaffold", "validation"],
+      "required_tools": ["sequentialthinking"],
+      "default_window_hours": 8.0,
+      "steps": [
+        {"id": "capture_plan", "title": "Capture introspection objective", "trigger": "discovered"},
+        {"id": "run_checks", "title": "Run probes/checks", "trigger": "execution_evidence"},
+        {"id": "report_outcome", "title": "Publish summary/report", "trigger": "terminal"}
+      ]
+    },
+    {
+      "name": "calendar_followthrough",
+      "description": "Track schedule-bound commitments and verify action in window.",
+      "keywords": ["calendar", "event", "schedule", "queued for", "trigger queued"],
+      "required_tools": ["create_event"],
+      "default_window_hours": 4.0,
+      "steps": [
+        {"id": "capture_plan", "title": "Capture scheduled commitment", "trigger": "discovered"},
+        {"id": "window_started", "title": "Enter scheduled execution window", "trigger": "window_started"},
+        {"id": "run_window_task", "title": "Execute scheduled task", "trigger": "execution_evidence"},
+        {"id": "close_loop", "title": "Close loop after window", "trigger": "terminal"}
+      ]
+    }
+  ]
+}

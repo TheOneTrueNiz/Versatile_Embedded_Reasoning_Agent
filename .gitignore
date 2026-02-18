@@ -70,3 +70,12 @@ dev/
 Thumbs.db
 .vscode/
 .idea/
+
+# env files (keep .example.env in git)
+config/callme_profiles/*.env
+!config/callme_profiles/*.example.env
+
+# generic env files
+.env
+.env.*
+!.env.example

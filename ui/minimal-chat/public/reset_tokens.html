@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Reset UI Tokens</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: #0f141d;
+        color: #e5edf6;
+        display: grid;
+        place-items: center;
+        min-height: 100vh;
+      }
+      .card {
+        background: #162131;
+        border: 1px solid #243447;
+        border-radius: 12px;
+        padding: 24px 28px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        max-width: 420px;
+        text-align: center;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 18px;
+      }
+      p {
+        margin: 0;
+        font-size: 14px;
+        opacity: 0.85;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Resetting UI theme tokens...</h1>
+      <p>This page clears all localStorage keys that start with "ui".</p>
+    </div>
+    <script>
+      (async function () {
+        const keysToRemove = [];
+        for (let i = 0; i < localStorage.length; i += 1) {
+          const key = localStorage.key(i);
+          if (key && key.startsWith('ui')) {
+            keysToRemove.push(key);
+          }
+        }
+        keysToRemove.forEach((key) => localStorage.removeItem(key));
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('resetCache') === '1') {
+          if ('serviceWorker' in navigator) {
+            const registrations = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(registrations.map((registration) => registration.unregister()));
+          }
+          if ('caches' in window) {
+            const cacheKeys = await caches.keys();
+            await Promise.all(cacheKeys.map((key) => caches.delete(key)));
+          }
+        }
+        const redirect = params.get('redirect') || '/';
+        window.location.replace(redirect);
+      })();
+    </script>
+  </body>
+</html>

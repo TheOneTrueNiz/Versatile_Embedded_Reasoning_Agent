@@ -1,0 +1,12 @@
+use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json
+
+server:
+  base_url: http://127.0.0.1:8081/
+  secret_key: "change-me-local-dev"
+  limiter: false
+  image_proxy: true

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VERA Setup</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body>
+    <div class="noise"></div>
+    <div class="glow glow-a"></div>
+    <div class="glow glow-b"></div>
+
+    <div class="wizard-shell">
+      <aside class="wizard-side">
+        <div class="brand">
+          <div class="brand-mark">VERA</div>
+          <div class="brand-sub">First-Run Setup</div>
+        </div>
+        <p class="brand-copy">
+          Configure core access, optional integrations, and Google OAuth in one
+          sleek pass. We will save credentials outside the repo at
+          <strong>~/Documents/creds</strong>.
+        </p>
+
+        <ol class="stepper">
+          <li data-step="welcome" class="active">Welcome</li>
+          <li data-step="llm">LLM Access</li>
+          <li data-step="optional">Tools &amp; Channels</li>
+          <li data-step="google">Google OAuth</li>
+          <li data-step="summary">Launch</li>
+        </ol>
+
+        <div class="side-footer">
+          <span class="pill">Sentinel Guard</span>
+          <span class="pill">Vera Core</span>
+        </div>
+      </aside>
+
+      <main class="wizard-main">
+        <section class="step active" data-step="welcome">
+          <h1>Welcome to Vera</h1>
+          <p class="lead">
+            Let’s get your core model access configured and keep everything
+            secure. You can skip optional integrations and return to them in the
+            UI later.
+          </p>
+          <div class="hero-card">
+            <div class="hero-badge">System Ready</div>
+            <h2>We will guide you step by step.</h2>
+            <p>
+              Choose your LLM path, add tools, and launch the full UI with your
+              preferences locked in.
+            </p>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" data-next>
+              Begin Setup
+            </button>
+          </div>
+        </section>
+
+        <section class="step" data-step="llm">
+          <h1>LLM Access</h1>
+          <p class="lead">Choose how Vera should connect to its model.</p>
+          <div class="choice-grid">
+            <label class="choice-card">
+              <input type="radio" name="llm-mode" value="xai" checked />
+              <span class="choice-title">xAI API</span>
+              <span class="choice-meta">Use your Grok key</span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="llm-mode" value="local" />
+              <span class="choice-title">Local/OpenAI-Compatible</span>
+              <span class="choice-meta">Run on your own hardware</span>
+            </label>
+          </div>
+
+          <div class="form-grid" data-llm="xai">
+            <label>
+              XAI API Key
+              <input id="xaiKey" type="password" placeholder="sk-..." />
+            </label>
+          </div>
+
+          <div class="form-grid hidden" data-llm="local">
+            <label>
+              Local Base URL
+              <input id="localBaseUrl" type="text" placeholder="http://127.0.0.1:8788/v1" />
+            </label>
+            <label>
+              Local API Key (optional)
+              <input id="localApiKey" type="password" placeholder="optional" />
+            </label>
+            <label>
+              Local Model ID (optional)
+              <input id="localModelId" type="text" placeholder="llama-3.1-8b-instruct" />
+            </label>
+          </div>
+
+          <div class="actions">
+            <button class="btn btn-ghost" data-back>Back</button>
+            <button class="btn btn-primary" data-next>Continue</button>
+          </div>
+        </section>
+
+        <section class="step" data-step="optional">
+          <h1>Tools &amp; Channels</h1>
+          <p class="lead">Enable any tools or messaging channels you want now. You can add more later.</p>
+
+          <div class="toggle-grid">
+            <div class="toggle-card" data-toggle="brave">
+              <div>
+                <h3>Brave Search</h3>
+                <p>Live web search through Brave APIs.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+            <div class="toggle-card" data-toggle="github">
+              <div>
+                <h3>GitHub</h3>
+                <p>Repository search and file reads.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+            <div class="toggle-card" data-toggle="searxng">
+              <div>
+                <h3>SearxNG</h3>
+                <p>Self-hosted metasearch.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+            <div class="toggle-card" data-toggle="obsidian">
+              <div>
+                <h3>Obsidian Vault</h3>
+                <p>Connect your vault for long-term notes.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+            <div class="toggle-card" data-toggle="hub">
+              <div>
+                <h3>Composio Hub</h3>
+                <p>One hub for 150+ app integrations.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+            <div class="toggle-card" data-toggle="browser">
+              <div>
+                <h3>Browser Automation</h3>
+                <p>Enable Playwright-powered web actions.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+            <div class="toggle-card" data-toggle="telegram">
+              <div>
+                <h3>Telegram</h3>
+                <p>Bot adapter with optional allowlists.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+            <div class="toggle-card" data-toggle="whatsapp">
+              <div>
+                <h3>WhatsApp Cloud API</h3>
+                <p>Meta Cloud API adapter + webhook.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+            <div class="toggle-card" data-toggle="discord">
+              <div>
+                <h3>Discord</h3>
+                <p>Discord bot adapter.</p>
+              </div>
+              <button class="toggle-btn" data-toggle-btn>Off</button>
+            </div>
+          </div>
+
+          <div class="form-grid hidden" data-optional="brave">
+            <label>
+              Brave API Key
+              <input id="braveKey" type="password" placeholder="brave-api-key" />
+            </label>
+          </div>
+          <div class="form-grid hidden" data-optional="github">
+            <label>
+              GitHub Token
+              <input id="githubToken" type="password" placeholder="ghp_..." />
+            </label>
+          </div>
+          <div class="form-grid hidden" data-optional="searxng">
+            <label>
+              SearxNG Base URL
+              <input id="searxngUrl" type="text" placeholder="http://127.0.0.1:8081" />
+            </label>
+          </div>
+          <div class="form-grid hidden" data-optional="obsidian">
+            <label>
+              Obsidian Vault Path
+              <input id="obsidianPath" type="text" placeholder="/home/you/Documents/VeraVault" />
+            </label>
+          </div>
+          <div class="form-grid hidden" data-optional="hub">
+            <label>
+              MCP Hub Command
+              <input id="hubCommand" type="text" placeholder="composio" />
+            </label>
+            <label>
+              MCP Hub Args (optional)
+              <input id="hubArgs" type="text" placeholder="serve --port 8269 --tools gmail,slack,notion,drive,linear,github --auth-mode local --log-level info" />
+            </label>
+            <label>
+              Composio API Key (optional)
+              <input id="composioKey" type="password" placeholder="composio-..." />
+            </label>
+          </div>
+          <div class="form-grid hidden" data-optional="telegram">
+            <label>
+              Telegram Bot Token
+              <input id="telegramToken" type="password" placeholder="123456:ABC-DEF..." />
+            </label>
+            <label>
+              Allowed Chats (optional)
+              <input id="telegramChats" type="text" placeholder="-10012345, -10067890" />
+            </label>
+            <label>
+              Allowed Users (optional)
+              <input id="telegramUsers" type="text" placeholder="123456, 789012" />
+            </label>
+            <label>
+              Command Prefix
+              <input id="telegramPrefix" type="text" value="/" />
+            </label>
+          </div>
+          <div class="form-grid hidden" data-optional="whatsapp">
+            <label>
+              WhatsApp Access Token
+              <input id="whatsappAccessToken" type="password" placeholder="EAAG..." />
+            </label>
+            <label>
+              Phone Number ID
+              <input id="whatsappPhoneId" type="text" placeholder="1234567890" />
+            </label>
+            <label>
+              Verify Token (optional)
+              <input id="whatsappVerifyToken" type="text" placeholder="your-verify-token" />
+            </label>
+            <label>
+              App Secret (optional)
+              <input id="whatsappAppSecret" type="password" placeholder="app-secret" />
+            </label>
+            <label>
+              Allowed Numbers (optional)
+              <input id="whatsappAllowedNumbers" type="text" placeholder="15551234567, 15557654321" />
+            </label>
+            <label>
+              Graph Version
+              <input id="whatsappGraphVersion" type="text" value="v20.0" />
+            </label>
+          </div>
+          <div class="form-grid hidden" data-optional="discord">
+            <label>
+              Discord Bot Token
+              <input id="discordToken" type="password" placeholder="discord-bot-token" />
+            </label>
+            <label>
+              Allowed Guilds (optional)
+              <input id="discordGuilds" type="text" placeholder="guild-id-1, guild-id-2" />
+            </label>
+            <label>
+              Allowed Users (optional)
+              <input id="discordUsers" type="text" placeholder="user-id-1, user-id-2" />
+            </label>
+            <label>
+              Command Prefix
+              <input id="discordPrefix" type="text" value="!" />
+            </label>
+          </div>
+
+          <div class="actions">
+            <button class="btn btn-ghost" data-back>Back</button>
+            <button class="btn btn-primary" data-next>Continue</button>
+          </div>
+        </section>
+
+        <section class="step" data-step="google">
+          <h1>Google OAuth</h1>
+          <p class="lead">
+            Workspace email and OAuth are optional. Add them now if you want Google tools.
+          </p>
+
+          <div class="form-grid">
+            <label>
+              Workspace Email
+              <input id="googleEmail" type="email" placeholder="you@gmail.com" />
+            </label>
+            <label>
+              Client ID
+              <input id="googleClientId" type="text" placeholder="Google OAuth Client ID" />
+            </label>
+            <label>
+              Client Secret
+              <input id="googleClientSecret" type="password" placeholder="Google OAuth Client Secret" />
+            </label>
+            <label>
+              Redirect URI
+              <input id="googleRedirectUri" type="text" value="http://127.0.0.1:8080/oauth2callback" />
+            </label>
+          </div>
+
+          <div class="actions">
+            <button class="btn btn-ghost" data-back>Back</button>
+            <button class="btn btn-primary" data-next>Continue</button>
+          </div>
+        </section>
+
+        <section class="step" data-step="summary">
+          <h1>Launch Vera</h1>
+          <p class="lead">Review your choices and launch the full interface.</p>
+
+          <div class="summary-card" id="summaryCard"></div>
+          <div class="status" id="statusText"></div>
+
+          <div class="actions">
+            <button class="btn btn-ghost" data-back>Edit</button>
+            <button class="btn btn-primary" id="launchBtn">Save &amp; Launch</button>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="wizard-toast" id="wizardToast"></div>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

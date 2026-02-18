@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${ROOT_DIR}/.venv"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 ENV_FILE="${ROOT_DIR}/scripts/vera_env.local"
+KEYCHAIN_SCRIPT="${ROOT_DIR}/scripts/vera_secret_store.sh"
 WHEELHOUSE_DIR="${VERA_WHEELHOUSE_DIR:-${ROOT_DIR}/wheelhouse}"
 VENV_SEED_ARCHIVE="${WHEELHOUSE_DIR}/venv_seed.tar.gz"
 REQ_FILE="${ROOT_DIR}/requirements.txt"
@@ -129,6 +130,16 @@ restore_venv_from_seed() {
 if [ -f "${ENV_FILE}" ]; then
   # shellcheck source=/dev/null
   source "${ENV_FILE}"
+fi
+if [ "${VERA_KEYCHAIN_LOAD:-1}" != "0" ] && [ -x "${KEYCHAIN_SCRIPT}" ]; then
+  eval "$("${KEYCHAIN_SCRIPT}" load 2>/dev/null || true)"
+fi
+
+if [ -z "${XAI_API_KEY:-}" ] && [ -n "${API_KEY:-}" ]; then
+  export XAI_API_KEY="${API_KEY}"
+fi
+if [ -z "${API_KEY:-}" ] && [ -n "${XAI_API_KEY:-}" ]; then
+  export API_KEY="${XAI_API_KEY}"
 fi
 
 if [ "${VERA_MAX:-0}" = "1" ]; then
@@ -260,7 +271,9 @@ if [ "${VERA_MCP_LOCAL:-0}" = "1" ]; then
 fi
 
 if [ -z "${XAI_API_KEY:-}" ]; then
-  echo "XAI_API_KEY not set. Export it first: export XAI_API_KEY=\"...\""
+  echo "XAI_API_KEY not set. Use:"
+  echo "  ./scripts/vera_secret_store.sh set XAI_API_KEY \"...\""
+  echo "or export it in your shell before launch."
 fi
 
 if [ "${VERA_NO_RUN:-0}" = "1" ]; then

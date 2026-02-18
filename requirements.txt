@@ -1,0 +1,48 @@
+# VERA - Personal AI Assistant
+# Python dependencies for core VERA functionality
+
+# === Core Dependencies ===
+httpx>=0.28.0        # HTTP client for xAI Grok API
+aiohttp>=3.10.0      # VERA API server (HTTP + WebSocket)
+websockets>=12.0     # Grok Voice Agent WebSocket client
+numpy>=1.26.0        # Audio + embeddings utilities
+sounddevice>=0.4.6   # Voice audio backend
+# pyaudio is optional and requires system headers (python-dev + portaudio)
+# that may be unavailable on fresh hosts without root package install.
+# It is installed best-effort in scripts/run_vera.sh when voice extras are enabled.
+# pyaudio>=0.2.14
+scipy>=1.11.0        # Audio resampling utilities
+pydantic>=2.5.0      # Tool schema validation for LLM bridge
+
+# === Optional Dependencies ===
+# Browser automation:
+playwright>=1.45.0
+# Messaging adapters:
+python-telegram-bot>=20.0
+# Web push notifications:
+pywebpush>=1.14.0
+# Uncomment if using Prometheus metrics:
+# prometheus-client>=0.21.0
+
+# Optional embeddings stack:
+# sentence-transformers>=2.2.2
+# faiss-cpu>=1.7.4
+
+# Optional LoRA training backend (Sprint 5 / VERA 3.0 runway):
+# torch>=2.2.0
+# transformers>=4.40.0
+# peft>=0.11.0
+# datasets>=2.19.0
+
+# === MCP Server Dependencies (Phase 2) ===
+# These are installed separately in their own environments
+# See mcp_server_and_tools/*/requirements.txt for details
+
+# === System Tray ===
+pystray>=0.19.5      # KDE/X11 system tray icon
+Pillow>=10.0.0       # Icon rendering for pystray
+
+# === Development Dependencies ===
+# (Testing/dev support; harmless if present in runtime envs)
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

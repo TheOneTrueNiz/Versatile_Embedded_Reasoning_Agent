@@ -1,0 +1,9 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: vera-searxng
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./config-local:/etc/searxng:rw
+    restart: unless-stopped

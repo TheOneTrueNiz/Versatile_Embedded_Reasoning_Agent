@@ -9,13 +9,25 @@ VERA is a local-first agent runtime with:
 ## Operator Entry Points
 
 - Online setup (optional): `./scripts/build_wheelhouse.sh`
+- One-time dev secret migration (optional): `./scripts/vera_secret_store.sh migrate-creds "${HOME}/Documents/creds"`
 - Offline bootstrap: `export VERA_WHEELHOUSE_DIR=/mnt/storage/vera_wheelhouse && VERA_NO_RUN=1 ./scripts/run_vera.sh`
 - Normal run: `./scripts/run_vera.sh`
 - Monolithic check: `python3 run_vera_monolithic.py --help`
 
 ## Quickstart
 
-1. Set credentials (expected outside repo): `~/Documents/creds`
+1. Configure secrets (recommended: OS keychain):
+
+```bash
+./scripts/vera_secret_store.sh set XAI_API_KEY "<your_key>"
+```
+
+Or migrate existing file-based secrets:
+
+```bash
+./scripts/vera_secret_store.sh migrate-creds "${HOME}/Documents/creds"
+```
+
 2. Smoke-check bootstrap without launching runtime:
 
 ```bash
@@ -33,6 +45,14 @@ VERA_NO_RUN=1 ./scripts/run_vera.sh
 ```bash
 .venv/bin/python run_vera_api.py --help
 ```
+
+## Secret Management (Dev + Prod)
+
+- Dev default: use OS keychain via `scripts/vera_secret_store.sh` (`secret-tool` on Linux, `security` on macOS).
+- Launchers auto-load keychain secrets when available (`VERA_KEYCHAIN_LOAD=1`, default).
+- File-based `~/Documents/creds` is still supported as fallback for compatibility.
+- Disable keychain loading if needed: `VERA_KEYCHAIN_LOAD=0`.
+- Production: inject secrets through environment/secret manager; do not store runtime secrets in repo files.
 
 ## API + UI + MCP
 
@@ -79,7 +99,7 @@ Included in git (production-required):
 
 Excluded / expected external:
 - `.venv/`, `wheelhouse/`, and `dev/` (gitignored)
-- Credentials in `~/Documents/creds`
+- Secrets in OS keychain (recommended) and/or credentials in `~/Documents/creds` (fallback)
 - Runtime/generated state (`logs/`, `tmp/`, `vera_memory/`, `vera_checkpoints/`, `rollback_storage/`)
 - Archived/non-production artifacts (kept under `dev/production_prune_*` if retained)
 
@@ -87,6 +107,7 @@ Excluded / expected external:
 
 - `RUNBOOK.md` for operator commands and runtime flow
 - `OFFLINE_BOOTSTRAP.md` for offline/bootstrap behavior details
+- `SECRETS.md` for keychain and credential migration workflows
 
 ## Ops Changes (2026-02-18)
 

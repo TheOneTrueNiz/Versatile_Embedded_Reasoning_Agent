@@ -1,0 +1,42 @@
+{
+  "channels": [
+    {
+      "type": "api",
+      "enabled": true
+    },
+    {
+      "type": "discord",
+      "enabled": false,
+      "settings": {
+        "token_env": "DISCORD_BOT_TOKEN",
+        "command_prefix": "!"
+      }
+    },
+    {
+      "type": "telegram",
+      "enabled": false,
+      "settings": {
+        "token_env": "TELEGRAM_BOT_TOKEN",
+        "command_prefix": "/"
+      }
+    },
+    {
+      "type": "whatsapp",
+      "enabled": false,
+      "settings": {
+        "token_env": "WHATSAPP_ACCESS_TOKEN",
+        "phone_number_id_env": "WHATSAPP_PHONE_NUMBER_ID",
+        "verify_token_env": "WHATSAPP_VERIFY_TOKEN",
+        "app_secret_env": "WHATSAPP_APP_SECRET",
+        "graph_version": "v20.0",
+        "allowed_numbers": []
+      }
+    },
+    {
+      "type": "custom",
+      "enabled": false,
+      "module": "your_adapter.module:YourAdapterClass",
+      "settings": {}
+    }
+  ]
+}
