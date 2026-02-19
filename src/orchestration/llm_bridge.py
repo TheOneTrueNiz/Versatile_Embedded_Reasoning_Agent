@@ -550,8 +550,11 @@ class LLMBridge:
             "generate video", "generate a video", "create video",
             "create a video", "make a video", "make video",
             "render video", "produce a video",
+            "video generation",
         )
         video_score += sum(3 for kw in video_strong if kw in text)
+        if re.search(r"\b(generate|create|make|render|produce)\s+(?:an?\s+|another\s+)?video\b", text):
+            video_score += 3
 
         video_medium = (
             "animate", "animation of", "video of", "clip of",
@@ -582,8 +585,11 @@ class LLMBridge:
             "generate image", "generate an image", "create image",
             "create an image", "make an image", "make image",
             "render image", "design image", "create a picture",
+            "image generation",
         )
         image_score += sum(3 for kw in image_strong if kw in text)
+        if re.search(r"\b(generate|create|make|render|design)\s+(?:an?\s+|another\s+)?image\b", text):
+            image_score += 3
 
         image_medium = (
             "draw ", "draw me", "sketch ", "illustration",
