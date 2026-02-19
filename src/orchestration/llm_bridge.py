@@ -130,6 +130,112 @@ class LLMBridge:
     def _normalize_task_text(task_text: str) -> str:
         return " ".join(str(task_text or "").strip().lower().split())
 
+    @classmethod
+    def _is_acknowledgement_turn(cls, task_text: str) -> bool:
+        normalized = cls._normalize_task_text(task_text)
+        if not normalized:
+            return True
+        acknowledgement_phrases = {
+            "yes",
+            "yes please",
+            "y",
+            "ok",
+            "okay",
+            "sure",
+            "yep",
+            "yup",
+            "no",
+            "n",
+            "no thanks",
+            "cancel",
+            "thanks",
+            "thank you",
+            "great",
+            "perfect",
+            "sounds good",
+            "looks good",
+            "cool",
+            "done",
+        }
+        return normalized in acknowledgement_phrases
+
+    @staticmethod
+    def _tool_result_requires_confirmation(result: Any) -> bool:
+        lowered = str(result or "").strip().lower()
+        if not lowered:
+            return False
+        return any(
+            phrase in lowered
+            for phrase in (
+                "confirmation required",
+                "awaiting confirmation",
+                "reply 'yes' to proceed",
+                "reply \"yes\" to proceed",
+                "reply with 'yes' to proceed",
+                "proceed? (yes/no)",
+                "proceed (yes/no)",
+            )
+        )
+
+    @staticmethod
+    def _parse_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _workflow_chain_step_budget(self) -> int:
+        raw = str(os.getenv("VERA_WORKFLOW_MAX_FORCED_STEPS", "")).strip()
+        if raw:
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                pass
+        return max(1, int(self.max_tool_rounds) - 1)
+
+    def _should_accept_workflow_chain(
+        self,
+        *,
+        context: str,
+        workflow_plan: Dict[str, Any],
+        workflow_chain: List[str],
+        explicit_tools: List[str],
+        forced_tool: Optional[str],
+    ) -> Tuple[bool, str]:
+        chain = [
+            str(name).strip()
+            for name in workflow_chain
+            if isinstance(name, str) and str(name).strip()
+        ]
+        if len(chain) < 2:
+            return False, "chain_too_short"
+        chain_budget = self._workflow_chain_step_budget()
+        if len(chain) > chain_budget:
+            return False, f"chain_exceeds_budget:{len(chain)}>{chain_budget}"
+        if self._is_acknowledgement_turn(context):
+            return False, "acknowledgement_turn"
+
+        explicit = {str(name).strip() for name in explicit_tools if isinstance(name, str) and str(name).strip()}
+        if explicit and explicit.isdisjoint(set(chain)):
+            return False, "explicit_intent_mismatch"
+
+        forced = str(forced_tool or "").strip()
+        if forced and forced not in chain:
+            return False, f"forced_tool_mismatch:{forced}"
+
+        source = str(workflow_plan.get("source") or "").strip().lower()
+        if source == "fuzzy":
+            confidence = self._parse_float(workflow_plan.get("confidence"), 0.0)
+            min_conf = self._parse_float(os.getenv("VERA_WORKFLOW_FUZZY_MIN_CONFIDENCE", "0.70"), 0.70)
+            if min_conf < 0.0:
+                min_conf = 0.0
+            if min_conf > 1.0:
+                min_conf = 1.0
+            if confidence < min_conf:
+                return False, f"fuzzy_low_confidence:{confidence:.3f}<{min_conf:.3f}"
+
+        return True, "ok"
+
     def set_request_workflow_hint(
         self,
         task_text: str,
@@ -451,14 +557,16 @@ class LLMBridge:
             "animate", "animation of", "video of", "clip of",
             "timelapse", "time-lapse", "motion graphics",
             "movie ", "film ", "short film", "cinematic video",
-            "video showing", "video with",
+            "video showing", "video with", "animation", "loop",
+            "video loop", "animated loop",
         )
         video_score += sum(2 for kw in video_medium if kw in text)
 
         video_weak = (
             "moving image", "in motion", "animated",
             "slow motion", "footage", "b-roll",
-            "transition", "visual effect", "vfx",
+            "transition", "visual effect", "vfx", "looping",
+            "seamless loop",
         )
         video_score += sum(1 for kw in video_weak if kw in text)
 
@@ -501,6 +609,48 @@ class LLMBridge:
         if image_score >= 2:
             return "image"
 
+        return None
+
+    @staticmethod
+    def _response_claims_generated_media(response_text: str, media_type: str) -> bool:
+        """Detect placeholder-style media success claims in plain text."""
+        text = str(response_text or "").lower()
+        if not text:
+            return False
+
+        if media_type == "video":
+            markers = ("embedded video", "generated video", ".mp4", " video:")
+        else:
+            markers = ("embedded image", "generated image", ".png", ".jpg", ".jpeg", ".webp", " image:")
+        return any(marker in text for marker in markers)
+
+    def _resolve_media_retry_tool(
+        self,
+        user_message: str,
+        assistant_content: str,
+        available_tool_names: List[str],
+    ) -> Optional[str]:
+        """Pick media tool to force when intent/claim exists but no tool call happened."""
+        available = {str(name).strip() for name in (available_tool_names or []) if str(name).strip()}
+
+        media_intent = self._detect_media_generation_intent(str(user_message or ""))
+        if media_intent == "video" and "generate_video" in available:
+            return "generate_video"
+        if media_intent == "image" and "generate_image" in available:
+            return "generate_image"
+
+        if self._response_claims_generated_media(assistant_content, "video") and "generate_video" in available:
+            return "generate_video"
+        if self._response_claims_generated_media(assistant_content, "image") and "generate_image" in available:
+            return "generate_image"
+        return None
+
+    @staticmethod
+    def _media_tool_for_intent(media_intent: Optional[str]) -> Optional[str]:
+        if media_intent == "video":
+            return "generate_video"
+        if media_intent == "image":
+            return "generate_image"
         return None
 
     @staticmethod
@@ -2035,6 +2185,10 @@ class LLMBridge:
 
         workflow_plan: Dict[str, Any] = self._consume_request_workflow_hint(context)
         workflow_suggested_chain: List[str] = list(workflow_plan.get("tool_chain", []) or [])
+        if self._is_acknowledgement_turn(context or ""):
+            workflow_plan = {}
+            workflow_suggested_chain = []
+            self._trace_workflow("suggest_chain_skip reason=acknowledgement_turn")
         if workflow_suggested_chain:
             self._trace_workflow(
                 "suggest_chain_result context_len=%s chain=%s signature=%s source=%s",
@@ -2047,9 +2201,11 @@ class LLMBridge:
             learning_loop = getattr(self.vera, "learning_loop", None) if self.vera else None
             if not learning_loop:
                 self._trace_workflow("suggest_chain_skip reason=no_learning_loop")
+            elif self._is_acknowledgement_turn(context or ""):
+                self._trace_workflow("suggest_chain_skip reason=acknowledgement_turn")
             elif not context:
                 self._trace_workflow("suggest_chain_skip reason=empty_context")
-            if learning_loop and context:
+            if learning_loop and context and not self._is_acknowledgement_turn(context or ""):
                 try:
                     if hasattr(learning_loop, "get_workflow_plan"):
                         raw_plan = learning_loop.get_workflow_plan(context)
@@ -2070,10 +2226,39 @@ class LLMBridge:
                     workflow_plan = {}
                     workflow_suggested_chain = []
         if workflow_suggested_chain:
+            chain_ok, chain_reason = self._should_accept_workflow_chain(
+                context=str(context or ""),
+                workflow_plan=workflow_plan,
+                workflow_chain=workflow_suggested_chain,
+                explicit_tools=list(explicit_tools),
+                forced_tool=forced_tool,
+            )
+            if not chain_ok:
+                self._trace_workflow(
+                    "suggest_chain_skip reason=%s chain=%s signature=%s source=%s",
+                    chain_reason,
+                    list(workflow_suggested_chain),
+                    str(workflow_plan.get("signature", "")),
+                    str(workflow_plan.get("source", "")),
+                )
+                workflow_plan = {}
+                workflow_suggested_chain = []
+        if workflow_suggested_chain:
             promoted_chain = [
                 name for name in workflow_suggested_chain
                 if name in native_defs or name in mcp_defs
             ]
+            # Media generation should execute directly; reusing learned chains here
+            # can force unrelated memory/web tools and exhaust tool-call rounds.
+            if forced_tool in {"generate_image", "generate_video"}:
+                self._trace_workflow(
+                    "suggest_chain_skip reason=media_forced_tool forced=%s chain=%s",
+                    forced_tool,
+                    list(workflow_suggested_chain),
+                )
+                workflow_plan = {}
+                workflow_suggested_chain = []
+                promoted_chain = []
             if promoted_chain:
                 forced_prefix: List[str] = []
                 if forced_tool and forced_tool in promoted_chain:
@@ -3037,6 +3222,9 @@ class LLMBridge:
         conversation_id: str,
         error: str = "",
     ) -> None:
+        if self._is_acknowledgement_turn(task_text):
+            self._trace_workflow("record_outcome_skip reason=acknowledgement_turn")
+            return
         if not self.vera:
             self._trace_workflow("record_outcome_skip reason=no_vera")
             return
@@ -3072,6 +3260,9 @@ class LLMBridge:
         conversation_id: str,
         error: str = "",
     ) -> None:
+        if self._is_acknowledgement_turn(task_text):
+            self._trace_workflow("record_replay_skip reason=acknowledgement_turn")
+            return
         if not self.vera:
             self._trace_workflow("record_replay_skip reason=no_vera")
             return
@@ -3129,6 +3320,9 @@ class LLMBridge:
         if not task_text:
             self._trace_workflow("runtime_plan_skip reason=empty_task_text")
             return plan
+        if self._is_acknowledgement_turn(task_text):
+            self._trace_workflow("runtime_plan_skip reason=acknowledgement_turn")
+            return plan
 
         payload = self.last_tool_payload if isinstance(self.last_tool_payload, dict) else {}
         raw_plan = payload.get("workflow_plan", {})
@@ -3149,6 +3343,15 @@ class LLMBridge:
                 "runtime_plan_skip reason=chain_too_short available=%s proposed=%s",
                 sorted(set(available_tools)),
                 list(plan.get("tool_chain", []) or []),
+            )
+            return {}
+        chain_budget = self._workflow_chain_step_budget()
+        if len(chain) > chain_budget:
+            self._trace_workflow(
+                "runtime_plan_skip reason=chain_exceeds_budget chain_len=%s budget=%s signature=%s",
+                len(chain),
+                chain_budget,
+                str(plan.get("signature") or ""),
             )
             return {}
 
@@ -3287,6 +3490,40 @@ class LLMBridge:
         if isinstance(self.last_tool_payload, dict):
             self.last_tool_payload["model_override"] = model_override
             self.last_tool_payload["model_reason"] = model_reason
+        media_intent = self._detect_media_generation_intent(user_message)
+        media_tool = self._media_tool_for_intent(media_intent)
+        if media_tool:
+            if media_tool not in available_tool_names:
+                unavailable_type = "Video" if media_intent == "video" else "Image"
+                unavailable_msg = (
+                    f"{unavailable_type} generation is currently unavailable because "
+                    f"`{media_tool}` is not registered in this runtime."
+                )
+                self.last_tools_used = list(tools_used)
+                self._emit_routing_signals(
+                    user_message, selected_categories, model_override,
+                    model_reason, tools_used,
+                )
+                self._record_workflow_outcome(
+                    task_text=user_message,
+                    tools_used=tools_used,
+                    success=False,
+                    conversation_id="default",
+                    error=unavailable_msg,
+                )
+                self._record_workflow_replay_result(
+                    task_text=user_message,
+                    workflow_plan=workflow_plan,
+                    success=False,
+                    conversation_id="default",
+                    error=unavailable_msg,
+                )
+                self._active_workflow_plan = {}
+                return unavailable_msg
+            current_tool_choice = self._force_tool_choice(media_tool)
+            workflow_plan = {}
+            self._active_workflow_plan = {}
+        media_retry_attempted = False
 
         # Inject system prompt instruction when live data intent requires tool use
         if getattr(self, "_live_data_forced_tool", None):
@@ -3332,6 +3569,29 @@ class LLMBridge:
 
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
+                content = message.get("content") or ""
+                if not media_retry_attempted and round_idx < (self.max_tool_rounds - 1):
+                    media_retry_tool = self._resolve_media_retry_tool(
+                        user_message=user_message,
+                        assistant_content=content,
+                        available_tool_names=available_tool_names,
+                    )
+                    if media_retry_tool:
+                        media_retry_attempted = True
+                        if self.history:
+                            self.history.pop()
+                        current_tool_choice = self._force_tool_choice(media_retry_tool)
+                        system_prompt += (
+                            f"\n\n## CRITICAL — Media Generation Required\n"
+                            f"The user asked for generated media. You MUST call `{media_retry_tool}` "
+                            f"before making any success claim. Do not output placeholder media text."
+                        )
+                        logger.warning(
+                            "Media intent/claim detected without tool call; retrying with forced tool: %s",
+                            media_retry_tool,
+                        )
+                        continue
+
                 self.last_tools_used = list(tools_used)
                 self._emit_routing_signals(
                     user_message, selected_categories, model_override,
@@ -3363,7 +3623,6 @@ class LLMBridge:
                     error=replay_error,
                 )
                 self._active_workflow_plan = dict(workflow_plan)
-                content = message.get("content") or ""
                 sanitized = self._sanitize_response_text(content)
                 if sanitized != content:
                     message["content"] = sanitized
@@ -3400,6 +3659,16 @@ class LLMBridge:
                 else:
                     tool_result = f"Tool execution unavailable for: {tool_name}"
                     exec_status = "error"
+
+                if exec_status == "ok" and self._tool_result_requires_confirmation(tool_result):
+                    exec_status = "error"
+                    if not workflow_error:
+                        workflow_error = f"confirmation_required:{tool_name}"
+                    workflow_failed = True
+                    if workflow_plan and workflow_plan.get("active"):
+                        workflow_plan["active"] = False
+                        if not workflow_plan.get("abandon_reason"):
+                            workflow_plan["abandon_reason"] = f"confirmation_required:{tool_name}"
 
                 exec_entry = {
                     "tool_name": tool_name,
@@ -3494,6 +3763,42 @@ class LLMBridge:
             conversation_id=conversation_id,
         )
         tools, tool_choice, selected_categories = await self._build_tool_schemas(last_user)
+        forced_override_name = ""
+        if isinstance(tool_choice_override, dict):
+            forced_override_name = str(
+                ((tool_choice_override.get("function") or {}).get("name") or "")
+            ).strip()
+        forced_override_available = True
+        if forced_override_name:
+            current_names = [
+                str((tool.get("function", {}) or {}).get("name") or "")
+                for tool in tools
+                if isinstance(tool, dict)
+            ]
+            if forced_override_name not in current_names:
+                augmented_context = (
+                    f"{last_user}\n\n"
+                    f"Tool override requirement: `{forced_override_name}`"
+                ).strip()
+                tools, tool_choice, selected_categories = await self._build_tool_schemas(
+                    augmented_context
+                )
+                refreshed_names = [
+                    str((tool.get("function", {}) or {}).get("name") or "")
+                    for tool in tools
+                    if isinstance(tool, dict)
+                ]
+                if forced_override_name in refreshed_names:
+                    logger.info(
+                        "Forced tool override injected into schema set: %s",
+                        forced_override_name,
+                    )
+                else:
+                    forced_override_available = False
+                    logger.warning(
+                        "Forced tool override still unavailable in schema set: %s",
+                        forced_override_name,
+                    )
         available_tool_names = [
             str((tool.get("function", {}) or {}).get("name") or "")
             for tool in tools
@@ -3505,6 +3810,13 @@ class LLMBridge:
             self.last_tool_payload["model_override"] = model_override
             self.last_tool_payload["model_reason"] = model_reason
         effective_tool_choice = tool_choice_override if tool_choice_override is not None else tool_choice
+        if tool_choice_override is not None and forced_override_name and not forced_override_available:
+            # Avoid invalid forced tool_choice payloads that trigger provider 400 responses.
+            effective_tool_choice = tool_choice
+            logger.warning(
+                "Requested tool_choice override unavailable; falling back to auto selection: %s",
+                forced_override_name,
+            )
         workflow_plan = self._resolve_workflow_runtime_plan(
             task_text=last_user,
             available_tools=[name for name in available_tool_names if name],
@@ -3515,10 +3827,47 @@ class LLMBridge:
         if workflow_plan and not current_tool_choice:
             workflow_plan["forced_steps"] = int(workflow_plan.get("forced_steps", 0) or 0) + 1
             current_tool_choice = self._force_tool_choice(workflow_plan["tool_chain"][0])
+        media_intent = self._detect_media_generation_intent(last_user)
+        media_tool = self._media_tool_for_intent(media_intent)
+        if media_tool:
+            if media_tool not in available_tool_names:
+                unavailable_type = "Video" if media_intent == "video" else "Image"
+                unavailable_msg = (
+                    f"{unavailable_type} generation is currently unavailable because "
+                    f"`{media_tool}` is not registered in this runtime."
+                )
+                if persist_history:
+                    self.history = list(history)
+                if not _is_title_gen:
+                    self.last_tools_used = list(tools_used)
+                self._emit_routing_signals(
+                    last_user, selected_categories, model_override,
+                    model_reason, tools_used, conversation_id or "default",
+                )
+                self._record_workflow_outcome(
+                    task_text=last_user,
+                    tools_used=tools_used,
+                    success=False,
+                    conversation_id=conversation_id or "default",
+                    error=unavailable_msg,
+                )
+                self._record_workflow_replay_result(
+                    task_text=last_user,
+                    workflow_plan=workflow_plan,
+                    success=False,
+                    conversation_id=conversation_id or "default",
+                    error=unavailable_msg,
+                )
+                self._active_workflow_plan = {}
+                return unavailable_msg
+            current_tool_choice = self._force_tool_choice(media_tool)
+            workflow_plan = {}
+            self._active_workflow_plan = {}
         if isinstance(self.last_tool_payload, dict):
             self.last_tool_payload["requested_tool_choice"] = (
                 effective_tool_choice if effective_tool_choice is not None else "auto"
             )
+        media_retry_attempted = False
 
         # Inject system prompt instruction when live data intent requires tool use
         if getattr(self, "_live_data_forced_tool", None):
@@ -3567,6 +3916,29 @@ class LLMBridge:
 
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
+                content = message.get("content") or ""
+                if not media_retry_attempted and _round_idx < (self.max_tool_rounds - 1):
+                    media_retry_tool = self._resolve_media_retry_tool(
+                        user_message=last_user,
+                        assistant_content=content,
+                        available_tool_names=available_tool_names,
+                    )
+                    if media_retry_tool:
+                        media_retry_attempted = True
+                        if working_history:
+                            working_history.pop()
+                        current_tool_choice = self._force_tool_choice(media_retry_tool)
+                        system_prompt += (
+                            f"\n\n## CRITICAL — Media Generation Required\n"
+                            f"The user asked for generated media. You MUST call `{media_retry_tool}` "
+                            f"before making any success claim. Do not output placeholder media text."
+                        )
+                        logger.warning(
+                            "Media intent/claim detected without tool call; retrying with forced tool: %s",
+                            media_retry_tool,
+                        )
+                        continue
+
                 if persist_history:
                     self.history = working_history
                 if not _is_title_gen:
@@ -3601,7 +3973,6 @@ class LLMBridge:
                     error=replay_error,
                 )
                 self._active_workflow_plan = dict(workflow_plan)
-                content = message.get("content") or ""
                 sanitized = self._sanitize_response_text(content)
                 if sanitized != content:
                     message["content"] = sanitized
@@ -3638,6 +4009,16 @@ class LLMBridge:
                 else:
                     tool_result = f"Tool execution unavailable for: {tool_name}"
                     exec_status = "error"
+
+                if exec_status == "ok" and self._tool_result_requires_confirmation(tool_result):
+                    exec_status = "error"
+                    if not workflow_error:
+                        workflow_error = f"confirmation_required:{tool_name}"
+                    workflow_failed = True
+                    if workflow_plan and workflow_plan.get("active"):
+                        workflow_plan["active"] = False
+                        if not workflow_plan.get("abandon_reason"):
+                            workflow_plan["abandon_reason"] = f"confirmation_required:{tool_name}"
 
                 # Record execution in history
                 exec_entry = {
