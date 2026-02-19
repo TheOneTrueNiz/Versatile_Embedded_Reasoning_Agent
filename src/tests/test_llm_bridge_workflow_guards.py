@@ -80,3 +80,38 @@ def test_resolve_runtime_plan_accepts_within_budget_chain() -> None:
     assert plan.get("active") is True
     assert plan.get("tool_chain") == ["a", "b", "c", "d", "e"]
     assert plan.get("forced_steps") == 0
+
+
+def test_tool_calls_signature_is_stable_for_json_key_order() -> None:
+    calls_a = [
+        {
+            "function": {
+                "name": "search_files",
+                "arguments": "{\"path\":\"src\",\"query\":\"vera\",\"limit\":5}",
+            }
+        }
+    ]
+    calls_b = [
+        {
+            "function": {
+                "name": "search_files",
+                "arguments": "{\"limit\":5,\"query\":\"vera\",\"path\":\"src\"}",
+            }
+        }
+    ]
+    assert LLMBridge._tool_calls_signature(calls_a) == LLMBridge._tool_calls_signature(calls_b)
+
+
+def test_tool_calls_signature_changes_when_arguments_change() -> None:
+    calls_a = [{"function": {"name": "time", "arguments": "{\"timezone\":\"UTC\"}"}}]
+    calls_b = [{"function": {"name": "time", "arguments": "{\"timezone\":\"America/Chicago\"}"}}]
+    assert LLMBridge._tool_calls_signature(calls_a) != LLMBridge._tool_calls_signature(calls_b)
+
+
+def test_tool_loop_no_progress_limit_default_and_override(monkeypatch) -> None:
+    monkeypatch.delenv("VERA_TOOL_LOOP_NO_PROGRESS_LIMIT", raising=False)
+    bridge = _make_bridge(max_tool_rounds=5)
+    assert bridge._tool_loop_no_progress_limit() == 3
+
+    monkeypatch.setenv("VERA_TOOL_LOOP_NO_PROGRESS_LIMIT", "2")
+    assert bridge._tool_loop_no_progress_limit() == 2

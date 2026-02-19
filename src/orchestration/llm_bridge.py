@@ -10,6 +10,7 @@ Backward compatible: works with direct httpx calls (legacy) or ProviderRegistry.
 """
 
 import json
+import hashlib
 import logging
 import os
 import time
@@ -192,6 +193,48 @@ class LLMBridge:
             except (TypeError, ValueError):
                 pass
         return max(1, int(self.max_tool_rounds) - 1)
+
+    def _tool_loop_no_progress_limit(self) -> int:
+        return self._read_int_env(
+            "VERA_TOOL_LOOP_NO_PROGRESS_LIMIT",
+            3,
+            min_value=1,
+            max_value=20,
+        )
+
+    @staticmethod
+    def _normalize_tool_call_arguments(arguments: Any) -> str:
+        if arguments is None:
+            return ""
+        if isinstance(arguments, dict):
+            return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        raw = str(arguments).strip()
+        if not raw:
+            return ""
+        try:
+            parsed = json.loads(raw)
+            return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        except Exception:
+            return raw
+
+    @classmethod
+    def _tool_calls_signature(cls, tool_calls: List[Dict[str, Any]]) -> str:
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return ""
+        normalized_calls: List[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            func = call.get("function", {}) or {}
+            name = str(func.get("name") or "").strip()
+            if not name:
+                continue
+            args = cls._normalize_tool_call_arguments(func.get("arguments"))
+            normalized_calls.append(f"{name}:{args}")
+        if not normalized_calls:
+            return ""
+        canonical = "|".join(normalized_calls)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
 
     def _should_accept_workflow_chain(
         self,
@@ -3530,6 +3573,9 @@ class LLMBridge:
             workflow_plan = {}
             self._active_workflow_plan = {}
         media_retry_attempted = False
+        tool_loop_no_progress_limit = self._tool_loop_no_progress_limit()
+        last_tool_call_signature = ""
+        repeated_tool_call_rounds = 0
 
         # Inject system prompt instruction when live data intent requires tool use
         if getattr(self, "_live_data_forced_tool", None):
@@ -3634,6 +3680,12 @@ class LLMBridge:
                     message["content"] = sanitized
                 return sanitized
 
+            current_tool_call_signature = self._tool_calls_signature(tool_calls)
+            if current_tool_call_signature and current_tool_call_signature == last_tool_call_signature:
+                repeated_tool_call_rounds += 1
+            else:
+                repeated_tool_call_rounds = 1 if current_tool_call_signature else 0
+            last_tool_call_signature = current_tool_call_signature
             called_tools: List[str] = []
             for call in tool_calls:
                 func = call.get("function", {})
@@ -3703,6 +3755,24 @@ class LLMBridge:
                     "name": tool_name,
                     "content": tool_result,
                 })
+            if (
+                current_tool_call_signature
+                and repeated_tool_call_rounds >= tool_loop_no_progress_limit
+            ):
+                workflow_failed = True
+                if not workflow_error:
+                    workflow_error = f"no_progress_tool_loop:repeat_rounds={repeated_tool_call_rounds}"
+                if workflow_plan and workflow_plan.get("active"):
+                    workflow_plan["active"] = False
+                    if not workflow_plan.get("abandon_reason"):
+                        workflow_plan["abandon_reason"] = "no_progress_tool_loop"
+                logger.warning(
+                    "No-progress tool loop circuit breaker tripped (round=%s repeat_rounds=%s signature=%s)",
+                    round_idx,
+                    repeated_tool_call_rounds,
+                    current_tool_call_signature,
+                )
+                break
             current_tool_choice = self._advance_workflow_runtime_plan(
                 workflow_plan=workflow_plan,
                 called_tools=called_tools,
@@ -3730,6 +3800,8 @@ class LLMBridge:
             error=replay_error,
         )
         self._active_workflow_plan = dict(workflow_plan)
+        if str(workflow_error or "").startswith("no_progress_tool_loop"):
+            return "Tool loop made no progress; aborted safely. Please rephrase or narrow the request."
         return "Tool call limit reached; unable to complete the request."
 
     async def respond_messages(
@@ -3874,6 +3946,9 @@ class LLMBridge:
                 effective_tool_choice if effective_tool_choice is not None else "auto"
             )
         media_retry_attempted = False
+        tool_loop_no_progress_limit = self._tool_loop_no_progress_limit()
+        last_tool_call_signature = ""
+        repeated_tool_call_rounds = 0
 
         # Inject system prompt instruction when live data intent requires tool use
         if getattr(self, "_live_data_forced_tool", None):
@@ -3984,6 +4059,12 @@ class LLMBridge:
                     message["content"] = sanitized
                 return sanitized
 
+            current_tool_call_signature = self._tool_calls_signature(tool_calls)
+            if current_tool_call_signature and current_tool_call_signature == last_tool_call_signature:
+                repeated_tool_call_rounds += 1
+            else:
+                repeated_tool_call_rounds = 1 if current_tool_call_signature else 0
+            last_tool_call_signature = current_tool_call_signature
             called_tools: List[str] = []
             for call in tool_calls:
                 func = call.get("function", {})
@@ -4055,6 +4136,24 @@ class LLMBridge:
                     "name": tool_name,
                     "content": tool_result,
                 })
+            if (
+                current_tool_call_signature
+                and repeated_tool_call_rounds >= tool_loop_no_progress_limit
+            ):
+                workflow_failed = True
+                if not workflow_error:
+                    workflow_error = f"no_progress_tool_loop:repeat_rounds={repeated_tool_call_rounds}"
+                if workflow_plan and workflow_plan.get("active"):
+                    workflow_plan["active"] = False
+                    if not workflow_plan.get("abandon_reason"):
+                        workflow_plan["abandon_reason"] = "no_progress_tool_loop"
+                logger.warning(
+                    "No-progress tool loop circuit breaker tripped (round=%s repeat_rounds=%s signature=%s)",
+                    _round_idx,
+                    repeated_tool_call_rounds,
+                    current_tool_call_signature,
+                )
+                break
             current_tool_choice = self._advance_workflow_runtime_plan(
                 workflow_plan=workflow_plan,
                 called_tools=called_tools,
@@ -4085,7 +4184,8 @@ class LLMBridge:
             error=replay_error,
         )
         self._active_workflow_plan = dict(workflow_plan)
-
+        if str(workflow_error or "").startswith("no_progress_tool_loop"):
+            return "Tool loop made no progress; aborted safely. Please rephrase or narrow the request."
         return "Tool call limit reached; unable to complete the request."
 
     async def parse_structured(
