@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "name": "VERA Guided Learning Curriculum",
+  "description": "Tool fluency drills for Vera as a synthetic collaborative partner. Lessons emphasize deterministic tool use, memory carryover, proactive follow-through, and native media generation.",
+  "lessons": [
+    {
+      "id": "core_time_reasoning",
+      "title": "Temporal Grounding",
+      "objective": "Use objective time data and deterministic arithmetic before answering.",
+      "conversation_group": "core_reflex",
+      "prompt": "Use `time` in UTC and `calculate` to compute how many minutes remain until the next UTC hour. Return one equation and final number.",
+      "expected_tools_any_order": [
+        "time",
+        "calculate"
+      ]
+    },
+    {
+      "id": "core_sequential_reasoning",
+      "title": "Reasoning Then Compute",
+      "objective": "Show concise planning and exact computation.",
+      "conversation_group": "core_reflex",
+      "prompt": "Use `sequentialthinking` for a two-step plan, then use `calculate` to compute 47*23. Keep the final answer concise.",
+      "expected_tools_any_order": [
+        "sequentialthinking",
+        "calculate"
+      ]
+    },
+    {
+      "id": "partner_memory_continuity",
+      "title": "Partner Continuity",
+      "objective": "Treat partner context as persistent and queryable.",
+      "conversation_group": "partner_memory",
+      "prompt": "Use `retrieve_memory` for query `Niz` and `search_archive` for query `Niz`. Return one actionable follow-up Vera should initiate next.",
+      "expected_tools_any_order": [
+        "retrieve_memory",
+        "search_archive"
+      ]
+    },
+    {
+      "id": "filesystem_memory_coordination",
+      "title": "Workspace + Memory Coordination",
+      "objective": "Use memory graph and file permissions together before acting.",
+      "conversation_group": "core_reflex",
+      "prompt": "Use `read_graph` and `list_allowed_directories`, then propose one safe path to persist guided-learning notes for later recall.",
+      "expected_tools_any_order": [
+        "read_graph",
+        "list_allowed_directories"
+      ]
+    },
+    {
+      "id": "knowledge_triangulation",
+      "title": "Search Triangulation",
+      "objective": "Cross-check web + encyclopedia before summarizing.",
+      "conversation_group": "research_reflex",
+      "prompt": "Use `brave_web_search` and `search_wikipedia` on `Model Context Protocol`, then return a four-line synthesis with one caveat.",
+      "expected_tool_groups_any_order": [
+        [
+          "brave_web_search",
+          "brave_ai_grounding",
+          "searxng_search",
+          "google_search"
+        ],
+        [
+          "search_wikipedia",
+          "get_summary",
+          "get_article",
+          "search",
+          "get_page",
+          "get_page_content"
+        ]
+      ]
+    },
+    {
+      "id": "native_image_generation",
+      "title": "Native Image Tool",
+      "objective": "Call native image generation and report concrete artifact metadata.",
+      "conversation_group": "media_reflex",
+      "prompt": "Use `generate_image` to create a calm autumn forest stream scene. Return the generated asset URL/path and one-line alt text.",
+      "expected_tools_any_order": [
+        "generate_image"
+      ]
+    },
+    {
+      "id": "native_video_generation",
+      "title": "Native Video Tool",
+      "objective": "Call native video generation and report concrete artifact metadata.",
+      "conversation_group": "media_reflex",
+      "prompt": "Use `generate_video` to create a 10-second serene forest stream loop with gentle falling leaves. Return the generated asset URL/path and a short description.",
+      "expected_tools_any_order": [
+        "generate_video"
+      ]
+    },
+    {
+      "id": "coding_workspace_reflex",
+      "title": "Coding Workspace Reflex",
+      "objective": "Read then write in a bounded local file workflow.",
+      "conversation_group": "coding_reflex",
+      "prompt": "Use `read_file` on `README.md`, then use `write_file` to create `tmp/curriculum_probe.txt` containing a one-sentence summary of Vera operator entry points.",
+      "expected_tools_any_order": [
+        "read_file",
+        "write_file"
+      ]
+    },
+    {
+      "id": "memory_encode_recall_loop",
+      "title": "Encode + Recall Loop",
+      "objective": "Persist a marker and verify retrieval within the same learning session.",
+      "conversation_group": "partner_memory",
+      "prompt": "Use `encode_event` to persist marker `guided_curriculum_marker`, then use `retrieve_memory` for that marker and reply PASS/FAIL.",
+      "expected_tools_any_order": [
+        "encode_event",
+        "retrieve_memory"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+Tool Inventory
+379 tools
+Core
+25
+filesystem (14)
+read_file, read_text_file, read_media_file, read_multiple_files, write_file, edit_file, create_directory, list_directory, list_directory_with_sizes, directory_tree, move_file, search_files, get_file_info, list_allowed_directories
+memory (9)
+create_entities, create_relations, add_observations, delete_entities, delete_observations, delete_relations, read_graph, search_nodes, open_nodes
+time (1)
+time
+sequential-thinking (1)
+sequentialthinking
+Search
+10
+brave-search (9)
+brave_web_search, brave_news_search, brave_video_search, brave_image_search, brave_local_search, brave_suggest, brave_spellcheck, brave_summarize, brave_ai_grounding
+searxng (1)
+searxng_search
+Knowledge
+5
+pdf-reader (5)
+read_pdf_text, extract_pdf_images, read_pdf_with_ocr, get_pdf_info, analyze_pdf_structure
+Notes
+14
+obsidian-vault (14)
+read_file, read_text_file, read_media_file, read_multiple_files, write_file, edit_file, create_directory, list_directory, list_directory_with_sizes, directory_tree, move_file, search_files, get_file_info, list_allowed_directories
+Workspace
+95
+google-workspace (95)
+start_google_auth, list_calendars, get_events, create_event, modify_event, delete_event, list_spaces, get_messages, send_message, search_messages, search_docs, get_doc_content, list_docs_in_folder, create_doc, modify_doc_text, find_and_replace_doc, insert_doc_elements, insert_doc_image, update_doc_headers_footers, batch_update_doc, inspect_doc_structure, create_table_with_data, debug_table_structure, export_doc_to_pdf, read_document_comments, create_document_comment, reply_to_document_comment, resolve_document_comment, search_drive_files, get_drive_file_content, get_drive_file_download_url, list_drive_items, create_drive_file, get_drive_file_permissions, check_drive_file_public_access, update_drive_file, get_drive_shareable_link, share_drive_file, batch_share_drive_file, update_drive_permission, remove_drive_permission, transfer_drive_ownership, create_form, get_form, set_publish_settings, get_form_response, list_form_responses, search_gmail_messages, get_gmail_message_content, get_gmail_messages_content_batch, send_gmail_message, draft_gmail_message, get_gmail_thread_content, get_gmail_threads_content_batch, list_gmail_labels, manage_gmail_label, list_gmail_filters, create_gmail_filter, delete_gmail_filter, modify_gmail_message_labels, batch_modify_gmail_message_labels, search_custom, get_search_engine_info, search_custom_siterestrict, list_spreadsheets, get_spreadsheet_info, read_sheet_values, modify_sheet_values, create_spreadsheet, create_sheet, read_spreadsheet_comments, create_spreadsheet_comment, reply_to_spreadsheet_comment, resolve_spreadsheet_comment, create_presentation, get_presentation, batch_update_presentation, get_page, get_page_thumbnail, read_presentation_comments, create_presentation_comment, reply_to_presentation_comment, resolve_presentation_comment, list_task_lists, get_task_list, create_task_list, update_task_list, delete_task_list, list_tasks, get_task, create_task, update_task, delete_task, move_task, clear_completed_tasks
+Dev
+26
+github (26)
+create_or_update_file, search_repositories, create_repository, get_file_contents, push_files, create_issue, create_pull_request, fork_repository, create_branch, list_commits, list_issues, update_issue, add_issue_comment, search_code, search_issues, search_users, get_issue, get_pull_request, list_pull_requests, create_pull_request_review, merge_pull_request, get_pull_request_files, get_pull_request_status, update_pull_request_branch, get_pull_request_comments, get_pull_request_reviews
+Media
+5
+memvid (3)
+memvid_encode_text, memvid_encode_file, memvid_search
+youtube-transcript (2)
+get_transcript, search_youtube
+Other
+199
+browserbase (9)
+browserbase_session_create, browserbase_session_close, browserbase_stagehand_navigate, browserbase_stagehand_act, browserbase_stagehand_extract, browserbase_stagehand_observe, browserbase_screenshot, browserbase_stagehand_get_url, browserbase_stagehand_agent
+calculator (4)
+calculate, convert_units, percentage, statistics
+call-me (3)
+initiate_call, send_mobile_push, send_native_push
+composio (6)
+COMPOSIO_MANAGE_CONNECTIONS, COMPOSIO_MULTI_EXECUTE_TOOL, COMPOSIO_REMOTE_BASH_TOOL, COMPOSIO_REMOTE_WORKBENCH, COMPOSIO_SEARCH_TOOLS, COMPOSIO_GET_TOOL_SCHEMAS
+grokipedia (7)
+search, get_page, get_page_content, get_page_citations, get_related_pages, get_page_section, get_page_sections
+marm-memory (18)
+marm_start, marm_refresh, marm_smart_recall, marm_contextual_log, marm_log_session, marm_log_entry, marm_log_show, marm_log_delete, marm_notebook_add, marm_notebook_use, marm_notebook_show, marm_notebook_status, marm_notebook_clear, marm_notebook_delete, marm_summary, marm_context_bridge, marm_system_info, marm_reload_docs
+sandbox (7)
+sandbox_shell_exec, sandbox_file_read, sandbox_file_write, sandbox_python_exec, sandbox_nodejs_exec, sandbox_browser_navigate, sandbox_file_search
+scrapeless (21)
+google_search, google_trends, scrape_html, scrape_markdown, scrape_screenshot, browser_click, browser_close, browser_create, browser_get_html, browser_get_text, browser_go_back, browser_go_forward, browser_goto, browser_press_key, browser_screenshot, browser_scroll, browser_scroll_to, browser_snapshot, browser_type, browser_wait, browser_wait_for
+stealth-browser (90)
+spawn_browser, list_instances, close_instance, get_instance_state, navigate, go_back, go_forward, reload_page, query_elements, click_element, type_text, paste_text, select_option, get_element_state, wait_for_element, scroll_page, execute_script, get_page_content, take_screenshot, list_network_requests, get_request_details, get_response_details, get_response_content, modify_headers, get_cookies, set_cookie, clear_cookies, get_debug_view, clear_debug_view, export_debug_logs, get_debug_lock_status, list_tabs, switch_tab, close_tab, get_active_tab, new_tab, extract_element_styles, extract_element_structure, extract_element_events, extract_element_animations, extract_element_assets, extract_element_styles_cdp, extract_related_files, clone_element_complete, hot_reload, reload_status, validate_browser_environment_tool, clone_element_progressive, expand_styles, expand_events, expand_children, expand_css_rules, expand_pseudo_elements, expand_animations, list_stored_elements, clear_stored_element, clear_all_elements, clone_element_to_file, extract_complete_element_to_file, extract_complete_element_cdp, extract_element_styles_to_file, extract_element_structure_to_file, extract_element_events_to_file, extract_element_animations_to_file, extract_element_assets_to_file, list_clone_files, cleanup_clone_files, list_cdp_commands, execute_cdp_command, get_execution_contexts, discover_global_functions, discover_object_methods, call_javascript_function, inspect_function_signature, inject_and_execute_script, create_persistent_function, execute_function_sequence, create_python_binding, execute_python_in_browser, get_function_executor_info, create_dynamic_hook, create_simple_dynamic_hook, list_dynamic_hooks, get_dynamic_hook_details, remove_dynamic_hook, get_hook_documentation, get_hook_examples, get_hook_requirements_documentation, get_hook_common_patterns, validate_hook_function
+wikipedia-mcp (11)
+search_wikipedia, test_wikipedia_connectivity, get_article, get_summary, summarize_article_for_query, summarize_article_section, extract_key_facts, get_related_topics, get_sections, get_links, get_coordinates
+x-twitter (23)
+get_user_profile, get_user_by_screen_name, get_user_by_id, get_user_followers, get_user_following, get_user_followers_you_know, get_user_subscriptions, post_tweet, delete_tweet, get_tweet_details, create_poll_tweet, vote_on_poll, favorite_tweet, unfavorite_tweet, bookmark_tweet, delete_bookmark, delete_all_bookmarks, get_timeline, get_latest_timeline, search_twitter, get_trends, get_highlights_tweets, get_user_mentions

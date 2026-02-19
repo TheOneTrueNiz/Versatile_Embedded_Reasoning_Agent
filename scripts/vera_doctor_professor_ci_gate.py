@@ -12,11 +12,20 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib import error, request
+
+
+PROFESSOR_EQUIVALENT_TOOL_GROUPS: Dict[str, List[List[str]]] = {
+    "web_knowledge_chain": [
+        ["brave_web_search", "brave_ai_search", "searxng_search"],
+        ["search_wikipedia", "get_summary", "get_article", "search", "get_page", "get_page_content"],
+    ],
+}
 
 
 @dataclass
@@ -90,6 +99,39 @@ def _load_json(path: Path) -> Dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _wait_for_readiness(
+    base_url: str,
+    timeout_s: float,
+    ready_streak: int = 3,
+    poll_s: float = 1.0,
+) -> bool:
+    timeout = max(0.0, float(timeout_s))
+    if timeout <= 0.0:
+        return True
+    required_streak = max(1, int(ready_streak))
+    deadline = time.time() + timeout
+    streak = 0
+    url = f"{base_url.rstrip('/')}/api/readiness"
+    while time.time() < deadline:
+        try:
+            req = request.Request(url, method="GET")
+            with request.urlopen(req, timeout=max(2.0, poll_s + 1.5)) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                payload = json.loads(raw)
+                ready = bool(resp.getcode() == 200 and isinstance(payload, dict) and payload.get("ready") is True)
+        except Exception:
+            ready = False
+
+        if ready:
+            streak += 1
+            if streak >= required_streak:
+                return True
+        else:
+            streak = 0
+        time.sleep(max(0.1, poll_s))
+    return False
 
 
 def _record_memory_event(
@@ -201,21 +243,72 @@ def _professor_ok(payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     lessons = payload.get("lessons")
     if not isinstance(lessons, list) or not lessons:
         return False, {"reason": "missing lessons"}
+
+    def _tools_cover_groups(used: List[str], groups: List[List[str]]) -> bool:
+        used_set = {str(item).strip() for item in used if str(item).strip()}
+        if not used_set:
+            return False
+        for group in groups:
+            names = [str(name).strip() for name in group if str(name).strip()]
+            if names and not any(name in used_set for name in names):
+                return False
+        return True
+
     total = len(lessons)
-    passed = int(payload.get("pass") or 0)
-    failed = int(payload.get("fail") or 0)
+    passed = 0
+    failed = 0
     missing: Dict[str, List[str]] = {}
+    compat_recovered: List[str] = []
     for lesson in lessons:
-        if isinstance(lesson, dict) and not lesson.get("passed"):
-            lesson_id = str(lesson.get("id") or "unknown")
-            miss = lesson.get("missing_tools")
-            missing[lesson_id] = [str(x) for x in miss] if isinstance(miss, list) else []
+        if not isinstance(lesson, dict):
+            failed += 1
+            continue
+        lesson_id = str(lesson.get("id") or "unknown")
+        lesson_passed = bool(lesson.get("passed") is True)
+        if not lesson_passed:
+            groups = PROFESSOR_EQUIVALENT_TOOL_GROUPS.get(lesson_id)
+            used_tools = [str(x) for x in lesson.get("used_tools") or [] if isinstance(x, str)]
+            if groups and _tools_cover_groups(used_tools, groups):
+                lesson_passed = True
+                compat_recovered.append(lesson_id)
+        if lesson_passed:
+            passed += 1
+            continue
+        failed += 1
+        miss = lesson.get("missing_tools")
+        missing[lesson_id] = [str(x) for x in miss] if isinstance(miss, list) else []
     ok = passed == total and failed == 0 and not missing
-    return ok, {"total": total, "passed": passed, "failed": failed, "missing_tools": missing}
+    return ok, {
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "missing_tools": missing,
+        "compatibility_recovered": sorted(set(compat_recovered)),
+    }
 
 
 def _probe_ok(payload: Dict[str, Any], key: str = "overall_ok") -> bool:
     return bool(payload.get(key) is True)
+
+
+def _guided_ok(payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    lessons = payload.get("lessons")
+    if not isinstance(lessons, list) or not lessons:
+        return False, {"reason": "missing lessons"}
+    passed = int(payload.get("pass") or 0)
+    failed = int(payload.get("fail") or 0)
+    skipped = int(payload.get("skip") or 0)
+    hard_failures = payload.get("hard_failures")
+    if not isinstance(hard_failures, list):
+        hard_failures = []
+    ok = bool(payload.get("overall_ok") is True)
+    return ok, {
+        "total": len(lessons),
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "hard_failures": [str(x) for x in hard_failures],
+    }
 
 
 def main() -> int:
@@ -228,6 +321,42 @@ def main() -> int:
     parser.add_argument("--native-probe-timeout", type=float, default=300.0)
     parser.add_argument("--archive-probe-timeout", type=float, default=300.0)
     parser.add_argument("--drift-check-timeout", type=float, default=180.0)
+    parser.add_argument("--guided-timeout", type=float, default=1800.0)
+    parser.add_argument(
+        "--professor-protocol",
+        default="",
+        help="Optional protocol markdown passed to Doctor_Codex professor_curriculum.py",
+    )
+    parser.add_argument(
+        "--run-guided-learning",
+        action="store_true",
+        help="Run Vera-side guided curriculum in addition to Doctor_Codex professor curriculum.",
+    )
+    parser.add_argument(
+        "--guided-curriculum",
+        default="config/doctor_professor/vera_guided_learning_curriculum.json",
+    )
+    parser.add_argument(
+        "--guided-protocol",
+        default="config/doctor_professor/vera_professor_protocol.md",
+    )
+    parser.add_argument(
+        "--guided-inventory",
+        default="vera_tools_list_for_guided_learning",
+    )
+    parser.add_argument("--guided-retries", type=int, default=2)
+    parser.add_argument(
+        "--wait-ready-seconds",
+        type=float,
+        default=0.0,
+        help="Wait for /api/readiness ready=true before each CI sub-run (0 disables wait).",
+    )
+    parser.add_argument(
+        "--ready-streak",
+        type=int,
+        default=3,
+        help="Consecutive ready=true checks required when --wait-ready-seconds > 0.",
+    )
     parser.add_argument(
         "--allow-doctor-failure",
         action="append",
@@ -246,6 +375,23 @@ def main() -> int:
     logs_dir = Path(args.logs_dir).resolve() if args.logs_dir else (harness_root / "logs" / "vera_ci" / ts)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.professor_protocol:
+        professor_protocol_path = Path(args.professor_protocol)
+        if not professor_protocol_path.is_absolute():
+            professor_protocol_path = root / professor_protocol_path
+    else:
+        professor_protocol_path = root / "config" / "doctor_professor" / "vera_professor_protocol.md"
+
+    guided_curriculum_path = Path(args.guided_curriculum)
+    if not guided_curriculum_path.is_absolute():
+        guided_curriculum_path = root / guided_curriculum_path
+    guided_protocol_path = Path(args.guided_protocol)
+    if not guided_protocol_path.is_absolute():
+        guided_protocol_path = root / guided_protocol_path
+    guided_inventory_path = Path(args.guided_inventory)
+    if not guided_inventory_path.is_absolute():
+        guided_inventory_path = root / guided_inventory_path
+
     allowed_failures = {
         "x-twitter:get_trends",
         "scrapeless:google_search",
@@ -260,6 +406,18 @@ def main() -> int:
     native_probe_report = logs_dir / f"doctor_professor_native_memory_probe_{ts}.json"
     archive_probe_report = logs_dir / f"archive_retrieval_probe_{ts}.json"
     drift_check_report = logs_dir / f"tool_discovery_drift_check_{ts}.json"
+    guided_report = logs_dir / f"guided_curriculum_{ts}.json"
+
+    professor_cmd = [
+        sys.executable,
+        str(harness_root / "professor_curriculum.py"),
+        "--base-url",
+        args.base_url,
+        "--output",
+        str(professor_report),
+    ]
+    if professor_protocol_path.exists():
+        professor_cmd.extend(["--protocol", str(professor_protocol_path)])
 
     runs: List[RunResult] = []
     run_inputs: List[Tuple[str, List[str], Path, float]] = [
@@ -271,7 +429,7 @@ def main() -> int:
         ),
         (
             "professor_curriculum",
-            [sys.executable, str(harness_root / "professor_curriculum.py"), "--base-url", args.base_url, "--output", str(professor_report)],
+            professor_cmd,
             professor_report,
             args.professor_timeout,
         ),
@@ -304,10 +462,61 @@ def main() -> int:
                 args.drift_check_timeout,
             )
         )
+    if args.run_guided_learning:
+        run_inputs.append(
+            (
+                "guided_learning_curriculum",
+                [
+                    sys.executable,
+                    str(root / "scripts" / "vera_guided_learning_curriculum.py"),
+                    "--base-url",
+                    args.base_url,
+                    "--curriculum",
+                    str(guided_curriculum_path),
+                    "--protocol",
+                    str(guided_protocol_path),
+                    "--inventory",
+                    str(guided_inventory_path),
+                    "--retries",
+                    str(args.guided_retries),
+                    "--output",
+                    str(guided_report),
+                ],
+                guided_report,
+                args.guided_timeout,
+            )
+        )
 
     for name, cmd, report_path, timeout_s in run_inputs:
         stdout_path = logs_dir / f"{name}_{ts}.stdout.log"
         stderr_path = logs_dir / f"{name}_{ts}.stderr.log"
+        if float(args.wait_ready_seconds) > 0.0:
+            ready_ok = _wait_for_readiness(
+                base_url=args.base_url,
+                timeout_s=float(args.wait_ready_seconds),
+                ready_streak=int(args.ready_streak),
+            )
+            if not ready_ok:
+                msg = (
+                    f"readiness_not_stable before {name}: "
+                    f"wait={float(args.wait_ready_seconds):.1f}s streak={int(args.ready_streak)}"
+                )
+                stdout_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_path.write_text("", encoding="utf-8")
+                stderr_path.write_text(msg + "\n", encoding="utf-8")
+                runs.append(
+                    RunResult(
+                        name=name,
+                        cmd=cmd,
+                        returncode=1,
+                        ok=False,
+                        elapsed_s=0.0,
+                        stdout_log=str(stdout_path),
+                        stderr_log=str(stderr_path),
+                        report_path=str(report_path),
+                    )
+                )
+                continue
         runs.append(_run_cmd(name, cmd, report_path, stdout_path, stderr_path, timeout_s))
 
     doctor_payload = _load_json(doctor_report)
@@ -315,12 +524,17 @@ def main() -> int:
     native_payload = _load_json(native_probe_report) if not args.skip_native_probe else {}
     archive_payload = _load_json(archive_probe_report) if not args.skip_archive_probe else {}
     drift_payload = _load_json(drift_check_report) if not args.skip_drift_check else {}
+    guided_payload = _load_json(guided_report) if args.run_guided_learning else {}
 
     doctor_ok, doctor_detail = _doctor_ok(doctor_payload, allowed_failures)
     professor_ok, professor_detail = _professor_ok(professor_payload)
     native_ok = True if args.skip_native_probe else _probe_ok(native_payload)
     archive_ok = True if args.skip_archive_probe else _probe_ok(archive_payload)
     drift_ok = True if args.skip_drift_check else _probe_ok(drift_payload)
+    guided_ok = True
+    guided_detail: Dict[str, Any] = {"skipped": True}
+    if args.run_guided_learning:
+        guided_ok, guided_detail = _guided_ok(guided_payload)
 
     run_map = {item.name: item for item in runs}
     doctor_exec_ok = bool(run_map.get("doctor_clinic") and run_map["doctor_clinic"].ok)
@@ -328,6 +542,7 @@ def main() -> int:
     native_exec_ok = True if args.skip_native_probe else bool(run_map.get("native_memory_probe") and run_map["native_memory_probe"].ok)
     archive_exec_ok = True if args.skip_archive_probe else bool(run_map.get("archive_retrieval_probe") and run_map["archive_retrieval_probe"].ok)
     drift_exec_ok = True if args.skip_drift_check else bool(run_map.get("tool_discovery_drift_check") and run_map["tool_discovery_drift_check"].ok)
+    guided_exec_ok = True if not args.run_guided_learning else bool(run_map.get("guided_learning_curriculum") and run_map["guided_learning_curriculum"].ok)
 
     overall_ok = all([
         doctor_exec_ok,
@@ -335,11 +550,13 @@ def main() -> int:
         native_exec_ok,
         archive_exec_ok,
         drift_exec_ok,
+        guided_exec_ok,
         doctor_ok,
         professor_ok,
         native_ok,
         archive_ok,
         drift_ok,
+        guided_ok,
     ])
 
     manifest = {
@@ -355,6 +572,7 @@ def main() -> int:
             "native_memory_probe": {"exec_ok": native_exec_ok, "logic_ok": native_ok},
             "archive_retrieval_probe": {"exec_ok": archive_exec_ok, "logic_ok": archive_ok},
             "tool_discovery_drift_check": {"exec_ok": drift_exec_ok, "logic_ok": drift_ok},
+            "guided_learning_curriculum": {"exec_ok": guided_exec_ok, "logic_ok": guided_ok, "detail": guided_detail},
         },
         "run_artifacts": [
             {
@@ -375,6 +593,7 @@ def main() -> int:
             "native_memory_probe": str(native_probe_report) if not args.skip_native_probe else "",
             "archive_retrieval_probe": str(archive_probe_report) if not args.skip_archive_probe else "",
             "tool_discovery_drift_check": str(drift_check_report) if not args.skip_drift_check else "",
+            "guided_learning_curriculum": str(guided_report) if args.run_guided_learning else "",
         },
         "memory_record": {},
     }

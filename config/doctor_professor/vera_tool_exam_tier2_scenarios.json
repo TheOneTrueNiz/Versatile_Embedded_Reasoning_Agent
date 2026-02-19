@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "name": "VERA Tool Exam Tier-2 Scenarios",
+  "description": "Inference and chain scenarios for Professor-style tool competency validation.",
+  "scenarios": [
+    {
+      "id": "infer_time_reasoning",
+      "prompt": "How many minutes remain until the next UTC hour? Show one equation and final number.",
+      "expected_tools_any_order": [
+        "time",
+        "calculate"
+      ],
+      "min_distinct_tools": 2
+    },
+    {
+      "id": "infer_memory_workspace",
+      "prompt": "Suggest one safe workspace path for storing long-term learning notes and justify why that path is allowed.",
+      "expected_tools_any_order": [
+        "read_graph",
+        "list_allowed_directories"
+      ],
+      "min_distinct_tools": 2
+    },
+    {
+      "id": "infer_web_triangulation",
+      "prompt": "Give me a concise summary of the Model Context Protocol using both broad web information and encyclopedia context.",
+      "expected_tool_groups_any_order": [
+        [
+          "brave_web_search",
+          "brave_ai_grounding",
+          "searxng_search",
+          "google_search"
+        ],
+        [
+          "search_wikipedia",
+          "get_summary",
+          "get_article",
+          "search",
+          "get_page",
+          "get_page_content"
+        ]
+      ],
+      "min_distinct_tools": 2
+    },
+    {
+      "id": "infer_media_image",
+      "prompt": "Generate an image of a calm autumn forest stream and return the resulting asset path or URL.",
+      "expected_tools_any_order": [
+        "generate_image"
+      ],
+      "min_distinct_tools": 1
+    },
+    {
+      "id": "infer_media_video",
+      "prompt": "Generate a short serene forest-stream loop video and return the resulting asset path or URL.",
+      "expected_tools_any_order": [
+        "generate_video"
+      ],
+      "min_distinct_tools": 1
+    },
+    {
+      "id": "infer_code_file_flow",
+      "prompt": "Read README.md and create tmp/tool_exam_probe.txt with a one-sentence summary of Vera operator entry points.",
+      "expected_tools_any_order": [
+        "read_file",
+        "write_file"
+      ],
+      "min_distinct_tools": 2
+    },
+    {
+      "id": "infer_encode_recall_chain",
+      "prompt": "Store a short memory marker about tool exams, then recall it and reply PASS or FAIL.",
+      "expected_tools_any_order": [
+        "encode_event",
+        "retrieve_memory"
+      ],
+      "min_distinct_tools": 2
+    }
+  ]
+}
