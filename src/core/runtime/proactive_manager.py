@@ -267,6 +267,18 @@ class ProactiveManager:
             "negative_feedback_step": _env_float("VERA_INITIATIVE_NEGATIVE_FEEDBACK_STEP", 0.090),
             "feedback_window_seconds": _env_int("VERA_INITIATIVE_FEEDBACK_WINDOW_SECONDS", 1800),
             "max_action_memory": _env_int("VERA_INITIATIVE_MAX_ACTION_MEMORY", 40),
+            "repeat_action_success_cooldown_seconds": _env_int(
+                "VERA_INITIATIVE_REPEAT_ACTION_SUCCESS_COOLDOWN_SECONDS",
+                240,
+            ),
+            "repeat_action_failure_cooldown_seconds": _env_int(
+                "VERA_INITIATIVE_REPEAT_ACTION_FAILURE_COOLDOWN_SECONDS",
+                120,
+            ),
+            "partner_recent_activity_gate_minutes": _env_int(
+                "VERA_INITIATIVE_PARTNER_RECENT_ACTIVITY_GATE_MINUTES",
+                2,
+            ),
         }
         try:
             genome_path = Path(os.getenv("VERA_GENOME_CONFIG_PATH", "config/vera_genome.json"))
@@ -331,6 +343,21 @@ class ProactiveManager:
         )
         config["feedback_window_seconds"] = _coerce_int(config.get("feedback_window_seconds"), 1800, 60)
         config["max_action_memory"] = _coerce_int(config.get("max_action_memory"), 40, 5)
+        config["repeat_action_success_cooldown_seconds"] = _coerce_int(
+            config.get("repeat_action_success_cooldown_seconds"),
+            240,
+            0,
+        )
+        config["repeat_action_failure_cooldown_seconds"] = _coerce_int(
+            config.get("repeat_action_failure_cooldown_seconds"),
+            120,
+            0,
+        )
+        config["partner_recent_activity_gate_minutes"] = _coerce_int(
+            config.get("partner_recent_activity_gate_minutes"),
+            2,
+            0,
+        )
         return config
 
     @staticmethod
@@ -471,14 +498,136 @@ class ProactiveManager:
         mood_delta = self._initiative_threshold_delta_for_mood(mood)
         adjusted_required = min(1.0, max(0.0, required + mood_delta))
         if score >= adjusted_required:
-            return True, (
+            threshold_reason = (
                 f"initiative_score_ok:{score:.3f}>={adjusted_required:.3f}"
                 f";mood={mood};delta={mood_delta:+.3f}"
             )
+            partner_activity_gate_minutes = int(self._initiative_config.get("partner_recent_activity_gate_minutes", 0))
+            if (
+                recommendation.priority in {ActionPriority.BACKGROUND, ActionPriority.LOW}
+                and partner_activity_gate_minutes > 0
+            ):
+                minutes_since_activity = self._minutes_since_last_partner_activity()
+                if (
+                    minutes_since_activity is not None
+                    and minutes_since_activity < float(partner_activity_gate_minutes)
+                ):
+                    return False, (
+                        f"partner_recently_active:{minutes_since_activity:.1f}m<"
+                        f"{partner_activity_gate_minutes}m"
+                    )
+            duplicated, duplicate_reason = self._is_duplicate_recent_action(recommendation)
+            if duplicated:
+                return False, duplicate_reason
+            return True, threshold_reason
         return False, (
             f"initiative_score_below_threshold:{score:.3f}<{adjusted_required:.3f}"
             f";mood={mood};delta={mood_delta:+.3f}"
         )
+
+    def _minutes_since_last_partner_activity(self) -> Optional[float]:
+        session_store = self._local_attr(self, "session_store", None)
+        if session_store is None:
+            return None
+        try:
+            sessions = session_store.list_sessions()
+        except Exception:
+            return None
+
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        latest_epoch: Optional[float] = None
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            raw_last_active = session.get("last_active")
+            if not isinstance(raw_last_active, (int, float)):
+                continue
+            epoch = float(raw_last_active)
+            if epoch <= 0:
+                continue
+            if latest_epoch is None or epoch > latest_epoch:
+                latest_epoch = epoch
+        if latest_epoch is None:
+            return None
+        return max(0.0, (now_epoch - latest_epoch) / 60.0)
+
+    @staticmethod
+    def _extract_recommendation_conversation_id(recommendation: RecommendedAction) -> str:
+        payload = recommendation.payload if isinstance(recommendation.payload, dict) else {}
+        for key in ("conversation_id", "vera_conversation_id", "session_key"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        events = payload.get("events")
+        if isinstance(events, list):
+            for item in events:
+                if not isinstance(item, dict):
+                    continue
+                event_payload = item.get("payload")
+                if not isinstance(event_payload, dict):
+                    continue
+                for key in ("conversation_id", "vera_conversation_id", "session_key"):
+                    value = str(event_payload.get(key) or "").strip()
+                    if value:
+                        return value
+        return ""
+
+    def _is_duplicate_recent_action(self, recommendation: RecommendedAction) -> Tuple[bool, str]:
+        state = self._ensure_initiative_runtime()
+        recent = list(state.get("recent_actions") or [])
+        if not recent:
+            return False, ""
+
+        now_utc = _utc_now()
+        recommendation_conversation_id = self._extract_recommendation_conversation_id(recommendation)
+        action_type = str(recommendation.action_type or "").strip()
+        trigger_id = str(recommendation.trigger_id or "").strip()
+        if not action_type:
+            return False, ""
+
+        for row in reversed(recent):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("action_type") or "").strip() != action_type:
+                continue
+
+            row_trigger_id = str(row.get("trigger_id") or "").strip()
+            if trigger_id and row_trigger_id and trigger_id != row_trigger_id:
+                continue
+
+            row_conversation_id = str(row.get("conversation_id") or "").strip()
+            if (
+                recommendation_conversation_id
+                and row_conversation_id
+                and recommendation_conversation_id != row_conversation_id
+            ):
+                continue
+
+            ts = _parse_iso_utc(str(row.get("ts_utc") or ""))
+            if ts is None:
+                continue
+            age_seconds = (now_utc - ts).total_seconds()
+            if age_seconds < 0:
+                continue
+
+            was_success = bool(row.get("success"))
+            if was_success:
+                cooldown = int(self._initiative_config.get("repeat_action_success_cooldown_seconds", 240))
+                if cooldown <= 0 or age_seconds >= cooldown:
+                    continue
+                return True, (
+                    f"duplicate_action_success_cooldown:{action_type};"
+                    f"age={int(age_seconds)}s<{cooldown}s"
+                )
+
+            cooldown = int(self._initiative_config.get("repeat_action_failure_cooldown_seconds", 120))
+            if cooldown <= 0 or age_seconds >= cooldown:
+                continue
+            return True, (
+                f"duplicate_action_failure_cooldown:{action_type};"
+                f"age={int(age_seconds)}s<{cooldown}s"
+            )
+        return False, ""
 
     def _apply_initiative_signal(
         self,
@@ -530,6 +679,7 @@ class ProactiveManager:
         action_row = {
             "ts_utc": _utc_iso(),
             "action_id": recommendation.action_id,
+            "trigger_id": recommendation.trigger_id,
             "action_type": recommendation.action_type,
             "priority": recommendation.priority.name,
             "conversation_id": conversation_id,
@@ -965,18 +1115,53 @@ class ProactiveManager:
             elif reflection_result and getattr(reflection_result, "outcome", "") == "action":
                 workflow_result = {"ok": False, "reason": "workflow_window_cap_reached"}
 
-            followthrough_result: Dict[str, Any] = {"ok": False, "reason": "followthrough_disabled"}
+            followthrough_result: Dict[str, Any] = {
+                "ok": False,
+                "reason": "followthrough_disabled",
+                "attempted": False,
+            }
             if bool(self._autonomy_config.get("followthrough_enabled", True)):
                 last_follow = _parse_iso_utc(str(state.get("last_followthrough_utc") or ""))
                 cooldown_seconds = int(self._autonomy_config.get("followthrough_cooldown_seconds", 900))
                 now_utc = _utc_now()
-                cooldown_ok = (last_follow is None) or ((now_utc - last_follow).total_seconds() >= cooldown_seconds)
+                seconds_since_last_follow = (
+                    (now_utc - last_follow).total_seconds() if last_follow is not None else None
+                )
+                cooldown_ok = (
+                    last_follow is None
+                    or (seconds_since_last_follow is not None and seconds_since_last_follow >= cooldown_seconds)
+                )
                 if cooldown_ok:
                     followthrough_result = await self._run_followthrough_executor_once()
+                    if not isinstance(followthrough_result, dict):
+                        followthrough_result = {"ok": False, "reason": "invalid_followthrough_result"}
+                    followthrough_result["attempted"] = True
+                    followthrough_result["cooldown_seconds"] = cooldown_seconds
+                    followthrough_result["seconds_since_last_followthrough"] = (
+                        round(seconds_since_last_follow, 3)
+                        if seconds_since_last_follow is not None
+                        else None
+                    )
+                    followthrough_result["cooldown_remaining_seconds"] = 0
                     if followthrough_result.get("ok"):
                         state["last_followthrough_utc"] = _utc_iso()
                 else:
-                    followthrough_result = {"ok": False, "reason": "followthrough_cooldown_active"}
+                    cooldown_remaining = max(
+                        0,
+                        cooldown_seconds - int(seconds_since_last_follow or 0),
+                    )
+                    followthrough_result = {
+                        "ok": False,
+                        "reason": "followthrough_cooldown_active",
+                        "attempted": False,
+                        "cooldown_seconds": cooldown_seconds,
+                        "seconds_since_last_followthrough": (
+                            round(seconds_since_last_follow, 3)
+                            if seconds_since_last_follow is not None
+                            else None
+                        ),
+                        "cooldown_remaining_seconds": int(cooldown_remaining),
+                    }
 
             result.update(
                 {
