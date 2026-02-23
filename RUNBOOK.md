@@ -56,6 +56,12 @@ Monolithic check:
 python3 run_vera_monolithic.py --help
 ```
 
+Local release gate (writes manifest/logs under `tmp/release_gate/<timestamp>/`):
+
+```bash
+./scripts/vera_release_gate_local.py
+```
+
 ## 5) API + UI + MCP Stack
 
 Primary stack launcher:
@@ -67,6 +73,24 @@ Primary stack launcher:
 Notes:
 - `scripts/run_vera_full.sh` is the full-stack orchestrator (API + UI + MCP + optional SearxNG).
 - For live launch, run without `--diag-only`.
+
+## 5.1) Doctor/Professor Guided Learning
+
+Run the Vera-side guided curriculum session:
+
+```bash
+.venv/bin/python scripts/vera_guided_learning_curriculum.py --base-url http://127.0.0.1:8788
+```
+
+Run CI gate with guided curriculum included:
+
+```bash
+.venv/bin/python scripts/vera_doctor_professor_ci_gate.py --base-url http://127.0.0.1:8788 --run-guided-learning
+```
+
+Curriculum assets:
+- `config/doctor_professor/vera_guided_learning_curriculum.json`
+- `config/doctor_professor/vera_professor_protocol.md`
 
 ## 6) Manual Halt Sentinel
 

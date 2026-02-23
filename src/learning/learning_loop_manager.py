@@ -21,7 +21,7 @@ import re
 import time
 from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from observability.decision_ledger import DecisionLedger
 from learning.trace_extraction import TraceExtractionEngine
@@ -118,6 +118,7 @@ class LearningLoopManager:
                 "reward_last_status": "",
                 "reward_last_error": "",
                 "reward_last_attempt_at": "",
+                "reward_last_status_updated_at": "",
                 "lora_last_trained_at": "",
                 "lora_last_train_example_count": 0,
                 "lora_last_adapter_id": "",
@@ -130,10 +131,52 @@ class LearningLoopManager:
             },
         )
         self._workflows = _safe_read_json(self.workflow_path, {"templates": {}})
+        if not isinstance(self._state, dict):
+            self._state = {}
+        self._state.setdefault("reward_last_status_updated_at", "")
 
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._cycle_running = False
+        self._diag: Dict[str, Any] = {
+            "start_attempts": 0,
+            "start_successes": 0,
+            "start_failures": 0,
+            "last_start_at": "",
+            "last_start_error": "",
+            "last_start_due_now": False,
+            "last_start_due_reason": "",
+            "last_start_last_trace_date": "",
+            "last_start_scheduled_today": "",
+            "last_start_next_due_at": "",
+            "last_stop_at": "",
+            "ticks_total": 0,
+            "last_tick_at": "",
+            "last_tick_due_now": False,
+            "last_tick_due_reason": "",
+            "last_tick_next_due_at": "",
+            "manual_cycle_requests": 0,
+            "manual_cycles_started": 0,
+            "manual_cycles_completed": 0,
+            "last_manual_cycle_started_at": "",
+            "last_manual_cycle_completed_at": "",
+            "last_manual_cycle_error": "",
+            "last_manual_cycle_result": {},
+            "cycles_started": 0,
+            "cycles_completed": 0,
+            "last_cycle_started_at": "",
+            "last_cycle_completed_at": "",
+            "last_cycle_error": "",
+            "last_cycle_result": {},
+            "workflow_outcome_calls": 0,
+            "workflow_outcome_saved": 0,
+            "workflow_outcome_skip_short_chain": 0,
+            "workflow_outcome_last": {},
+            "workflow_replay_calls": 0,
+            "workflow_replay_saved": 0,
+            "workflow_replay_skip_short_chain": 0,
+            "workflow_replay_last": {},
+        }
 
         self.daily_hour = self._read_int_env("VERA_TRACE_EXTRACTION_HOUR", 2, min_value=0, max_value=23)
         self.poll_seconds = self._read_int_env("VERA_TRACE_EXTRACTION_POLL_SECONDS", 300, min_value=30)
@@ -178,6 +221,37 @@ class LearningLoopManager:
             min_value=1,
             max_value=10,
         )
+        self.workflow_quarantine_minutes = self._read_int_env(
+            "VERA_WORKFLOW_QUARANTINE_MINUTES",
+            self.workflow_disable_minutes,
+            min_value=15,
+            max_value=10080,
+        )
+        quarantine_tags_raw = str(
+            os.getenv(
+                "VERA_WORKFLOW_QUARANTINE_TAGS",
+                (
+                    "tool_call_limit_reached,tool_timeout,llm_timeout,"
+                    "confirmation_required,cached_chain_not_completed,chain_mismatch"
+                ),
+            )
+            or ""
+        ).strip()
+        quarantine_tags = [
+            str(tag).strip().lower()
+            for tag in quarantine_tags_raw.split(",")
+            if str(tag).strip()
+        ]
+        if not quarantine_tags:
+            quarantine_tags = [
+                "tool_call_limit_reached",
+                "tool_timeout",
+                "llm_timeout",
+                "confirmation_required",
+                "cached_chain_not_completed",
+                "chain_mismatch",
+            ]
+        self.workflow_quarantine_tags = sorted(set(quarantine_tags))
         self.reward_auto_train_enabled = self._read_bool_env("VERA_REWARD_AUTO_TRAIN", True)
         self.reward_train_min_new_transitions = self._read_int_env(
             "VERA_REWARD_TRAIN_MIN_NEW_TRANSITIONS",
@@ -374,6 +448,31 @@ class LearningLoopManager:
             return
         logger.info("[reward-debug] " + message, *args)
 
+    @staticmethod
+    def _short_text(value: Any, limit: int = 240) -> str:
+        return str(value or "")[:max(1, int(limit))]
+
+    @staticmethod
+    def _short_task(value: Any, limit: int = 180) -> str:
+        return str(value or "").strip().replace("\n", " ")[:max(1, int(limit))]
+
+    def _set_reward_status_state(
+        self,
+        *,
+        status: str,
+        error: str = "",
+        attempted_at: Optional[datetime] = None,
+        save: bool = True,
+    ) -> None:
+        now_text = datetime.now().isoformat()
+        if attempted_at is not None:
+            self._state["reward_last_attempt_at"] = attempted_at.isoformat()
+        self._state["reward_last_status"] = self._short_text(status, 180)
+        self._state["reward_last_error"] = self._short_text(error, 220)
+        self._state["reward_last_status_updated_at"] = now_text
+        if save:
+            self._save_state()
+
     def _build_lora_trainer(self) -> Any:
         preference = str(self.lora_trainer_backend_preference or "auto").strip().lower()
         if preference not in {"auto", "mock", "hf_peft", "hf"}:
@@ -554,11 +653,21 @@ class LearningLoopManager:
         if self._running:
             self._trace_learning("start_skipped reason=already_running")
             return
+        self._diag["start_attempts"] = int(self._diag.get("start_attempts", 0) or 0) + 1
+        self._diag["last_start_at"] = datetime.now().isoformat()
+        self._diag["last_start_error"] = ""
         self._running = True
         try:
             loop = asyncio.get_running_loop()
             due_details = self._daily_due_details(now=datetime.now())
             self._task = loop.create_task(self._daily_loop())
+            self._diag["start_successes"] = int(self._diag.get("start_successes", 0) or 0) + 1
+            self._diag["last_start_error"] = ""
+            self._diag["last_start_due_now"] = bool(due_details.get("due_now", False))
+            self._diag["last_start_due_reason"] = str(due_details.get("reason", ""))
+            self._diag["last_start_last_trace_date"] = str(due_details.get("last_trace_date", ""))
+            self._diag["last_start_scheduled_today"] = str(due_details.get("scheduled_today", ""))
+            self._diag["last_start_next_due_at"] = str(due_details.get("next_due_at", ""))
             self._trace_learning(
                 (
                     "start_ok poll_seconds=%s startup_delay_seconds=%s daily_hour=%s due_now=%s due_reason=%s "
@@ -575,6 +684,8 @@ class LearningLoopManager:
         except RuntimeError:
             self._running = False
             self._task = None
+            self._diag["start_failures"] = int(self._diag.get("start_failures", 0) or 0) + 1
+            self._diag["last_start_error"] = "no_running_asyncio_loop"
             logger.warning(
                 "Learning loop start skipped: no running asyncio loop (poll_seconds=%s daily_hour=%s)",
                 self.poll_seconds,
@@ -586,6 +697,7 @@ class LearningLoopManager:
         if self._task and not self._task.done():
             self._task.cancel()
         self._task = None
+        self._diag["last_stop_at"] = datetime.now().isoformat()
         self._trace_learning("stop_completed")
 
     async def shutdown(self, timeout_seconds: float = 120.0) -> None:
@@ -596,6 +708,7 @@ class LearningLoopManager:
         executor workers alive past event-loop shutdown.
         """
         self._running = False
+        self._diag["last_stop_at"] = datetime.now().isoformat()
         task = self._task
         if task is None:
             self._trace_learning("shutdown_skip reason=no_task")
@@ -648,6 +761,11 @@ class LearningLoopManager:
             try:
                 now = datetime.now()
                 due_details = self._daily_due_details(now=now)
+                self._diag["ticks_total"] = int(self._diag.get("ticks_total", 0) or 0) + 1
+                self._diag["last_tick_at"] = now.isoformat()
+                self._diag["last_tick_due_now"] = bool(due_details.get("due_now", False))
+                self._diag["last_tick_due_reason"] = str(due_details.get("reason", ""))
+                self._diag["last_tick_next_due_at"] = str(due_details.get("next_due_at", ""))
                 self._trace_learning(
                     (
                         "tick due_now=%s reason=%s now=%s last_trace_date=%s "
@@ -662,11 +780,24 @@ class LearningLoopManager:
                 )
                 if bool(due_details.get("due_now", False)):
                     self._trace_learning("tick_run_cycle_start")
+                    self._diag["cycles_started"] = int(self._diag.get("cycles_started", 0) or 0) + 1
+                    self._diag["last_cycle_started_at"] = now.isoformat()
+                    self._diag["last_cycle_error"] = ""
                     self._cycle_running = True
                     try:
                         result = await self.run_daily_learning_cycle()
                     finally:
                         self._cycle_running = False
+                    self._diag["cycles_completed"] = int(self._diag.get("cycles_completed", 0) or 0) + 1
+                    self._diag["last_cycle_completed_at"] = datetime.now().isoformat()
+                    self._diag["last_cycle_result"] = {
+                        "trajectories_extracted": int(result.get("trajectories_extracted", 0) or 0),
+                        "examples_from_trajectories": int(result.get("examples_from_trajectories", 0) or 0),
+                        "flight_examples_created": int(((result.get("flight_ingest") or {}).get("examples_created", 0) or 0)),
+                        "reward_trained": bool(((result.get("reward_training") or {}).get("trained", False))),
+                        "lora_trained": bool(((result.get("lora_training") or {}).get("trained", False))),
+                        "total_examples": int(result.get("total_examples", 0) or 0),
+                    }
                     self._trace_learning(
                         (
                             "tick_run_cycle_done traces=%s examples=%s flight_examples=%s "
@@ -684,6 +815,7 @@ class LearningLoopManager:
                 break
             except Exception as exc:
                 self._cycle_running = False
+                self._diag["last_cycle_error"] = self._short_text(exc, 240)
                 logger.warning("Learning loop tick failed: %s", exc)
             await asyncio.sleep(self.poll_seconds)
 
@@ -755,6 +887,7 @@ class LearningLoopManager:
 
     async def run_daily_learning_cycle_if_due(self, force: bool = False) -> Dict[str, Any]:
         now = datetime.now()
+        self._diag["manual_cycle_requests"] = int(self._diag.get("manual_cycle_requests", 0) or 0) + 1
         due_details = self._daily_due_details(now=now)
         due = bool(due_details.get("due_now", False))
         self._trace_learning(
@@ -777,7 +910,36 @@ class LearningLoopManager:
                 "last_trace_date": str(self._state.get("last_trace_date", "")),
                 "due_details": due_details,
             }
-        result = await self.run_daily_learning_cycle()
+        if self._cycle_running:
+            return {
+                "ran": False,
+                "reason": "already_running",
+                "due_now": due,
+                "next_due_at": self._next_due_datetime(now=now).isoformat(),
+                "last_trace_date": str(self._state.get("last_trace_date", "")),
+                "due_details": due_details,
+            }
+        self._diag["manual_cycles_started"] = int(self._diag.get("manual_cycles_started", 0) or 0) + 1
+        self._diag["last_manual_cycle_started_at"] = datetime.now().isoformat()
+        self._diag["last_manual_cycle_error"] = ""
+        self._cycle_running = True
+        try:
+            result = await self.run_daily_learning_cycle()
+        except Exception as exc:
+            self._diag["last_manual_cycle_error"] = self._short_text(exc, 240)
+            raise
+        finally:
+            self._cycle_running = False
+        self._diag["manual_cycles_completed"] = int(self._diag.get("manual_cycles_completed", 0) or 0) + 1
+        self._diag["last_manual_cycle_completed_at"] = datetime.now().isoformat()
+        self._diag["last_manual_cycle_result"] = {
+            "trajectories_extracted": int(result.get("trajectories_extracted", 0) or 0),
+            "examples_from_trajectories": int(result.get("examples_from_trajectories", 0) or 0),
+            "flight_examples_created": int(((result.get("flight_ingest") or {}).get("examples_created", 0) or 0)),
+            "reward_trained": bool(((result.get("reward_training") or {}).get("trained", False))),
+            "lora_trained": bool(((result.get("lora_training") or {}).get("trained", False))),
+            "total_examples": int(result.get("total_examples", 0) or 0),
+        }
         return {
             "ran": True,
             "reason": "forced" if force and not due else "due",
@@ -892,17 +1054,21 @@ class LearningLoopManager:
         }
         if not self.reward_auto_train_enabled:
             result["reason"] = "disabled"
+            self._set_reward_status_state(status=result["reason"], error="")
             self._trace_reward("reward_train_skip reason=disabled")
             return result
         if not _REWARD_MODEL_AVAILABLE or not train_reward_model:
             result["reason"] = "reward_model_unavailable"
+            self._set_reward_status_state(status=result["reason"], error="")
             self._trace_reward("reward_train_skip reason=reward_model_unavailable")
             return result
         if not self.flight_path.exists():
             result["reason"] = "no_flight_recorder"
+            self._set_reward_status_state(status=result["reason"], error="")
             self._trace_reward("reward_train_skip reason=no_flight_recorder path=%s", self.flight_path)
             return result
         if not bool(due_info["due"]):
+            self._set_reward_status_state(status="not_due", error="")
             self._trace_reward("reward_train_skip reason=not_due")
             return result
 
@@ -951,12 +1117,15 @@ class LearningLoopManager:
                 self._state.get("flight_processed_total", 0) or 0
             )
             self._state["reward_last_samples"] = result["samples"]
-            self._state["reward_last_status"] = "trained"
-            self._state["reward_last_error"] = ""
+            self._set_reward_status_state(status="trained", error="", attempted_at=now, save=False)
             self._load_reward_model_if_available()
         else:
-            self._state["reward_last_status"] = str(result.get("reason") or "not_trained")
-            self._state["reward_last_error"] = str(result.get("error") or "")[:220]
+            self._set_reward_status_state(
+                status=str(result.get("reason") or "not_trained"),
+                error=str(result.get("error") or ""),
+                attempted_at=now,
+                save=False,
+            )
 
         self._trace_reward(
             (
@@ -1392,6 +1561,8 @@ class LearningLoopManager:
             "sample_task": "",
             "last_conversation_id": "",
             "last_error": "",
+            "last_failure_tag": "",
+            "last_failure_at": "",
             "last_replay_at": "",
             "last_replay_outcome": "",
             "last_replay_error": "",
@@ -1403,7 +1574,43 @@ class LearningLoopManager:
             "reward_last_scored_at": "",
             "disabled_until": "",
             "disabled_reason": "",
+            "quarantine_count": 0,
+            "quarantine_until": "",
+            "quarantine_reason": "",
+            "quarantine_last_at": "",
+            "quarantine_last_failure_tag": "",
+            "quarantine_requires_fresh_success": False,
+            "quarantine_success_baseline": 0,
+            "quarantine_propagated_count": 0,
+            # --- Skill identity & trust ---
+            "source": "self_crafted",
+            "trust_tier": "provisional",
+            "human_name": "",
+            "description": "",
+            "created_at": "",
         }
+
+    @staticmethod
+    def _compute_trust_tier(entry: Dict[str, Any]) -> str:
+        """Derive trust tier from success history and source."""
+        success = int(entry.get("success_count", 0) or 0)
+        replay_success = int(entry.get("replay_success_count", 0) or 0)
+        failure = int(entry.get("failure_count", 0) or 0)
+        total = success + failure
+        reliability = success / max(total, 1)
+        source = entry.get("source", "self_crafted")
+
+        if source == "external":
+            return "untrusted"
+        if entry.get("disabled_until") or entry.get("quarantine_until"):
+            return "quarantined"
+        if total < 2:
+            return "provisional"
+        if reliability >= 0.8 and replay_success >= 3:
+            return "proven"
+        if reliability >= 0.6 and success >= 2:
+            return "trusted"
+        return "provisional"
 
     def _normalize_workflow_entry(
         self,
@@ -1434,17 +1641,25 @@ class LearningLoopManager:
             "replay_failure_count",
             "consecutive_failures",
             "reward_samples",
+            "quarantine_count",
+            "quarantine_success_baseline",
+            "quarantine_propagated_count",
         ):
             try:
                 normalized[key] = int(normalized.get(key, 0) or 0)
             except Exception:
                 normalized[key] = 0
+        normalized["quarantine_requires_fresh_success"] = bool(
+            normalized.get("quarantine_requires_fresh_success", False)
+        )
         try:
             normalized["last_suggested_score"] = float(normalized.get("last_suggested_score", 0.0) or 0.0)
         except Exception:
             normalized["last_suggested_score"] = 0.0
         normalized["reward_score_ema"] = self._clamp_reward_score(normalized.get("reward_score_ema", 0.0))
         normalized["reward_last_score"] = self._clamp_reward_score(normalized.get("reward_last_score", 0.0))
+        normalized["last_failure_tag"] = str(normalized.get("last_failure_tag", "") or "")[:120]
+        normalized["last_failure_at"] = str(normalized.get("last_failure_at", "") or "")[:64]
         return normalized
 
     @staticmethod
@@ -1557,6 +1772,166 @@ class LearningLoopManager:
         return True
 
     @staticmethod
+    def _classify_workflow_failure_tag(error: str) -> str:
+        lowered = str(error or "").strip().lower()
+        if not lowered:
+            return ""
+        if (
+            "tool call limit reached" in lowered
+            or "tool_call_limit_reached" in lowered
+            or "no_progress_tool_loop" in lowered
+        ):
+            return "tool_call_limit_reached"
+        if "tool_timeout" in lowered or "tool execution timeout" in lowered:
+            return "tool_timeout"
+        if "llm_timeout" in lowered or "llm request timed out" in lowered:
+            return "llm_timeout"
+        if (
+            "confirmation_required" in lowered
+            or "confirmation required" in lowered
+            or "awaiting confirmation" in lowered
+            or "reply 'yes' to proceed" in lowered
+            or "reply \"yes\" to proceed" in lowered
+        ):
+            return "confirmation_required"
+        if "cached_chain_not_completed" in lowered or "cached chain not completed" in lowered:
+            return "cached_chain_not_completed"
+        if (
+            "chain_mismatch" in lowered
+            or "chain mismatch" in lowered
+            or ("expected_" in lowered and "_got_" in lowered)
+            or ("expected " in lowered and " got " in lowered)
+        ):
+            return "chain_mismatch"
+        return ""
+
+    @staticmethod
+    def _clear_workflow_quarantine(entry: Dict[str, Any], reason: str = "") -> None:
+        entry["quarantine_until"] = ""
+        entry["quarantine_reason"] = ""
+        entry["quarantine_last_at"] = ""
+        entry["quarantine_requires_fresh_success"] = False
+        entry["quarantine_success_baseline"] = 0
+        entry["quarantine_last_cleared_reason"] = str(reason or "")
+        entry["quarantine_last_failure_tag"] = ""
+
+    @staticmethod
+    def _workflow_chain_key(chain: List[str]) -> str:
+        return "|".join(
+            str(name).strip()
+            for name in list(chain or [])
+            if isinstance(name, str) and str(name).strip()
+        )
+
+    def _apply_replay_quarantine(
+        self,
+        entry: Dict[str, Any],
+        *,
+        now: datetime,
+        failure_tag: str,
+        reason_prefix: str = "replay_failure",
+    ) -> bool:
+        if not failure_tag:
+            return False
+
+        reason_value = f"{reason_prefix}:{failure_tag}"
+        baseline = int(entry.get("success_count", 0) or 0)
+        quarantine_until_dt = now + timedelta(minutes=self.workflow_quarantine_minutes)
+        existing_until = self._parse_datetime(str(entry.get("quarantine_until") or ""))
+
+        entry["quarantine_count"] = int(entry.get("quarantine_count", 0) or 0) + 1
+        if existing_until is None or existing_until < quarantine_until_dt:
+            entry["quarantine_until"] = quarantine_until_dt.isoformat()
+        entry["quarantine_reason"] = reason_value
+        entry["quarantine_last_at"] = now.isoformat()
+        entry["quarantine_last_failure_tag"] = failure_tag
+        entry["quarantine_requires_fresh_success"] = True
+        entry["quarantine_success_baseline"] = baseline
+        return True
+
+    def _propagate_chain_quarantine(
+        self,
+        templates: Dict[str, Any],
+        *,
+        source_signature: str,
+        chain: List[str],
+        now: datetime,
+        failure_tag: str,
+    ) -> int:
+        source_key = self._workflow_chain_key(chain)
+        if not source_key:
+            return 0
+
+        propagated = 0
+        for candidate_signature, raw_candidate in list(templates.items()):
+            if candidate_signature == source_signature or not isinstance(raw_candidate, dict):
+                continue
+            candidate_entry = self._normalize_workflow_entry(
+                raw_candidate,
+                signature=candidate_signature,
+                task_text=str(raw_candidate.get("sample_task") or ""),
+            )
+            candidate_chain = self._sanitize_tool_chain(candidate_entry.get("tool_chain", []))
+            if self._workflow_chain_key(candidate_chain) != source_key:
+                continue
+
+            if self._apply_replay_quarantine(
+                candidate_entry,
+                now=now,
+                failure_tag=failure_tag,
+                reason_prefix="propagated_replay_failure",
+            ):
+                templates[candidate_signature] = candidate_entry
+                propagated += 1
+
+        if propagated > 0:
+            self._trace_workflow(
+                "record_replay_quarantine_propagated source_signature=%s failure_tag=%s propagated=%s chain=%s",
+                source_signature,
+                failure_tag,
+                propagated,
+                chain,
+            )
+        return propagated
+
+    def _workflow_quarantine_state(
+        self,
+        entry: Dict[str, Any],
+        now: Optional[datetime] = None,
+    ) -> Tuple[bool, bool, str]:
+        now_dt = now or datetime.now()
+        changed = False
+
+        try:
+            success_count = int(entry.get("success_count", 0) or 0)
+        except Exception:
+            success_count = 0
+        try:
+            baseline = int(entry.get("quarantine_success_baseline", 0) or 0)
+        except Exception:
+            baseline = 0
+        requires_fresh_success = bool(entry.get("quarantine_requires_fresh_success", False))
+        quarantine_until = self._parse_datetime(str(entry.get("quarantine_until") or ""))
+
+        if requires_fresh_success and success_count > baseline:
+            self._clear_workflow_quarantine(entry, reason="fresh_success")
+            changed = True
+            return False, changed, "fresh_success"
+
+        if quarantine_until is not None and quarantine_until > now_dt:
+            return True, changed, "active"
+
+        if requires_fresh_success and success_count <= baseline:
+            return True, changed, "awaiting_fresh_success"
+
+        if quarantine_until is not None and quarantine_until <= now_dt:
+            self._clear_workflow_quarantine(entry, reason="expired")
+            changed = True
+            return False, changed, "expired"
+
+        return False, changed, ""
+
+    @staticmethod
     def _workflow_reliability(entry: Dict[str, Any]) -> float:
         success = int(entry.get("success_count", 0)) + int(entry.get("replay_success_count", 0))
         failure = int(entry.get("failure_count", 0)) + int(entry.get("replay_failure_count", 0))
@@ -1564,6 +1939,23 @@ class LearningLoopManager:
         if total <= 0:
             return 0.0
         return success / total
+
+    @staticmethod
+    def _workflow_total_failures(entry: Dict[str, Any]) -> int:
+        return int(entry.get("failure_count", 0) or 0) + int(entry.get("replay_failure_count", 0) or 0)
+
+    def _workflow_failure_tag_from_entry(self, entry: Dict[str, Any]) -> str:
+        explicit = str(entry.get("last_failure_tag", "") or "").strip().lower()
+        if explicit:
+            return explicit
+        quarantine_tag = str(entry.get("quarantine_last_failure_tag", "") or "").strip().lower()
+        if quarantine_tag:
+            return quarantine_tag
+        for field in ("last_replay_error", "last_error", "quarantine_reason"):
+            tag = self._classify_workflow_failure_tag(str(entry.get(field, "") or ""))
+            if tag:
+                return tag
+        return ""
 
     def _workflow_reward_component(self, entry: Dict[str, Any]) -> float:
         score = self._clamp_reward_score(entry.get("reward_score_ema", 0.0))
@@ -1607,8 +1999,20 @@ class LearningLoopManager:
         conversation_id: str = "default",
         error: str = "",
     ) -> None:
+        self._diag["workflow_outcome_calls"] = int(self._diag.get("workflow_outcome_calls", 0) or 0) + 1
+        self._diag["workflow_outcome_last"] = {
+            "at": datetime.now().isoformat(),
+            "conversation_id": str(conversation_id or "default"),
+            "success": bool(success),
+            "chain": self._sanitize_tool_chain(tools_used),
+            "error": self._short_text(error, 180),
+            "task": self._short_task(task_text, 180),
+        }
         chain = self._sanitize_tool_chain(tools_used)
         if len(chain) < 2:
+            self._diag["workflow_outcome_skip_short_chain"] = int(
+                self._diag.get("workflow_outcome_skip_short_chain", 0) or 0
+            ) + 1
             self._trace_workflow(
                 "record_outcome_skip reason=chain_too_short chain=%s conversation_id=%s",
                 chain,
@@ -1630,16 +2034,27 @@ class LearningLoopManager:
         entry["last_used_at"] = now.isoformat()
         entry["sample_task"] = str(task_text or "")[:180]
         entry["last_conversation_id"] = conversation_id
+        if not entry.get("created_at"):
+            entry["created_at"] = now.isoformat()
+        if not entry.get("source"):
+            entry["source"] = "self_crafted"
         if success:
             entry["success_count"] = int(entry.get("success_count", 0)) + 1
             entry["consecutive_failures"] = 0
             entry["last_error"] = ""
+            entry["last_failure_tag"] = ""
+            entry["last_failure_at"] = ""
             entry["disabled_until"] = ""
             entry["disabled_reason"] = ""
+            if bool(entry.get("quarantine_requires_fresh_success", False)):
+                self._clear_workflow_quarantine(entry, reason="runtime_success")
         else:
             entry["failure_count"] = int(entry.get("failure_count", 0)) + 1
             entry["consecutive_failures"] = int(entry.get("consecutive_failures", 0)) + 1
             entry["last_error"] = str(error or "")[:180]
+            failure_tag = self._classify_workflow_failure_tag(error)
+            entry["last_failure_tag"] = str(failure_tag or "")[:120]
+            entry["last_failure_at"] = now.isoformat()
             if int(entry.get("consecutive_failures", 0)) >= self.workflow_disable_failures:
                 disabled_until = now + timedelta(minutes=self.workflow_disable_minutes)
                 entry["disabled_until"] = disabled_until.isoformat()
@@ -1651,7 +2066,9 @@ class LearningLoopManager:
             error=error,
         )
         self._apply_workflow_reward_score(entry, reward_score, now.isoformat())
+        entry["trust_tier"] = self._compute_trust_tier(entry)
         templates[signature] = entry
+        self._diag["workflow_outcome_saved"] = int(self._diag.get("workflow_outcome_saved", 0) or 0) + 1
         self._save_workflows()
         self._trace_workflow(
             (
@@ -1666,6 +2083,46 @@ class LearningLoopManager:
             int(entry.get("consecutive_failures", 0) or 0),
             str(entry.get("disabled_until", "")),
         )
+
+    def list_skills(
+        self,
+        sort_by: str = "trust_tier",
+        trust_filter: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Return learned workflow skills with trust tiers for API consumption."""
+        templates = self._workflows.get("templates", {})
+        tier_order = {"proven": 0, "trusted": 1, "provisional": 2, "quarantined": 3, "untrusted": 4}
+        skills: List[Dict[str, Any]] = []
+        for sig, entry in templates.items():
+            tier = self._compute_trust_tier(entry)
+            if trust_filter and tier != trust_filter:
+                continue
+            total = int(entry.get("success_count", 0) or 0) + int(entry.get("failure_count", 0) or 0)
+            reliability = int(entry.get("success_count", 0) or 0) / max(total, 1)
+            skills.append({
+                "signature": sig,
+                "human_name": entry.get("human_name") or "",
+                "description": entry.get("description") or "",
+                "tool_chain": entry.get("tool_chain", []),
+                "source": entry.get("source", "self_crafted"),
+                "trust_tier": tier,
+                "success_count": int(entry.get("success_count", 0) or 0),
+                "failure_count": int(entry.get("failure_count", 0) or 0),
+                "replay_success_count": int(entry.get("replay_success_count", 0) or 0),
+                "replay_failure_count": int(entry.get("replay_failure_count", 0) or 0),
+                "reliability": round(reliability, 3),
+                "reward_score_ema": round(float(entry.get("reward_score_ema", 0) or 0), 3),
+                "sample_task": entry.get("sample_task", ""),
+                "created_at": entry.get("created_at", ""),
+                "last_used_at": entry.get("last_used_at", ""),
+            })
+        if sort_by == "trust_tier":
+            skills.sort(key=lambda s: (tier_order.get(s["trust_tier"], 9), -s["reliability"]))
+        elif sort_by == "reliability":
+            skills.sort(key=lambda s: -s["reliability"])
+        elif sort_by == "recent":
+            skills.sort(key=lambda s: s.get("last_used_at", ""), reverse=True)
+        return skills
 
     def get_workflow_plan(self, task_text: str) -> Dict[str, Any]:
         trigger_plan = self._match_workflow_trigger(task_text)
@@ -1688,36 +2145,47 @@ class LearningLoopManager:
             if self._is_workflow_disabled(direct, now=now):
                 direct = None
             else:
-                runtime_success = int(direct.get("success_count", 0))
-                reliability = self._workflow_reliability(direct)
-                if runtime_success >= self.workflow_min_success and reliability >= self.workflow_min_reliability:
-                    reward_component = self._workflow_reward_component(direct)
-                    confidence = min(0.99, 0.5 + reliability * 0.4 + reward_component * self.workflow_reward_weight)
-                    direct["last_suggested_at"] = now.isoformat()
-                    direct["last_suggested_score"] = round(confidence, 4)
+                quarantined, quarantine_changed, quarantine_reason = self._workflow_quarantine_state(direct, now=now)
+                if quarantine_changed:
                     changed = True
-                    if changed:
-                        self._save_workflows()
+                if quarantined:
                     self._trace_workflow(
-                        (
-                            "plan_lookup_hit source=direct signature=%s confidence=%.4f "
-                            "reliability=%.4f chain=%s"
-                        ),
+                        "plan_lookup_skip reason=quarantine signature=%s quarantine_reason=%s",
                         signature,
-                        float(confidence),
-                        float(reliability),
-                        list(direct.get("tool_chain", [])),
+                        quarantine_reason,
                     )
-                    return {
-                        "signature": signature,
-                        "tool_chain": list(direct.get("tool_chain", [])),
-                        "source": "direct",
-                        "confidence": round(confidence, 4),
-                        "reliability": round(reliability, 4),
-                        "reward_score_ema": round(self._clamp_reward_score(direct.get("reward_score_ema", 0.0)), 4),
-                        "success_count": runtime_success,
-                        "failure_count": int(direct.get("failure_count", 0)),
-                    }
+                    direct = None
+                else:
+                    runtime_success = int(direct.get("success_count", 0))
+                    reliability = self._workflow_reliability(direct)
+                    if runtime_success >= self.workflow_min_success and reliability >= self.workflow_min_reliability:
+                        reward_component = self._workflow_reward_component(direct)
+                        confidence = min(0.99, 0.5 + reliability * 0.4 + reward_component * self.workflow_reward_weight)
+                        direct["last_suggested_at"] = now.isoformat()
+                        direct["last_suggested_score"] = round(confidence, 4)
+                        changed = True
+                        if changed:
+                            self._save_workflows()
+                        self._trace_workflow(
+                            (
+                                "plan_lookup_hit source=direct signature=%s confidence=%.4f "
+                                "reliability=%.4f chain=%s"
+                            ),
+                            signature,
+                            float(confidence),
+                            float(reliability),
+                            list(direct.get("tool_chain", [])),
+                        )
+                        return {
+                            "signature": signature,
+                            "tool_chain": list(direct.get("tool_chain", [])),
+                            "source": "direct",
+                            "confidence": round(confidence, 4),
+                            "reliability": round(reliability, 4),
+                            "reward_score_ema": round(self._clamp_reward_score(direct.get("reward_score_ema", 0.0)), 4),
+                            "success_count": runtime_success,
+                            "failure_count": int(direct.get("failure_count", 0)),
+                        }
 
         query_tokens = set(self._tokenize_task(task_text))
         if not query_tokens:
@@ -1736,6 +2204,16 @@ class LearningLoopManager:
             entry = self._normalize_workflow_entry(raw_entry, raw_signature, task_text)
             templates[raw_signature] = entry
             if self._is_workflow_disabled(entry, now=now):
+                continue
+            quarantined, quarantine_changed, quarantine_reason = self._workflow_quarantine_state(entry, now=now)
+            if quarantine_changed:
+                changed = True
+            if quarantined:
+                self._trace_workflow(
+                    "plan_lookup_skip reason=quarantine signature=%s quarantine_reason=%s",
+                    raw_signature,
+                    quarantine_reason,
+                )
                 continue
             candidate_tokens = set(entry.get("tokens", []))
             if not candidate_tokens:
@@ -1801,6 +2279,140 @@ class LearningLoopManager:
         chain = plan.get("tool_chain", [])
         return list(chain) if isinstance(chain, list) else []
 
+    def get_failure_recovery_plan(self, task_text: str) -> Dict[str, Any]:
+        """
+        Return a compact hint distilled from prior workflow failures.
+
+        The hint contains:
+        - failing chain/tools to avoid for similar tasks
+        - an alternative high-reliability chain when available
+        """
+        templates = self._workflows.get("templates", {})
+        if not isinstance(templates, dict) or not templates:
+            return {}
+
+        query_tokens = set(self._tokenize_task(task_text))
+        if not query_tokens:
+            return {}
+
+        now = datetime.now()
+        changed = False
+        best_fail_signature = ""
+        best_fail_entry: Optional[Dict[str, Any]] = None
+        best_fail_score = 0.0
+
+        for raw_signature, raw_entry in templates.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = self._normalize_workflow_entry(raw_entry, raw_signature, task_text)
+            templates[raw_signature] = entry
+            candidate_tokens = set(entry.get("tokens", []))
+            if not candidate_tokens:
+                continue
+            overlap = len(query_tokens & candidate_tokens)
+            if overlap <= 0:
+                continue
+            total_failures = self._workflow_total_failures(entry)
+            if total_failures <= 0:
+                continue
+
+            lexical = overlap / max(len(query_tokens), 1)
+            reliability_penalty = 1.0 - self._workflow_reliability(entry)
+            failure_weight = min(0.4, total_failures / 10.0)
+            failure_tag = self._workflow_failure_tag_from_entry(entry)
+            quarantine_bonus = 0.12 if failure_tag in set(self.workflow_quarantine_tags) else 0.0
+            recency_bonus = 0.0
+            last_failure_dt = self._parse_datetime(str(entry.get("last_failure_at") or ""))
+            if last_failure_dt is not None:
+                age_hours = max(0.0, (now - last_failure_dt).total_seconds() / 3600.0)
+                recency_bonus = max(0.0, 0.25 - min(0.25, age_hours / 96.0))
+
+            score = lexical * 0.55 + reliability_penalty * 0.25 + failure_weight + quarantine_bonus + recency_bonus
+            if score > best_fail_score:
+                best_fail_score = score
+                best_fail_signature = str(raw_signature)
+                best_fail_entry = entry
+
+        if best_fail_entry is None:
+            if changed:
+                self._save_workflows()
+            return {}
+
+        avoid_chain = self._sanitize_tool_chain(best_fail_entry.get("tool_chain", []))
+        if len(avoid_chain) < 2:
+            if changed:
+                self._save_workflows()
+            return {}
+
+        best_recovery_signature = ""
+        best_recovery_chain: List[str] = []
+        best_recovery_score = 0.0
+        avoid_key = self._workflow_chain_key(avoid_chain)
+
+        for raw_signature, raw_entry in templates.items():
+            if raw_signature == best_fail_signature or not isinstance(raw_entry, dict):
+                continue
+            entry = self._normalize_workflow_entry(raw_entry, raw_signature, task_text)
+            templates[raw_signature] = entry
+
+            chain = self._sanitize_tool_chain(entry.get("tool_chain", []))
+            if len(chain) < 2:
+                continue
+            if self._workflow_chain_key(chain) == avoid_key:
+                continue
+
+            success_total = int(entry.get("success_count", 0) or 0) + int(entry.get("replay_success_count", 0) or 0)
+            reliability = self._workflow_reliability(entry)
+            if success_total < self.workflow_min_success or reliability < self.workflow_min_reliability:
+                continue
+
+            candidate_tokens = set(entry.get("tokens", []))
+            overlap = len(query_tokens & candidate_tokens) if candidate_tokens else 0
+            if overlap <= 0:
+                continue
+            lexical = overlap / max(len(query_tokens), 1)
+            reward_component = self._workflow_reward_component(entry)
+            score = lexical * 0.55 + reliability * 0.25 + reward_component * self.workflow_reward_weight
+            if score > best_recovery_score:
+                best_recovery_score = score
+                best_recovery_signature = str(raw_signature)
+                best_recovery_chain = chain
+
+        if changed:
+            self._save_workflows()
+
+        failure_tag = self._workflow_failure_tag_from_entry(best_fail_entry)
+        result: Dict[str, Any] = {
+            "source_signature": best_fail_signature,
+            "source_failure_tag": failure_tag,
+            "source_failure_count": self._workflow_total_failures(best_fail_entry),
+            "source_reliability": round(self._workflow_reliability(best_fail_entry), 4),
+            "source_last_error": self._short_text(
+                best_fail_entry.get("last_replay_error") or best_fail_entry.get("last_error") or "",
+                200,
+            ),
+            "avoid_chain": list(avoid_chain),
+            "avoid_tools": list(dict.fromkeys(avoid_chain)),
+            "confidence": round(min(0.99, max(0.0, best_fail_score)), 4),
+        }
+        if best_recovery_chain:
+            result["suggested_recovery_chain"] = list(best_recovery_chain)
+            result["recovery_signature"] = best_recovery_signature
+            result["recovery_confidence"] = round(min(0.99, max(0.0, best_recovery_score)), 4)
+
+        self._trace_workflow(
+            (
+                "failure_recovery_plan source_signature=%s failure_tag=%s avoid=%s "
+                "recovery_signature=%s recovery_chain=%s"
+            ),
+            best_fail_signature,
+            failure_tag,
+            list(avoid_chain),
+            best_recovery_signature,
+            list(best_recovery_chain),
+        )
+        return result
+
     def record_workflow_replay_result(
         self,
         task_text: str,
@@ -1810,8 +2422,21 @@ class LearningLoopManager:
         error: str = "",
         signature: str = "",
     ) -> None:
+        self._diag["workflow_replay_calls"] = int(self._diag.get("workflow_replay_calls", 0) or 0) + 1
+        self._diag["workflow_replay_last"] = {
+            "at": datetime.now().isoformat(),
+            "conversation_id": str(conversation_id or "default"),
+            "success": bool(success),
+            "chain": self._sanitize_tool_chain(tool_chain),
+            "signature": self._short_text(signature, 120),
+            "error": self._short_text(error, 180),
+            "task": self._short_task(task_text, 180),
+        }
         chain = self._sanitize_tool_chain(tool_chain)
         if len(chain) < 2:
+            self._diag["workflow_replay_skip_short_chain"] = int(
+                self._diag.get("workflow_replay_skip_short_chain", 0) or 0
+            ) + 1
             self._trace_workflow(
                 "record_replay_skip reason=chain_too_short chain=%s conversation_id=%s",
                 chain,
@@ -1840,17 +2465,54 @@ class LearningLoopManager:
             entry["consecutive_failures"] = 0
             entry["last_replay_outcome"] = "success"
             entry["last_replay_error"] = ""
+            entry["last_failure_tag"] = ""
+            entry["last_failure_at"] = ""
             entry["disabled_until"] = ""
             entry["disabled_reason"] = ""
+            if bool(entry.get("quarantine_requires_fresh_success", False)):
+                self._clear_workflow_quarantine(entry, reason="replay_success")
         else:
             entry["replay_failure_count"] = int(entry.get("replay_failure_count", 0)) + 1
             entry["consecutive_failures"] = int(entry.get("consecutive_failures", 0)) + 1
             entry["last_replay_outcome"] = "failure"
             entry["last_replay_error"] = str(error or "")[:220]
+            entry["last_failure_at"] = now.isoformat()
             if int(entry.get("consecutive_failures", 0)) >= self.workflow_replay_disable_failures:
                 disabled_until = now + timedelta(minutes=self.workflow_disable_minutes)
                 entry["disabled_until"] = disabled_until.isoformat()
                 entry["disabled_reason"] = "replay_failures"
+            failure_tag = self._classify_workflow_failure_tag(error)
+            entry["last_failure_tag"] = str(failure_tag or "")[:120]
+            propagated = 0
+            if failure_tag and failure_tag in set(self.workflow_quarantine_tags):
+                self._apply_replay_quarantine(
+                    entry,
+                    now=now,
+                    failure_tag=failure_tag,
+                    reason_prefix="replay_failure",
+                )
+                propagated = self._propagate_chain_quarantine(
+                    templates,
+                    source_signature=resolved_signature,
+                    chain=chain,
+                    now=now,
+                    failure_tag=failure_tag,
+                )
+                if propagated > 0:
+                    entry["quarantine_propagated_count"] = int(
+                        entry.get("quarantine_propagated_count", 0) or 0
+                    ) + propagated
+                self._trace_workflow(
+                    (
+                        "record_replay_quarantine signature=%s failure_tag=%s "
+                        "quarantine_until=%s success_baseline=%s propagated=%s"
+                    ),
+                    resolved_signature,
+                    failure_tag,
+                    entry.get("quarantine_until", ""),
+                    int(entry.get("quarantine_success_baseline", 0) or 0),
+                    int(propagated),
+                )
         reward_score = self._score_workflow_transition(
             task_text=task_text,
             chain=chain,
@@ -1859,11 +2521,13 @@ class LearningLoopManager:
         )
         self._apply_workflow_reward_score(entry, reward_score, now.isoformat())
         templates[resolved_signature] = entry
+        self._diag["workflow_replay_saved"] = int(self._diag.get("workflow_replay_saved", 0) or 0) + 1
         self._save_workflows()
         self._trace_workflow(
             (
                 "record_replay_saved signature=%s success=%s chain=%s replay_success=%s "
-                "replay_failure=%s consecutive_failures=%s disabled_until=%s"
+                "replay_failure=%s consecutive_failures=%s disabled_until=%s "
+                "quarantine_until=%s quarantine_reason=%s"
             ),
             resolved_signature,
             bool(success),
@@ -1872,6 +2536,8 @@ class LearningLoopManager:
             int(entry.get("replay_failure_count", 0) or 0),
             int(entry.get("consecutive_failures", 0) or 0),
             str(entry.get("disabled_until", "")),
+            str(entry.get("quarantine_until", "")),
+            str(entry.get("quarantine_reason", "")),
         )
 
     @staticmethod
@@ -2098,17 +2764,45 @@ class LearningLoopManager:
         templates = self._workflows.get("templates", {})
         triggers_payload = self._workflow_triggers if isinstance(self._workflow_triggers, dict) else {}
         now = datetime.now()
+        due_details = self._daily_due_details(now=now)
         active_adapter = self.adapter_registry.get_active_adapter()
+        quarantine_active = 0
+        quarantine_pending_fresh_success = 0
+        for raw_entry in templates.values():
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = self._normalize_workflow_entry(raw_entry, str(raw_entry.get("signature") or ""), "")
+            quarantine_until = self._parse_datetime(str(entry.get("quarantine_until") or ""))
+            if quarantine_until is not None and quarantine_until > now:
+                quarantine_active += 1
+            if bool(entry.get("quarantine_requires_fresh_success", False)):
+                try:
+                    success_count = int(entry.get("success_count", 0) or 0)
+                    baseline = int(entry.get("quarantine_success_baseline", 0) or 0)
+                except Exception:
+                    success_count = 0
+                    baseline = 0
+                if success_count <= baseline:
+                    quarantine_pending_fresh_success += 1
         return {
             "daily_hour": self.daily_hour,
             "poll_seconds": self.poll_seconds,
+            "startup_delay_seconds": self.startup_delay_seconds,
             "debug_trace_enabled": bool(self.debug_trace_enabled),
             "workflow_trace_enabled": bool(self.workflow_trace_enabled),
             "reward_trace_enabled": bool(self.reward_trace_enabled),
+            "running": bool(self._running),
+            "task_active": bool(self._task is not None and not self._task.done()),
+            "cycle_running": bool(self._cycle_running),
             "state": dict(self._state),
+            "diagnostics": dict(self._diag),
             "workflow_templates": len(templates),
             "workflow_trigger_path": str(self.workflow_trigger_path),
             "workflow_triggers": len(list(triggers_payload.get("triggers", []) or [])),
+            "workflow_quarantine_minutes": int(self.workflow_quarantine_minutes),
+            "workflow_quarantine_tags": list(self.workflow_quarantine_tags),
+            "workflow_quarantine_active": quarantine_active,
+            "workflow_quarantine_pending_fresh_success": quarantine_pending_fresh_success,
             "reward_model_loaded": self.reward_model is not None,
             "reward_auto_train_enabled": bool(self.reward_auto_train_enabled),
             "workflow_reward_weight": self.workflow_reward_weight,
@@ -2126,6 +2820,8 @@ class LearningLoopManager:
             "active_adapter_id": str(getattr(active_adapter, "adapter_id", "") or ""),
             "example_count": self.example_store.count(),
             "trajectory_stats": self.capture.get_statistics(),
-            "daily_due_now": self._is_daily_cycle_due(now=now),
-            "daily_next_due_at": self._next_due_datetime(now=now).isoformat(),
+            "daily_due_now": bool(due_details.get("due_now", False)),
+            "daily_next_due_at": str(due_details.get("next_due_at", "")),
+            "daily_due_reason": str(due_details.get("reason", "")),
+            "daily_due_details": due_details,
         }

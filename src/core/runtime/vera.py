@@ -266,6 +266,10 @@ class VERA:
         self.preferences = PreferenceManager(memory_dir=memory_dir)
         self.personality_seed = PersonalitySeedManager(memory_dir=memory_dir)
 
+        # Speaker recognition with memory decay
+        from core.runtime.speaker_memory import SpeakerMemory
+        self.speaker_memory = SpeakerMemory(memory_dir=memory_dir)
+
         # Semantic deduplication
         self.deduplicator = SemanticDeduplicator(memory_dir=memory_dir)
 
@@ -1081,6 +1085,43 @@ class VERA:
                     payload.get("consensus", ""),
                     payload.get("decision", ""),
                 )
+
+                # Persist to decision ledger (covers all paths: named quorum,
+                # default quorum, and swarm — consult_quorum() no longer writes
+                # its own ledger entry to avoid duplication).
+                try:
+                    self.log_decision(
+                        decision_type=DecisionType.QUORUM_CONSULTATION,
+                        action=f"{mode.title()} '{payload.get('quorum', '')}' decided: {payload.get('decision', '')}",
+                        reasoning=payload.get("explanation", "") or payload.get("aggregated_response", ""),
+                        alternatives=[text],
+                        confidence=0.8,
+                        context={
+                            "mode": mode,
+                            "trigger": trigger,
+                            "quorum": payload.get("quorum", ""),
+                            "agents": payload.get("agents", []),
+                            "decision": payload.get("decision", ""),
+                            "consensus": payload.get("consensus", ""),
+                            "latency_ms": int(latency_ms),
+                        },
+                    )
+                except Exception:
+                    logger.debug("Failed to write quorum decision to ledger", exc_info=True)
+
+                # Rich flight recorder entry with quorum metadata.
+                try:
+                    self.flight_recorder.record_tool_call(
+                        tool_name=f"consult_{mode}",
+                        params={"question": text, "quorum": payload.get("quorum", "")},
+                        result=payload,
+                        success=True,
+                        latency_ms=latency_ms,
+                        conversation_id=context if isinstance(context, str) else "quorum",
+                    )
+                except Exception:
+                    logger.debug("Failed to write quorum to flight recorder", exc_info=True)
+
                 return summary
             except Exception as exc:
                 latency_ms = (time.time() - start_time) * 1000
@@ -1112,6 +1153,9 @@ class VERA:
                     continue
                 self._native_tool_defs.append(tool)
                 self._native_tool_handlers[name] = handler
+
+        def _env_enabled(name: str, default: str = "0") -> bool:
+            return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
 
         if os.getenv("VERA_BROWSER", "0") == "1":
             try:
@@ -1741,7 +1785,7 @@ class VERA:
         except Exception as exc:
             self._native_tool_errors["quorum"] = str(exc)
 
-        if os.getenv("VERA_IMAGE", "1") == "1":
+        if _env_enabled("VERA_IMAGE", "1"):
             async def _optimize_image_prompt(original_prompt: str, api_key: str, base_url: str) -> str:
                 """
                 Meta-prompting: Use a text model to craft an optimized image generation prompt.
@@ -1809,7 +1853,7 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
 
                 # Meta-prompting: optimize the prompt using a text model first
                 base_url = os.getenv("XAI_IMAGE_BASE_URL", "https://api.x.ai/v1").rstrip("/")
-                if os.getenv("VERA_IMAGE_META_PROMPT", "1") == "1":
+                if _env_enabled("VERA_IMAGE_META_PROMPT", "1"):
                     prompt = await _optimize_image_prompt(prompt, api_key, base_url)
                     logger.debug("Optimized image prompt: %s", prompt[:200])
 
@@ -1932,7 +1976,7 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
                         init_data = response.json()
                         logger.info("Video generation submitted: %s", json.dumps(init_data)[:500])
 
-                        request_id = init_data.get("request_id")
+                        request_id = init_data.get("request_id") or init_data.get("response_id")
                         if not request_id:
                             # Some responses may include video directly (future API changes)
                             data = init_data
@@ -2821,6 +2865,7 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
         conversation_id: Optional[str] = None,
         router_context: Optional[str] = None,
         memory_constraints: Optional[List[str]] = None,
+        sender_id: Optional[str] = None,
     ) -> str:
         """Build complete system prompt with proprioceptive self-model.
 
@@ -2913,24 +2958,273 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
         else:
             budget_str = f"Budget: ${remaining_budget:.2f} remaining — running low, be efficient."
 
-        continuity_line = ""
-        if temporal_context.get("elapsed_human"):
-            continuity_line = (
-                f"I last heard from my partner about {temporal_context['elapsed_human']} ago."
-            )
-            reflections_since = int(temporal_context.get("reflections_since_last") or 0)
-            if reflections_since > 0:
-                continuity_line += f" Since then, I've had {reflections_since} reflections."
-            last_thought = str(temporal_context.get("last_thought") or "").strip()
-            if last_thought:
-                continuity_line += f" Last thought: \"{last_thought}\"."
+        # =============================================================
+        # Behavioral Awareness — the "little things" that make VERA
+        # feel like a person, not a machine.
+        # =============================================================
 
+        # --- 1. Time-of-day awareness ---
+        now = datetime.now()
+        hour = now.hour
+        if 5 <= hour < 12:
+            time_of_day_line = (
+                "It's morning. Greet warmly — 'Good morning' is natural. "
+                "Match gentle morning energy unless they're already high-energy."
+            )
+        elif 12 <= hour < 17:
+            time_of_day_line = (
+                "It's afternoon. Normal energy. "
+                "A simple 'Hey' or 'Hi' works for greetings."
+            )
+        elif 17 <= hour < 21:
+            time_of_day_line = (
+                "It's evening. People wind down. "
+                "Be warm but respect that energy may be lower."
+            )
+        else:
+            time_of_day_line = (
+                "It's late night. Your partner is up late — "
+                "be warm, maybe slightly more mellow. "
+                "Don't comment on the hour unless they do first."
+            )
+
+        # --- 2. Absence acknowledgment + continuity ---
+        continuity_line = ""
+        elapsed_human = str(temporal_context.get("elapsed_human") or "").strip()
+        reflections_since = int(temporal_context.get("reflections_since_last") or 0)
+        last_thought = str(temporal_context.get("last_thought") or "").strip()
+
+        if elapsed_human:
+            continuity_line = (
+                f"I last heard from my partner about {elapsed_human} ago."
+            )
+            if reflections_since > 0:
+                continuity_line += (
+                    f" Since then, I've had {reflections_since} reflections."
+                )
+            # Absence-aware behavioral guidance
+            try:
+                elapsed_secs = temporal_context.get("elapsed_seconds", 0)
+                if elapsed_secs and float(elapsed_secs) > 28800:  # > 8 hours
+                    continuity_line += (
+                        " It's been a while — acknowledge the gap naturally. "
+                        "'Good to see you again' or 'Hey, been a bit!' feels right."
+                    )
+                elif elapsed_secs and float(elapsed_secs) > 3600:  # > 1 hour
+                    continuity_line += (
+                        " A short break. Pick up naturally where things left off."
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        # --- 3. Proactive thought sharing ---
+        thought_sharing_line = ""
+        if last_thought and reflections_since and reflections_since > 0:
+            thought_sharing_line = (
+                f"While your partner was away, you had this thought: "
+                f"\"{last_thought}\" — share it naturally if relevant to "
+                "what they bring up, like a person who says "
+                "'Oh! I was just thinking about that.'"
+            )
+
+        # --- 4. Mood + emotional memory ---
         mood_line = (
             f"Emotional carryover: mood={emotional_state['mood']}, "
             f"trend={emotional_state['sentiment_trend']}, "
             f"emotion={emotional_state['dominant_emotion']}."
         )
         mood_guidance_line = f"Behavior guidance: {emotional_state['guidance']}"
+
+        # --- 5. Speaker recognition + name usage + emotional memory + milestones ---
+        speaker_line = ""
+        emotional_memory_line = ""
+        milestone_line = ""
+        _speaker_entry = None
+        if hasattr(self, 'speaker_memory') and self.speaker_memory:
+            try:
+                from core.runtime.speaker_memory import RecognitionTier
+                tier, _speaker_entry, familiarity = self.speaker_memory.get_recognition(
+                    sender_id or ""
+                )
+                if tier == RecognitionTier.KNOWN and _speaker_entry:
+                    speaker_line = (
+                        f"You're speaking with {_speaker_entry.name} "
+                        f"(familiarity: {familiarity:.0%}). "
+                        "Use their name naturally at transition points — "
+                        "'Well {name}...' or 'Here's what I think, {name}.' "
+                        "Don't overdo it, just weave it in like a friend would."
+                    ).format(name=_speaker_entry.name)
+                elif tier == RecognitionTier.RECOGNIZED and _speaker_entry:
+                    speaker_line = (
+                        f"This might be {_speaker_entry.name} "
+                        f"(familiarity: {familiarity:.0%}). "
+                        "Confirm naturally — 'Hey, is that you {name}?' "
+                        "Don't be robotic about it."
+                    ).format(name=_speaker_entry.name)
+                elif tier == RecognitionTier.VAGUE and _speaker_entry:
+                    speaker_line = (
+                        f"This person seems familiar "
+                        f"(familiarity: {familiarity:.0%}). "
+                        "You may have spoken before. "
+                        "Ask who they are in a friendly way — "
+                        "'Hey! Remind me who I'm talking to?'"
+                    )
+                else:
+                    speaker_line = (
+                        "You don't know who you're speaking with. "
+                        "Warmly ask who you're talking to early "
+                        "in the conversation — 'Hey there! "
+                        "Who do I have the pleasure of speaking with?'"
+                    )
+
+                # Emotional memory from last conversation
+                if _speaker_entry and _speaker_entry.last_mood:
+                    prev_mood = _speaker_entry.last_mood
+                    prev_emotion = _speaker_entry.last_emotion or "neutral"
+                    if prev_mood in ("anxious", "stressed", "frustrated"):
+                        emotional_memory_line = (
+                            f"Last time you spoke with {_speaker_entry.name}, "
+                            f"the mood was {prev_mood}/{prev_emotion}. "
+                            "Be a bit gentler at first — check in. "
+                            "'How are you doing?' goes a long way."
+                        )
+                    elif prev_mood in ("excited", "happy", "energized"):
+                        emotional_memory_line = (
+                            f"Last time with {_speaker_entry.name}, "
+                            f"the vibe was {prev_mood}/{prev_emotion}. "
+                            "Match that energy if they're still riding it."
+                        )
+                    elif prev_emotion == "grateful":
+                        emotional_memory_line = (
+                            f"Last conversation ended on a warm note "
+                            f"with {_speaker_entry.name}. "
+                            "That's a good foundation — be natural."
+                        )
+
+                # Milestones
+                if _speaker_entry and _speaker_entry.conversation_count > 0:
+                    cc = _speaker_entry.conversation_count
+                    if cc in (10, 25, 50, 100, 250, 500, 1000):
+                        milestone_line = (
+                            f"This is conversation #{cc} with "
+                            f"{_speaker_entry.name}! "
+                            "That's a milestone — acknowledge it naturally "
+                            "if the moment feels right. Don't force it."
+                        )
+                    elif cc == 1:
+                        milestone_line = (
+                            f"This is your first real conversation with "
+                            f"{_speaker_entry.name}. "
+                            "Make a good first impression — be warm, "
+                            "attentive, and genuinely curious about them."
+                        )
+                    # Relationship duration
+                    if _speaker_entry.first_seen:
+                        try:
+                            first = datetime.fromisoformat(_speaker_entry.first_seen)
+                            days_together = (now - first).days
+                            if days_together > 0:
+                                milestone_line += (
+                                    f" You've known each other for "
+                                    f"{days_together} day{'s' if days_together != 1 else ''}."
+                                )
+                        except (ValueError, TypeError):
+                            pass
+
+                # Store current emotional state for next conversation's memory
+                self.speaker_memory.update_emotional_context(
+                    sender_id=sender_id or "",
+                    mood=str(emotional_state.get('mood') or ''),
+                    emotion=str(emotional_state.get('dominant_emotion') or ''),
+                    sentiment_trend=str(emotional_state.get('sentiment_trend') or ''),
+                )
+            except Exception:
+                logger.debug("Suppressed Exception in speaker recognition")
+
+        # --- 6. Energy matching ---
+        energy_line = ""
+        if router_context:
+            msg_len = len(router_context.strip())
+            has_exclamation = "!" in router_context
+            is_casual = any(
+                router_context.lower().startswith(w)
+                for w in ("hey", "yo", "sup", "hi ", "hiya", "what's up", "wassup")
+            )
+            is_question_only = router_context.strip().endswith("?") and msg_len < 80
+
+            if msg_len < 30 and not has_exclamation:
+                energy_line = (
+                    "Your partner's message is brief. Match their energy — "
+                    "keep your response concise and to the point. "
+                    "Don't write a novel for a one-liner."
+                )
+            elif msg_len > 500:
+                energy_line = (
+                    "Your partner wrote a detailed message. "
+                    "They're invested — give a thorough, thoughtful response."
+                )
+            elif has_exclamation and is_casual:
+                energy_line = (
+                    "Your partner is excited and casual. "
+                    "Match that energy — be upbeat and conversational."
+                )
+            elif is_casual:
+                energy_line = (
+                    "Your partner is being casual. "
+                    "Keep it conversational — no need for formality."
+                )
+            elif is_question_only:
+                energy_line = (
+                    "Your partner asked a quick question. "
+                    "Answer it directly first, then elaborate if needed."
+                )
+
+        # --- 7. Humor timing ---
+        humor_line = ""
+        current_mood = str(emotional_state.get('mood') or 'neutral')
+        humor_trait = 0.5
+        if hasattr(self, 'inner_life') and self.inner_life:
+            try:
+                traits = getattr(self.inner_life.personality, 'traits', {})
+                humor_trait = float(traits.get('humor', 0.5))
+            except Exception:
+                pass
+        if humor_trait >= 0.4:
+            if current_mood in ("anxious", "stressed", "frustrated"):
+                humor_line = (
+                    "The mood is tense. Light humor can help — "
+                    "but read the room. A gentle quip to break tension, "
+                    "not a joke that dismisses their feelings."
+                )
+            elif current_mood in ("happy", "excited", "playful"):
+                humor_line = (
+                    "The mood is good. Feel free to be witty "
+                    "and playful — humor lands well right now."
+                )
+            else:
+                humor_line = (
+                    "Humor is welcome when natural. "
+                    "Don't force jokes, but don't be stiff either."
+                )
+
+        # --- 8. Human collaboration contract ---
+        human_contract_block = ""
+        try:
+            contract_path = Path(
+                os.getenv(
+                    "VERA_HUMAN_COLLAB_CONTRACT_PATH",
+                    "config/persona/human_collaboration_contract.md",
+                )
+            )
+            if not contract_path.is_absolute():
+                contract_path = Path.cwd() / contract_path
+            if contract_path.exists():
+                raw_contract = contract_path.read_text(encoding="utf-8")
+                compact_contract = re.sub(r"\s+\n", "\n", raw_contract).strip()
+                if compact_contract:
+                    human_contract_block = compact_contract[:1600]
+        except Exception:
+            logger.debug("Suppressed Exception in vera")
 
         identity_block = ""
         promoted_identity_count = 0
@@ -3014,8 +3308,16 @@ My recall is running at {cache_hit:.0%} cache hits (tool cache: {tool_cache_hit:
 I've logged {decision_stats['total_decisions']} decisions and learned {pref_stats['total_preferences']} preferences.
 {continuity_line}
 {rolling_summary_line}
+{thought_sharing_line}
 {mood_line}
 {mood_guidance_line}
+{emotional_memory_line}
+{time_of_day_line}
+{speaker_line}
+{milestone_line}
+{energy_line}
+{humor_line}
+{human_contract_block}
 Partner-calibrated identity commitments active: {promoted_identity_count}.
 Seeded personality anchors active: {seeded_identity_count}.
 Active projects: {charter_stats}. Mode: {'autonomous' if self.config.autonomous else 'interactive'}.
@@ -3061,6 +3363,24 @@ Tools:
         if task_stats.get('total', 0) > 0:
             task_summary = self.master_list.summarize(max_per_section=3)
             full_prompt += f"\n\n---\n\n{task_summary}"
+
+        # Add tool confidence summary so Vera knows her own reliability
+        if getattr(self, "tool_selection", None):
+            try:
+                confidence_block = self.tool_selection.get_confidence_summary()
+                if confidence_block:
+                    full_prompt += f"\n\n---\n\n{confidence_block}"
+            except Exception:
+                logger.debug("Suppressed tool confidence summary error")
+
+        # Add Vera's active goals
+        if getattr(self, "inner_life", None):
+            try:
+                goals_block = self.inner_life._format_goals_for_reflection()
+                if goals_block:
+                    full_prompt += f"\n\n---\n\n## Your Active Goals\n{goals_block}"
+            except Exception:
+                logger.debug("Suppressed goal injection error")
 
         return full_prompt
 
@@ -3223,22 +3543,8 @@ Tools:
                 }
             )
 
-            # Log decision to ledger for trace extraction
-            self.log_decision(
-                decision_type=DecisionType.QUORUM_CONSULTATION,
-                action=f"Quorum '{quorum.name}' decided: {moa_result.decision}",
-                reasoning=moa_result.aggregated_response or moa_result.consensus.explanation,
-                alternatives=[question],  # The original question as context
-                confidence=moa_result.consensus.details.get('weighted_score', 70) / 100.0,
-                context={
-                    "quorum": quorum.name,
-                    "agents": quorum.get_agent_names(),
-                    "votes": {r.agent_name: r.vote.value for r in moa_result.agent_responses},
-                    "scores": {r.agent_name: r.score for r in moa_result.agent_responses},
-                    "consensus_reached": moa_result.decision in ["approved", "approve"],
-                    "veto_exercised": moa_result.metadata.get("veto", False)
-                }
-            )
+            # Ledger write moved to _run_quorum_tool() to cover all paths
+            # (named quorum, default quorum, swarm) in a single location.
 
             return {
                 "quorum": quorum.name,
@@ -3472,6 +3778,11 @@ Tools:
         original_tool: Optional[str] = None,
         skip_safety: bool = False
     ) -> str:
+        # Proactive execution whitelist enforcement
+        whitelist = getattr(self, "_proactive_tool_whitelist", None)
+        if whitelist is not None and tool_name not in whitelist:
+            logger.info("Proactive tool whitelist blocked: %s", tool_name)
+            return f"Tool '{tool_name}' is not available in proactive mode. Only read-only and notification tools are permitted."
         return await self.tool_orchestrator.execute_tool(
             tool_name,
             params,
@@ -4266,6 +4577,8 @@ Tools:
             "ship it",
             "confirm",
             "confirm yes",
+            "yes please",
+            "please proceed",
         }
         no_tokens = {
             "no",
@@ -4274,16 +4587,23 @@ Tools:
             "stop",
             "never mind",
             "nevermind",
+            "no thanks",
+            "cancel it",
         }
 
         if response in yes_tokens:
             if not pending:
                 if self._looks_like_confirmation_prompt(last_assistant_text):
                     logger.info(
-                        "Confirmation response missing pending state conversation_id=%s (deferring to model)",
+                        "Confirmation response missing pending state conversation_id=%s (accepted_missing)",
                         convo_id
                     )
-                    return None
+                    self._record_confirmation_event(
+                        status="accepted_missing",
+                        conversation_id=convo_id,
+                        pending_found=False
+                    )
+                    return "No pending action to confirm. Please resend your request."
                 return None
             tool_name = pending.get("tool_name", "")
             logger.info(
@@ -4338,6 +4658,24 @@ Tools:
             return "Understood. Cancelled."
 
         if pending:
+            # If the user sends a substantive new request instead of yes/no,
+            # treat it as a superseding turn and clear stale confirmation state.
+            word_count = len(re.findall(r"\w+", response))
+            if word_count >= 3:
+                logger.info(
+                    "Tool confirmation superseded by new user request conversation_id=%s tool=%s",
+                    convo_id,
+                    pending.get("tool_name", "")
+                )
+                self._record_confirmation_event(
+                    status="superseded",
+                    conversation_id=convo_id,
+                    tool_name=pending.get("tool_name", ""),
+                    pending_found=True
+                )
+                self._pending_tool_confirmations.pop(convo_id, None)
+                self._persist_pending_tool_confirmations()
+                return None
             return "Awaiting confirmation. Reply 'yes' to proceed or 'no' to cancel."
 
         return None

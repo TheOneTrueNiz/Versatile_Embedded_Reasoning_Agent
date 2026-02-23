@@ -127,6 +127,57 @@
       </div>
     </section>
 
+    <section class="drawer-card goals-card">
+      <div class="card-header">
+        <span>Goals</span>
+        <span class="pill neutral">{{ goals.length }} active</span>
+      </div>
+      <div v-if="!goals.length" class="empty-state">No active goals yet.</div>
+      <div v-else class="goals-list">
+        <div v-for="goal in goals" :key="goal.id" class="goal-item">
+          <div class="goal-meta">
+            <span class="intent-pill" :class="goalCategoryClass(goal.category)">{{ goal.category }}</span>
+            <span class="priority-dots">{{ '\u25CF'.repeat(goal.priority) }}{{ '\u25CB'.repeat(5 - goal.priority) }}</span>
+          </div>
+          <div class="goal-text">{{ goal.description }}</div>
+          <div v-if="goal.progress_notes?.length" class="goal-note">
+            Latest: {{ goal.progress_notes[goal.progress_notes.length - 1].note }}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="drawer-card proactive-card" v-if="proactive">
+      <div class="card-header">
+        <span>Proactive Systems</span>
+        <span class="pill" :class="proactiveActive ? 'ok' : 'neutral'">
+          {{ proactiveActive ? 'active' : 'standby' }}
+        </span>
+      </div>
+      <div class="status-grid">
+        <div class="stat-item">
+          <span>Calendar</span>
+          <span class="pill" :class="proactive.calendar_enabled ? 'ok' : 'warn'">
+            {{ proactive.calendar_enabled ? 'on' : 'off' }}
+          </span>
+        </div>
+        <div class="stat-item" v-if="proactive.calendar_enabled">
+          <span>Alerts today</span>
+          <span>{{ proactive.calendar_alerts_today || 0 }}</span>
+        </div>
+        <div class="stat-item" v-if="proactive.calendar_enabled">
+          <span>Last poll</span>
+          <span>{{ formatTimestamp(proactive.calendar_last_poll) }}</span>
+        </div>
+        <div class="stat-item">
+          <span>Auto-execute</span>
+          <span class="pill" :class="proactive.proactive_execution_enabled ? 'ok' : 'warn'">
+            {{ proactive.proactive_execution_enabled ? 'on' : 'off' }}
+          </span>
+        </div>
+      </div>
+    </section>
+
     <section class="drawer-card thoughts-card">
       <div class="card-header">
         <span>Recent Thoughts</span>
@@ -158,6 +209,8 @@ defineEmits(['close']);
 const stats = ref(null);
 const personality = ref(null);
 const thoughts = ref([]);
+const goals = ref([]);
+const proactive = ref(null);
 const loading = ref(false);
 const error = ref('');
 const reflectBusy = ref(false);
@@ -181,6 +234,8 @@ const fetchInnerLife = async () => {
     stats.value = payload.stats || null;
     personality.value = payload.personality || null;
     thoughts.value = payload.recent_thoughts || [];
+    goals.value = payload.goals || [];
+    proactive.value = payload.proactive || null;
   } catch (err) {
     error.value = err?.message || 'Failed to load inner life status.';
   } finally {
@@ -245,6 +300,20 @@ const moodClass = computed(() => {
 const interests = computed(() => {
   return personality.value?.interests || stats.value?.interests || [];
 });
+
+const proactiveActive = computed(() =>
+  proactive.value?.calendar_enabled || proactive.value?.proactive_execution_enabled
+);
+
+const goalCategoryClass = (cat) => {
+  const map = {
+    self_improvement: 'intent-action',
+    relationship: 'intent-reach',
+    skill: 'intent-prompt',
+    exploration: 'intent-internal'
+  };
+  return map[cat] || 'intent-internal';
+};
 
 const radarTraits = computed(() => {
   const traits = personality.value?.traits || {};
@@ -785,6 +854,13 @@ onBeforeUnmount(() => {
     grid-column: span 1;
   }
 }
+
+.goal-item { padding: 8px 0; border-bottom: 1px solid var(--vera-border); }
+.goal-item:last-child { border-bottom: none; }
+.goal-meta { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+.goal-text { font-size: 0.8125rem; color: var(--vera-text); }
+.goal-note { font-size: 0.75rem; color: var(--vera-text-muted); margin-top: 4px; font-style: italic; }
+.priority-dots { font-size: 0.625rem; color: var(--vera-accent); letter-spacing: 1px; }
 
 @keyframes orbitPulse {
   0%, 100% {

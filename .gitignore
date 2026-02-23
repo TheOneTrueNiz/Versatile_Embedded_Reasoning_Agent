@@ -65,6 +65,12 @@ vera_theming_tmp/
 dev/
 *.backup
 
+# Stray build/scratch artifacts
+index.faiss
+index.json
+output.mp4
+test.txt
+
 # OS / IDE
 .DS_Store
 Thumbs.db

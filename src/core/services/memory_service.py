@@ -316,9 +316,8 @@ class VERAMemoryService:
             elif hasattr(meta, "provenance") and risk:
                 try:
                     meta.provenance.setdefault("poison_risk", risk)
-                except Exception:
-                    logger.debug("Suppressed Exception in memory_service")
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to set poison_risk on provenance: %s", exc)
 
         if not rerank:
             return [item for item, _ in scored]
@@ -372,8 +371,8 @@ class VERAMemoryService:
                 metadata=metadata,
                 tags=list(cube.metadata.tags),
             )
-        except Exception:
-            logger.debug("Suppressed Exception in memory_service")
+        except Exception as exc:
+            logger.warning("memvid put failed for %s: %s", label, exc)
 
     def _memvid_find(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
         if not self.memvid_sdk or not getattr(self.memvid_sdk, "enabled", False):

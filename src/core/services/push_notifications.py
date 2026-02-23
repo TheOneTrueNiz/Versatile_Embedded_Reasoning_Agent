@@ -192,6 +192,25 @@ def _normalize_subscription(subscription: Dict[str, Any]) -> Optional[Dict[str, 
     keys = subscription.get("keys") or {}
     if not endpoint or not isinstance(keys, dict):
         return None
+    # Validate endpoint URL to prevent SSRF on broadcast
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(str(endpoint))
+        if parsed.scheme != "https":
+            return None  # Push endpoints must be HTTPS
+        hostname = (parsed.hostname or "").lower()
+        if not hostname or hostname in ("localhost", "127.0.0.1", "::1"):
+            return None
+        # Block private/internal IPs
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(hostname)
+            if addr.is_private or addr.is_reserved or addr.is_link_local or addr.is_loopback:
+                return None
+        except ValueError:
+            pass  # Hostname, not IP — OK
+    except Exception:
+        return None
     normalized = {
         "endpoint": endpoint,
         "keys": {

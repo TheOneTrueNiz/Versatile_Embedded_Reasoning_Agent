@@ -477,6 +477,37 @@ class ToolSelectionMemory:
             "summary": self.stats
         }
 
+    def get_confidence_summary(self, top_n: int = 15) -> str:
+        """Return a compact text summary of tool reliability for prompt injection.
+
+        Shows the most-used tools with their success rates so Vera can make
+        informed decisions about which tools to trust.
+        """
+        if not self.performance:
+            return ""
+        entries = []
+        for name, stats in self.performance.items():
+            if stats.total_calls < 2:
+                continue
+            entries.append((
+                name,
+                stats.total_calls,
+                stats.success_rate,
+                stats.recent_success_rate,
+                stats.avg_latency,
+            ))
+        if not entries:
+            return ""
+        entries.sort(key=lambda e: e[1], reverse=True)
+        lines = ["Tool reliability (from experience):"]
+        for name, calls, rate, recent, latency in entries[:top_n]:
+            tier = "high" if recent >= 0.85 else ("mid" if recent >= 0.6 else "low")
+            lines.append(
+                f"  {name}: {recent:.0%} recent success ({calls} calls, "
+                f"{latency:.0f}ms avg) [{tier}]"
+            )
+        return "\n".join(lines)
+
     def record_routing_outcome(
         self,
         selected_categories: list,

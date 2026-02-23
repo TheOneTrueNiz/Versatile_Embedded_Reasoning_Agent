@@ -256,9 +256,9 @@ class SandboxToolBridge:
         if not code:
             return {"success": False, "error": "No code provided."}
 
-        session_id = str(params.get("session_id") or "default")
-        timeout_ms = int(params.get("timeout_ms", 1500))
-        max_output_chars = int(params.get("max_output_chars", 2000))
+        session_id = str(params.get("session_id") or "default")[:128]
+        timeout_ms = max(100, min(int(params.get("timeout_ms", 1500)), 30000))
+        max_output_chars = max(100, min(int(params.get("max_output_chars", 2000)), 50000))
         reset_session = bool(params.get("reset_session", False))
 
         if reset_session:

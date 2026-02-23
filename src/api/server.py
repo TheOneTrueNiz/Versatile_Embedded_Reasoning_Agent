@@ -948,7 +948,7 @@ async def _fetch_vision_summary(content: List[Dict[str, Any]]) -> str:
     if not api_key:
         return ""
     model = os.getenv("XAI_VISION_MODEL", "grok-4")
-    base_url = os.getenv("XAI_VISION_BASE_URL", "https://api.x.ai/v1").rstrip("/")
+    base_url = _validate_base_url(os.getenv("XAI_VISION_BASE_URL", ""), "https://api.x.ai/v1")
     system_prompt = (
         "You are a vision analyzer. Describe the image accurately and concisely. "
         "If the user asked a specific question, answer it directly based only on the image."
@@ -991,18 +991,82 @@ def _voice_enabled() -> bool:
 
 
 def _client_ip(request: web.Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        first = forwarded.split(",", 1)[0].strip()
-        if first:
-            return first
-    return request.remote or "unknown"
+    """Extract client IP, only trusting X-Forwarded-For from trusted proxies."""
+    trusted_proxies = os.getenv("VERA_TRUSTED_PROXIES", "").strip()
+    remote = request.remote or "unknown"
+    if trusted_proxies and remote != "unknown":
+        trusted_set = {p.strip() for p in trusted_proxies.split(",") if p.strip()}
+        if remote in trusted_set:
+            forwarded = request.headers.get("X-Forwarded-For", "")
+            if forwarded:
+                first = forwarded.split(",", 1)[0].strip()
+                if first:
+                    return first
+    return remote
+
+
+# ---------------------------------------------------------------------------
+# Base URL validation (SSRF prevention)
+# ---------------------------------------------------------------------------
+_SAFE_API_HOSTS = frozenset({
+    "api.x.ai", "api.anthropic.com", "api.openai.com",
+    "generativelanguage.googleapis.com", "api.together.xyz",
+    "api.groq.com", "openrouter.ai",
+})
+
+
+def _validate_base_url(url: str, fallback: str) -> str:
+    """Validate an env-sourced base URL to prevent SSRF.
+
+    Allows known API hosts, localhost for dev, and rejects private/internal IPs.
+    Returns fallback if the URL is invalid.
+    """
+    if not url or not url.strip():
+        return fallback
+
+    url = url.strip().rstrip("/")
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+    except Exception:
+        logger.warning("Invalid base URL rejected: %s", url)
+        return fallback
+
+    hostname = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "").lower()
+
+    if not hostname or scheme not in ("http", "https"):
+        logger.warning("Base URL rejected (bad scheme/host): %s", url)
+        return fallback
+
+    # Allow known API hosts
+    if hostname in _SAFE_API_HOSTS:
+        return url
+
+    # Allow localhost/loopback for local dev proxies
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return url
+
+    # Allow custom hosts only over HTTPS
+    if scheme == "https":
+        # Block private/internal IP ranges
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(hostname)
+            if addr.is_private or addr.is_reserved or addr.is_link_local or addr.is_loopback:
+                logger.warning("Base URL rejected (private IP): %s", url)
+                return fallback
+        except ValueError:
+            pass  # hostname, not IP — allow over HTTPS
+        return url
+
+    # HTTP to non-localhost, non-safe host — reject
+    logger.warning("Base URL rejected (HTTP to external host): %s", url)
+    return fallback
 
 
 def _anthropic_messages_endpoint() -> str:
-    base_url = (os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").strip().rstrip("/")
-    if not base_url:
-        base_url = "https://api.anthropic.com"
+    base_url = _validate_base_url(os.getenv("ANTHROPIC_BASE_URL", ""), "https://api.anthropic.com")
     if base_url.endswith("/v1"):
         return f"{base_url}/messages"
     return f"{base_url}/v1/messages"
@@ -1048,13 +1112,113 @@ def _check_anthropic_proxy_rate_limit(app: web.Application, client_ip: str) -> T
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
+    origin = os.getenv("VERA_CORS_ORIGIN", "*")
     if request.method == "OPTIONS":
-        return web.Response(status=200)
+        return web.Response(
+            status=204,
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Max-Age": "3600",
+            },
+        )
     response = await handler(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     return response
+
+
+# ---------------------------------------------------------------------------
+# Auth middleware
+# ---------------------------------------------------------------------------
+_AUTH_SKIP_PREFIXES = ("/api/health", "/api/readiness")
+_AUTH_SKIP_EXACT = frozenset({"/", "/favicon.ico"})
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    if request.method == "OPTIONS":
+        return await handler(request)
+    api_key = request.app.get("vera_api_key", "")
+    if not api_key:  # Auth disabled when key not set
+        return await handler(request)
+    path = request.path
+    if path in _AUTH_SKIP_EXACT:
+        return await handler(request)
+    for prefix in _AUTH_SKIP_PREFIXES:
+        if path.startswith(prefix):
+            return await handler(request)
+    if not path.startswith("/api/") and not path.startswith("/v1/") and not path.startswith("/ws"):
+        return await handler(request)  # Static UI assets
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and auth_header[7:].strip() == api_key:
+        return await handler(request)
+    return web.json_response(
+        {"error": "Unauthorized. Provide Authorization: Bearer <VERA_API_KEY>."},
+        status=401,
+        headers={"WWW-Authenticate": 'Bearer realm="vera"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# General rate-limit helpers
+# ---------------------------------------------------------------------------
+_RATE_LIMIT_CLEANUP_INTERVAL = 300  # seconds between stale-IP sweeps
+_rate_limit_last_cleanup: float = 0.0
+
+
+def _check_rate_limit(app, bucket_name, client_ip, max_requests, window_seconds):
+    """Generic sliding-window rate limiter. Returns (allowed, retry_after)."""
+    global _rate_limit_last_cleanup
+    now = time.time()
+    cutoff = now - window_seconds
+    buckets = app.setdefault(bucket_name, {})
+
+    # Periodic sweep of stale IPs to prevent unbounded memory growth
+    if now - _rate_limit_last_cleanup > _RATE_LIMIT_CLEANUP_INTERVAL:
+        _rate_limit_last_cleanup = now
+        stale_keys = [k for k, v in buckets.items() if not v or v[-1] < cutoff]
+        for k in stale_keys:
+            del buckets[k]
+
+    history = buckets.setdefault(client_ip, [])
+    while history and history[0] < cutoff:
+        history.pop(0)
+    if len(history) >= max_requests:
+        retry_after = max(1, int(window_seconds - (now - history[0])))
+        return False, retry_after
+    history.append(now)
+    return True, 0
+
+
+_RATE_LIMIT_SKIP_PREFIXES = ("/api/health", "/api/readiness")
+
+
+@web.middleware
+async def rate_limit_middleware(request, handler):
+    if os.getenv("VERA_RATE_LIMIT", "1") == "0":
+        return await handler(request)
+    path = request.path
+    for prefix in _RATE_LIMIT_SKIP_PREFIXES:
+        if path.startswith(prefix):
+            return await handler(request)
+    if not path.startswith("/api/") and not path.startswith("/v1/") and not path.startswith("/ws"):
+        return await handler(request)
+    max_req = _parse_int_env("VERA_RATE_LIMIT_MAX", 60, minimum=1)
+    window = _parse_float_env("VERA_RATE_LIMIT_WINDOW", 60.0, minimum=1.0)
+    ip = _client_ip(request)
+    allowed, retry_after = _check_rate_limit(
+        request.app, "global_rate_limit", ip, max_req, window
+    )
+    if not allowed:
+        return web.json_response(
+            {"error": {"message": "Rate limit exceeded."}},
+            status=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+    return await handler(request)
 
 
 async def health(request: web.Request) -> web.Response:
@@ -1143,14 +1307,39 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     generation_config = _extract_generation_config(payload)
     generation_config = _filter_generation_config_for_model(model, generation_config)
 
-    system_prompt = vera.build_system_prompt(
-        conversation_id=runtime_conversation_id,
-        router_context=last_user_text_raw,
-    )
+    # Speaker recognition: detect self-identification, track conversations
+    _is_title_gen = "5 words or less" in last_user_text
+    if not _is_title_gen and hasattr(vera, 'speaker_memory') and vera.speaker_memory:
+        try:
+            from core.runtime.speaker_memory import SpeakerMemory
+            _speaker_sid = sender_id or runtime_conversation_id
+            _speaker_name = SpeakerMemory.detect_self_identification(last_user_text_raw)
+            if _speaker_name:
+                vera.speaker_memory.identify_speaker(
+                    name=_speaker_name,
+                    sender_id=_speaker_sid,
+                    channel_id=channel_id,
+                )
+            # Track new conversation starts (first message in session)
+            _session_obj = (
+                vera.session_store.get(session_key)
+                if session_key and getattr(vera, "session_store", None)
+                else None
+            )
+            if _session_obj and _session_obj.message_count == 0:
+                vera.speaker_memory.start_conversation(_speaker_sid)
+            vera.speaker_memory.record_interaction(
+                sender_id=_speaker_sid,
+                channel_id=channel_id,
+            )
+        except Exception:
+            logger.debug("Suppressed Exception in speaker recognition")
+
+    system_prompt_addenda: List[str] = []
     if system_override:
-        system_prompt = f"{system_prompt}\n\nUser System Prompt:\n{system_override}"
+        system_prompt_addenda.append(f"User System Prompt:\n{system_override}")
     if vision_summary:
-        system_prompt = f"{system_prompt}\n\nImage analysis ({vision_model}):\n{vision_summary}"
+        system_prompt_addenda.append(f"Image analysis ({vision_model}):\n{vision_summary}")
 
     manual_summary = ""
     manual_quorum = payload.get("vera_quorum")
@@ -1168,7 +1357,11 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
             params.setdefault("action", last_user_text_raw)
         manual_summary = await vera._run_quorum_tool(mode, params, manual=True, trigger="manual")
         if manual_summary:
-            system_prompt = f"{system_prompt}\n\n{manual_summary}"
+            system_prompt_addenda.append(manual_summary)
+
+    # Pass only additive directives. Core identity/self-model prompt construction
+    # remains centralized inside LLMBridge._get_system_prompt.
+    runtime_system_override = "\n\n".join(part for part in system_prompt_addenda if part).strip() or None
 
     # Set up thinking stream to broadcast to WebSocket clients
     thinking_task = None
@@ -1210,7 +1403,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         await _record_api_message_if_new(vera, session_key, "user", last_user_text_raw)
         text = await vera.process_messages(
             messages,
-            system_override=system_prompt,
+            system_override=runtime_system_override,
             model=model,
             generation_config=generation_config,
             conversation_id=runtime_conversation_id,
@@ -1277,7 +1470,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     await _record_api_message_if_new(vera, session_key, "user", last_user_text_raw)
     text = await vera.process_messages(
         messages,
-        system_override=system_prompt,
+        system_override=runtime_system_override,
         model=model,
         generation_config=generation_config,
         conversation_id=runtime_conversation_id,
@@ -1457,8 +1650,8 @@ async def session_activity(request: web.Request) -> web.Response:
     payload = {}
     try:
         payload = await request.json()
-    except Exception:
-        payload = {}
+    except (json.JSONDecodeError, Exception):
+        payload = {}  # Optional body — empty is fine
 
     conversation_id = payload.get("conversation_id") or payload.get("vera_conversation_id") or "default"
     convo_id = str(conversation_id)
@@ -1588,7 +1781,7 @@ async def session_link_map_update(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
     except Exception:
-        payload = {}
+        return web.json_response({"error": "Invalid or missing JSON body."}, status=400)
     if not isinstance(payload, dict):
         return web.json_response({"error": "Invalid payload"}, status=400)
 
@@ -1696,7 +1889,7 @@ async def session_link(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
     except Exception:
-        payload = {}
+        return web.json_response({"error": "Invalid or missing JSON body."}, status=400)
     if not isinstance(payload, dict):
         return web.json_response({"error": "Invalid payload"}, status=400)
 
@@ -1928,7 +2121,7 @@ async def core_identity_refresh(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
     except Exception:
-        payload = {}
+        payload = {}  # Optional body — defaults used when absent
     if not isinstance(payload, dict):
         payload = {}
 
@@ -1974,7 +2167,7 @@ async def core_identity_revert(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
     except Exception:
-        payload = {}
+        return web.json_response({"error": "Invalid or missing JSON body."}, status=400)
     if not isinstance(payload, dict):
         return web.json_response({"error": "Invalid payload"}, status=400)
 
@@ -2018,36 +2211,39 @@ async def file_read(request: web.Request) -> web.Response:
         if not path:
             return web.json_response({"error": "Path is required"}, status=400)
 
-        # Expand user home directory
-        path = os.path.expanduser(path)
+        # Expand and resolve to catch traversal
+        resolved = Path(os.path.expanduser(path)).resolve()
 
-        if not os.path.exists(path):
-            return web.json_response({"error": f"File not found: {path}"}, status=404)
+        # Block dangerous paths
+        if _is_path_blocked(resolved):
+            return web.json_response({"error": "Access denied: protected path"}, status=403)
 
-        if not os.path.isfile(path):
-            return web.json_response({"error": f"Not a file: {path}"}, status=400)
+        if not resolved.exists():
+            return web.json_response({"error": "File not found"}, status=404)
+
+        if not resolved.is_file():
+            return web.json_response({"error": "Not a file"}, status=400)
 
         # Check file size (limit to 10MB)
-        size = os.path.getsize(path)
+        size = resolved.stat().st_size
         if size > 10 * 1024 * 1024:
             return web.json_response({"error": "File too large (max 10MB)"}, status=400)
 
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
         return web.json_response({
-            "path": path,
+            "path": str(resolved),
             "content": content,
             "size": size
         })
     except Exception as e:
         logging.getLogger(__name__).error("File read error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal error reading file."}, status=500)
 
 
 # Editor canvas state (shared between frontend and VERA)
-import threading as _threading
-_editor_lock = _threading.Lock()
+_editor_lock = asyncio.Lock()
 _editor_state = {
     "content": "",
     "file_path": "",              # Relative to working_directory when set
@@ -2064,8 +2260,8 @@ _EDITOR_MAX_UNDO = 50  # Maximum undo history
 def _editor_push_undo():
     """Push current editor state to undo stack before making changes.
 
-    Callers should hold _editor_lock when modifying _editor_state and
-    calling this helper so that the snapshot is consistent.
+    Callers should hold _editor_lock (asyncio.Lock) when modifying
+    _editor_state and calling this helper so that the snapshot is consistent.
     """
     # Only save if there's actual content to undo
     state_snapshot = {
@@ -2104,9 +2300,9 @@ def _is_path_blocked(path: Path) -> bool:
     """Check if path is in the global blocklist for safety."""
     path_str = str(path.resolve())
 
-    # Check exact matches
     for blocked in _BLOCKED_PATHS:
-        blocked_resolved = str(Path(blocked).resolve()) if os.path.exists(blocked) else blocked
+        # Always resolve — avoids symlink bypass when blocked path doesn't exist yet
+        blocked_resolved = str(Path(blocked).resolve())
         if path_str == blocked_resolved or path_str.startswith(blocked_resolved + "/"):
             return True
 
@@ -2200,7 +2396,7 @@ async def editor_set(request: web.Request) -> web.Response:
     """Set the code editor content - used by VERA to write code."""
     try:
         payload = await request.json()
-        with _editor_lock:
+        async with _editor_lock:
             # Push to undo stack if content is changing
             if "content" in payload and payload["content"] != _editor_state["content"]:
                 _editor_push_undo()
@@ -2244,7 +2440,8 @@ async def editor_set(request: web.Request) -> web.Response:
 
         return web.json_response({"success": True, "state": _editor_state})
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error("Editor update error: %s", e)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def editor_save(request: web.Request) -> web.Response:
@@ -2263,7 +2460,8 @@ async def editor_save(request: web.Request) -> web.Response:
             try:
                 target = _validate_sandbox_path(rel_path)
             except ValueError as e:
-                return web.json_response({"error": str(e)}, status=403)
+                logger.warning("Sandbox path validation failed: %s", e)
+                return web.json_response({"error": "Path not allowed."}, status=403)
             abs_path = str(target)
         else:
             # No sandbox set - use legacy behavior but warn
@@ -2279,16 +2477,24 @@ async def editor_save(request: web.Request) -> web.Response:
         if dir_path and not os.path.exists(dir_path):
             os.makedirs(dir_path, exist_ok=True)
 
-        # Atomic write
-        temp_path = abs_path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.rename(temp_path, abs_path)
+        # Atomic write via random temp file (prevents symlink TOCTOU)
+        import tempfile
+        fd, temp_path = tempfile.mkstemp(
+            dir=os.path.dirname(abs_path) or ".", suffix=".vera_tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, abs_path)
+        except Exception:
+            os.unlink(temp_path)
+            raise
 
-        _editor_state["file_path"] = rel_path
-        _editor_state["content"] = content
+        async with _editor_lock:
+            _editor_state["file_path"] = rel_path
+            _editor_state["content"] = content
 
         return web.json_response({
             "success": True,
@@ -2298,28 +2504,29 @@ async def editor_save(request: web.Request) -> web.Response:
         })
     except Exception as e:
         logging.getLogger(__name__).error("Editor save error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def editor_undo(request: web.Request) -> web.Response:
     """Undo the last editor change, restoring previous content."""
     try:
-        if not _editor_undo_stack:
-            return web.json_response({
-                "success": False,
-                "error": "Nothing to undo",
-                "undo_available": False
-            })
+        async with _editor_lock:
+            if not _editor_undo_stack:
+                return web.json_response({
+                    "success": False,
+                    "error": "Nothing to undo",
+                    "undo_available": False
+                })
 
-        # Pop the previous state
-        prev_state = _editor_undo_stack.pop()
+            # Pop the previous state
+            prev_state = _editor_undo_stack.pop()
 
-        # Restore state
-        _editor_state["content"] = prev_state["content"]
-        _editor_state["file_path"] = prev_state["file_path"]
-        _editor_state["language"] = prev_state["language"]
+            # Restore state
+            _editor_state["content"] = prev_state["content"]
+            _editor_state["file_path"] = prev_state["file_path"]
+            _editor_state["language"] = prev_state["language"]
 
-        # Broadcast to WebSocket clients
+        # Broadcast to WebSocket clients (outside lock)
         app = request.app
         ws_clients = app.get("ws_clients", set())
         msg = {
@@ -2340,7 +2547,7 @@ async def editor_undo(request: web.Request) -> web.Response:
         })
     except Exception as e:
         logging.getLogger(__name__).error("Editor undo error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def workspace_get(request: web.Request) -> web.Response:
@@ -2361,7 +2568,7 @@ async def workspace_get(request: web.Request) -> web.Response:
         return web.json_response(result)
     except Exception as e:
         logging.getLogger(__name__).error("Workspace get error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def workspace_set(request: web.Request) -> web.Response:
@@ -2395,7 +2602,8 @@ async def workspace_set(request: web.Request) -> web.Response:
             }, status=400)
 
         # Set the working directory
-        _editor_state["working_directory"] = str(resolved)
+        async with _editor_lock:
+            _editor_state["working_directory"] = str(resolved)
 
         # Return the workspace with file list
         files = _list_directory(resolved)
@@ -2407,7 +2615,7 @@ async def workspace_set(request: web.Request) -> web.Response:
         })
     except Exception as e:
         logging.getLogger(__name__).error("Workspace set error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def workspace_files(request: web.Request) -> web.Response:
@@ -2428,7 +2636,8 @@ async def workspace_files(request: web.Request) -> web.Response:
             try:
                 target = _validate_sandbox_path(subpath)
             except ValueError as e:
-                return web.json_response({"error": str(e)}, status=403)
+                logger.warning("Sandbox path validation failed: %s", e)
+                return web.json_response({"error": "Path not allowed."}, status=403)
         else:
             target = Path(working_dir)
 
@@ -2451,7 +2660,7 @@ async def workspace_files(request: web.Request) -> web.Response:
         })
     except Exception as e:
         logging.getLogger(__name__).error("Workspace files error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def workspace_open_file(request: web.Request) -> web.Response:
@@ -2467,7 +2676,8 @@ async def workspace_open_file(request: web.Request) -> web.Response:
         try:
             target = _validate_sandbox_path(rel_path)
         except ValueError as e:
-            return web.json_response({"error": str(e)}, status=403)
+            logger.warning("Sandbox path validation failed: %s", e)
+            return web.json_response({"error": "Path not allowed."}, status=403)
 
         if not target.exists():
             return web.json_response({
@@ -2503,10 +2713,11 @@ async def workspace_open_file(request: web.Request) -> web.Response:
         language = ext_to_lang.get(ext, "plaintext")
 
         # Update editor state
-        _editor_state["content"] = content
-        _editor_state["file_path"] = rel_path
-        _editor_state["language"] = language
-        _editor_state["is_open"] = True
+        async with _editor_lock:
+            _editor_state["content"] = content
+            _editor_state["file_path"] = rel_path
+            _editor_state["language"] = language
+            _editor_state["is_open"] = True
 
         # Broadcast to WebSocket clients
         app = request.app
@@ -2527,7 +2738,7 @@ async def workspace_open_file(request: web.Request) -> web.Response:
         })
     except Exception as e:
         logging.getLogger(__name__).error("Workspace open file error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 # === Git Status API ===
@@ -2569,7 +2780,7 @@ async def git_status(request: web.Request) -> web.Response:
         return web.json_response(result)
     except Exception as e:
         logger.error("Git status error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def git_files(request: web.Request) -> web.Response:
@@ -2599,7 +2810,7 @@ async def git_files(request: web.Request) -> web.Response:
         return web.json_response(result)
     except Exception as e:
         logger.error("Git files error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def file_write(request: web.Request) -> web.Response:
@@ -2612,30 +2823,51 @@ async def file_write(request: web.Request) -> web.Response:
         if not path:
             return web.json_response({"error": "Path is required"}, status=400)
 
-        # Expand user home directory
-        path = os.path.expanduser(path)
+        # Expand and resolve to catch traversal
+        resolved = Path(os.path.expanduser(path)).resolve()
+
+        # Block dangerous paths
+        if _is_path_blocked(resolved):
+            return web.json_response({"error": "Access denied: protected path"}, status=403)
+
+        # Block writing to protected file patterns
+        fname = resolved.name
+        for pattern in _PROTECTED_PATTERNS:
+            if "*" in pattern:
+                import fnmatch
+                if fnmatch.fnmatch(fname, pattern):
+                    return web.json_response({"error": "Access denied: protected file"}, status=403)
+            elif fname == pattern:
+                return web.json_response({"error": "Access denied: protected file"}, status=403)
 
         # Create directory if it doesn't exist
-        dir_path = os.path.dirname(path)
-        if dir_path and not os.path.exists(dir_path):
-            os.makedirs(dir_path, exist_ok=True)
+        dir_path = resolved.parent
+        if not dir_path.exists():
+            dir_path.mkdir(parents=True, exist_ok=True)
 
-        # Write atomically via temp file
-        temp_path = path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.rename(temp_path, path)
+        # Atomic write via random temp file (prevents symlink TOCTOU)
+        import tempfile
+        fd, temp_path = tempfile.mkstemp(
+            dir=str(dir_path), suffix=".vera_tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, str(resolved))
+        except Exception:
+            os.unlink(temp_path)
+            raise
 
         return web.json_response({
-            "path": path,
+            "path": str(resolved),
             "size": len(content.encode("utf-8")),
             "success": True
         })
     except Exception as e:
         logging.getLogger(__name__).error("File write error: %s", e)
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"error": "Internal error writing file."}, status=500)
 
 
 async def image_generations(request: web.Request) -> web.Response:
@@ -2658,7 +2890,7 @@ async def image_generations(request: web.Request) -> web.Response:
         n = 1
     n = max(1, min(n, 4))
 
-    base_url = os.getenv("XAI_IMAGE_BASE_URL", "https://api.x.ai/v1").rstrip("/")
+    base_url = _validate_base_url(os.getenv("XAI_IMAGE_BASE_URL", ""), "https://api.x.ai/v1")
     is_xai = "api.x.ai" in base_url
     request_payload = {
         "model": model,
@@ -2687,7 +2919,8 @@ async def image_generations(request: web.Request) -> web.Response:
         logging.getLogger(__name__).warning("Image generation error %s: %s", exc.response.status_code, detail)
         return web.json_response({"error": {"message": detail}}, status=exc.response.status_code)
     except Exception as exc:
-        return web.json_response({"error": {"message": str(exc)}}, status=500)
+        logger.error("Image generation failed: %s", exc)
+        return web.json_response({"error": {"message": "Internal server error."}}, status=500)
 
 
 async def video_generations(request: web.Request) -> web.Response:
@@ -2708,30 +2941,110 @@ async def video_generations(request: web.Request) -> web.Response:
         n = 1
     n = max(1, min(n, 2))
 
-    base_url = os.getenv("XAI_VIDEO_BASE_URL", os.getenv("XAI_IMAGE_BASE_URL", "https://api.x.ai/v1")).rstrip("/")
+    base_url = _validate_base_url(
+        os.getenv("XAI_VIDEO_BASE_URL", "") or os.getenv("XAI_IMAGE_BASE_URL", ""),
+        "https://api.x.ai/v1",
+    )
     request_payload = dict(payload or {})
     request_payload["model"] = model
     request_payload["prompt"] = prompt
     request_payload["n"] = n
 
+    logger = logging.getLogger(__name__)
+    poll_interval = _parse_float_env("VERA_XAI_VIDEO_POLL_INTERVAL_SECONDS", 3.0, minimum=0.5)
+    poll_timeout = _parse_float_env("VERA_XAI_VIDEO_POLL_TIMEOUT_SECONDS", 210.0, minimum=5.0)
+
+    async def _poll_video_completion(
+        client: httpx.AsyncClient,
+        headers: Dict[str, str],
+        request_id: str,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        deadline = time.time() + poll_timeout
+        poll_url = f"{base_url}/videos/{request_id}"
+
+        while time.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            poll_response = await client.get(poll_url, headers=headers)
+
+            if poll_response.status_code == 202:
+                continue
+
+            if poll_response.status_code >= 400:
+                return None, poll_response.text
+
+            try:
+                poll_data = poll_response.json()
+            except ValueError:
+                return None, poll_response.text
+
+            status = str(poll_data.get("status", "")).strip().lower()
+            video_obj = poll_data.get("video")
+            if status == "done":
+                return poll_data, None
+            if status in {"expired", "failed", "rejected"}:
+                return poll_data, f"Video generation {status}."
+            if isinstance(video_obj, dict) and video_obj.get("url"):
+                return poll_data, None
+
+        return None, f"Video generation timed out after {int(poll_timeout)}s."
+
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=max(120.0, poll_timeout + 30.0)) as client:
             response = await client.post(
                 f"{base_url}/videos/generations",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json=request_payload,
             )
             response.raise_for_status()
-            return web.json_response(response.json())
+            init_data = response.json()
+
+            request_id = (
+                str(init_data.get("request_id") or "").strip()
+                or str(init_data.get("response_id") or "").strip()
+            )
+            final_data = init_data
+            if request_id:
+                logger.info("Video generation queued (request_id=%s). Polling for completion.", request_id)
+                polled_data, poll_error = await _poll_video_completion(client, headers, request_id)
+                if poll_error and not polled_data:
+                    logger.warning("Video generation polling failed: %s", poll_error)
+                    return web.json_response(
+                        {"error": {"message": poll_error}, "request_id": request_id},
+                        status=504,
+                    )
+                if polled_data:
+                    final_data = polled_data
+
+            if not isinstance(final_data, dict):
+                return web.json_response(final_data)
+
+            video_obj = final_data.get("video")
+            urls: List[str] = []
+            if isinstance(video_obj, dict):
+                video_url = video_obj.get("url")
+                if isinstance(video_url, str) and video_url.strip():
+                    urls.append(video_url.strip())
+            for item in final_data.get("data", []) if isinstance(final_data.get("data"), list) else []:
+                if isinstance(item, dict):
+                    item_url = item.get("url")
+                    if isinstance(item_url, str) and item_url.strip():
+                        urls.append(item_url.strip())
+
+            if urls and not final_data.get("data"):
+                final_data["data"] = [{"url": url} for url in urls]
+
+            return web.json_response(final_data)
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text
-        logging.getLogger(__name__).warning("Video generation error %s: %s", exc.response.status_code, detail)
+        logger.warning("Video generation error %s: %s", exc.response.status_code, detail)
         return web.json_response({"error": {"message": detail}}, status=exc.response.status_code)
     except Exception as exc:
-        return web.json_response({"error": {"message": str(exc)}}, status=500)
+        logger.exception("Unhandled video generation exception")
+        return web.json_response({"error": {"message": "Internal server error."}}, status=500)
 
 
 async def anthropic_messages_proxy(request: web.Request) -> web.StreamResponse:
@@ -3321,7 +3634,8 @@ async def google_auth_start(request: web.Request) -> web.Response:
             timeout=65.0,
         )
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        logger.error("Google auth failed: %s", exc)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
     auth_url = _extract_auth_url(message)
     return web.json_response(
@@ -3470,7 +3784,7 @@ async def quorum_custom_create(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
         logger.exception("Failed to save custom quorum")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
     return web.json_response({"status": "ok", "quorum": custom})
 
 
@@ -3494,7 +3808,7 @@ async def memory_stats(request: web.Request) -> web.Response:
         return web.json_response(safe_stats)
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to fetch memory stats")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def learning_loop_status(request: web.Request) -> web.Response:
@@ -3513,7 +3827,7 @@ async def learning_loop_status(request: web.Request) -> web.Response:
         return web.json_response(payload)
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to fetch learning loop status")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def learning_loop_run_cycle(request: web.Request) -> web.Response:
@@ -3533,8 +3847,16 @@ async def learning_loop_run_cycle(request: web.Request) -> web.Response:
 
     force = bool(payload.get("force", False))
     wait_for_completion = bool(payload.get("wait", False))
-    timeout_seconds = float(payload.get("timeout_seconds", 0) or 0)
-    timeout_seconds = max(1.0, min(timeout_seconds, 300.0)) if wait_for_completion else 0.0
+    timeout_raw = payload.get("timeout_seconds", None)
+    timeout_seconds = float(timeout_raw or 0)
+    if wait_for_completion:
+        # Default to a practical sync wait window when caller requests completion.
+        # The prior implicit 1s floor caused false timeout errors for healthy runs.
+        if timeout_seconds <= 0:
+            timeout_seconds = 120.0
+        timeout_seconds = max(1.0, min(timeout_seconds, 300.0))
+    else:
+        timeout_seconds = 0.0
 
     async def _run_once() -> Dict[str, Any]:
         if hasattr(learning_loop, "run_daily_learning_cycle_if_due"):
@@ -3542,15 +3864,39 @@ async def learning_loop_run_cycle(request: web.Request) -> web.Response:
         result = await learning_loop.run_daily_learning_cycle()
         return {"ran": True, "reason": "legacy_run_daily", "result": result}
 
+    def _consume_cycle_task(task: "asyncio.Task[Dict[str, Any]]") -> None:
+        try:
+            task.result()
+        except Exception:
+            logging.getLogger(__name__).exception("Background learning loop cycle failed")
+
     try:
         if wait_for_completion:
-            completed = await asyncio.wait_for(_run_once(), timeout=timeout_seconds) if timeout_seconds else await _run_once()
-            safe_completed = json.loads(json.dumps(completed, default=str))
-            return web.json_response({
-                "scheduled": True,
-                "completed": True,
-                "result": safe_completed,
-            })
+            run_task: "asyncio.Task[Dict[str, Any]]" = asyncio.create_task(_run_once())
+            run_task.add_done_callback(_consume_cycle_task)
+            try:
+                completed = (
+                    await asyncio.wait_for(asyncio.shield(run_task), timeout=timeout_seconds)
+                    if timeout_seconds
+                    else await run_task
+                )
+                safe_completed = json.loads(json.dumps(completed, default=str))
+                return web.json_response({
+                    "scheduled": True,
+                    "completed": True,
+                    "result": safe_completed,
+                })
+            except asyncio.TimeoutError:
+                return web.json_response(
+                    {
+                        "scheduled": True,
+                        "completed": False,
+                        "in_progress": True,
+                        "timeout_seconds": timeout_seconds,
+                        "error": "learning loop cycle timed out; continuing in background",
+                    },
+                    status=202,
+                )
 
         async def _background_run() -> None:
             try:
@@ -3571,7 +3917,7 @@ async def learning_loop_run_cycle(request: web.Request) -> web.Response:
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to run learning loop cycle")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def learning_loop_lora_evals(request: web.Request) -> web.Response:
@@ -3619,7 +3965,7 @@ async def learning_loop_lora_evals(request: web.Request) -> web.Response:
         return web.json_response(payload)
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to fetch LoRA evaluation reports")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def learning_loop_lora_readiness(request: web.Request) -> web.Response:
@@ -3641,7 +3987,27 @@ async def learning_loop_lora_readiness(request: web.Request) -> web.Response:
         return web.json_response(safe_payload)
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to fetch LoRA backend readiness")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
+
+
+async def skills_list(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    learning_loop = getattr(vera, "learning_loop", None)
+    if not learning_loop:
+        return web.json_response({"error": "Learning loop unavailable."}, status=503)
+    try:
+        sort_by = request.query.get("sort", "trust_tier")
+        trust_filter = request.query.get("trust", "")
+        skills = learning_loop.list_skills(sort_by=sort_by, trust_filter=trust_filter)
+        return web.json_response({
+            "total": len(skills),
+            "sort": sort_by,
+            "trust_filter": trust_filter or "all",
+            "skills": skills,
+        })
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Failed to list skills")
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def innerlife_status(request: web.Request) -> web.Response:
@@ -3663,15 +4029,52 @@ async def innerlife_status(request: web.Request) -> web.Response:
         proactive = getattr(vera, "proactive_manager", None)
         if proactive and hasattr(proactive, "get_autonomy_status"):
             autonomy = proactive.get_autonomy_status()
+        goals = []
+        if hasattr(inner_life, "list_active_goals"):
+            goals = inner_life.list_active_goals()
+
+        proactive_status = {}
+        cal_state_path = getattr(proactive, "_memory_dir", None) if proactive else None
+        if cal_state_path:
+            cal_state = safe_json_read(cal_state_path / "calendar_alerts_state.json", default={})
+            proactive_status = {
+                "calendar_last_poll": cal_state.get("last_poll_utc"),
+                "calendar_alerts_today": len(cal_state.get("alerted_event_ids", [])),
+                "calendar_enabled": os.getenv("VERA_CALENDAR_PROACTIVE", "0") == "1",
+                "proactive_execution_enabled": os.getenv("VERA_PROACTIVE_EXECUTION", "0") == "1",
+            }
+
         return web.json_response({
             "stats": stats,
             "personality": personality,
             "recent_thoughts": recent,
             "autonomy": autonomy,
+            "goals": goals,
+            "proactive": proactive_status,
         })
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to fetch inner life status")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
+
+
+async def innerlife_goals_add(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    inner_life = getattr(vera, "inner_life", None)
+    if not inner_life:
+        return web.json_response({"error": "Inner life engine unavailable."}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body."}, status=400)
+    description = str(body.get("description") or "").strip()
+    if not description:
+        return web.json_response({"error": "description is required."}, status=400)
+    category = str(body.get("category", "self_improvement"))
+    priority = int(body.get("priority", 3))
+    goal = inner_life.add_goal(description=description, category=category, priority=priority)
+    if not goal:
+        return web.json_response({"error": "At active goal capacity."}, status=409)
+    return web.json_response({"goal": goal})
 
 
 async def innerlife_reflect(request: web.Request) -> web.Response:
@@ -3711,7 +4114,7 @@ async def innerlife_reflect(request: web.Request) -> web.Response:
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to schedule inner life reflection")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def innerlife_autonomy_cycle(request: web.Request) -> web.Response:
@@ -3764,7 +4167,7 @@ async def innerlife_autonomy_cycle(request: web.Request) -> web.Response:
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to schedule autonomy cycle")
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def browser_status(request: web.Request) -> web.Response:
@@ -3795,7 +4198,8 @@ async def browser_launch(request: web.Request) -> web.Response:
             await bridge.launch()
         return web.json_response({"ok": True, "launched": True})
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        logger.error("Browser launch failed: %s", exc)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def browser_close(request: web.Request) -> web.Response:
@@ -3808,7 +4212,8 @@ async def browser_close(request: web.Request) -> web.Response:
             await bridge.close()
         return web.json_response({"ok": True, "launched": False})
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        logger.error("Browser close failed: %s", exc)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def self_improvement_budget_get(request: web.Request) -> web.Response:
@@ -3959,7 +4364,8 @@ async def tools_call(request: web.Request) -> web.Response:
         try:
             result = await handler(tool_name, args)
         except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
+            logger.error("Native tool call %s failed: %s", tool_name, exc)
+            return web.json_response({"error": "Internal server error."}, status=500)
         return web.json_response({"result": result, "tool": tool_name, "type": "native"})
 
     server_name = payload.get("server")
@@ -4002,7 +4408,8 @@ async def tools_call(request: web.Request) -> web.Response:
             status=504,
         )
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        logger.error("MCP tool call %s/%s failed: %s", server_name, tool_name, exc)
+        return web.json_response({"error": "Internal server error."}, status=500)
     finally:
         _release_mcp_call_capacity(capacity_global, capacity_server)
 
@@ -4373,7 +4780,8 @@ async def voice_test(request: web.Request) -> web.Response:
             response_payload["audio_format"] = "audio/wav"
         return web.json_response(response_payload)
     except Exception as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        logger.error("Voice diagnostics failed: %s", exc)
+        return web.json_response({"ok": False, "error": "Internal server error."}, status=500)
 
 
 async def voice_ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -5046,7 +5454,8 @@ async def tools_server_start(request: web.Request) -> web.Response:
         ok = mcp.start_server(server_name)
         return web.json_response({"ok": ok, "server": server_name})
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        logger.error("MCP server start %s failed: %s", server_name, exc)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def tools_server_stop(request: web.Request) -> web.Response:
@@ -5068,7 +5477,8 @@ async def tools_server_stop(request: web.Request) -> web.Response:
         ok = mcp.stop_server(server_name)
         return web.json_response({"ok": ok, "server": server_name})
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        logger.error("MCP server stop %s failed: %s", server_name, exc)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def tools_server_restart(request: web.Request) -> web.Response:
@@ -5090,7 +5500,8 @@ async def tools_server_restart(request: web.Request) -> web.Response:
         ok = mcp.restart_server(server_name)
         return web.json_response({"ok": ok, "server": server_name})
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        logger.error("MCP server restart %s failed: %s", server_name, exc)
+        return web.json_response({"error": "Internal server error."}, status=500)
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -5174,6 +5585,13 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                 if not text:
                     await ws.send_json({"type": "error", "message": "Empty message"})
                     continue
+                _MAX_WS_MESSAGE_CHARS = 100_000
+                if len(text) > _MAX_WS_MESSAGE_CHARS:
+                    await ws.send_json({
+                        "type": "error",
+                        "message": f"Message too large ({len(text)} chars). Maximum is {_MAX_WS_MESSAGE_CHARS}."
+                    })
+                    continue
 
                 # Set up thinking stream listener for this request
                 thinking_task = None
@@ -5252,6 +5670,45 @@ def _serve_index(ui_dir: Path) -> web.Response:
 # === Terminal WebSocket ===
 
 # Track active terminal processes per connection
+# ---------------------------------------------------------------------------
+# Terminal command blocklist (defense-in-depth for H3)
+# ---------------------------------------------------------------------------
+_TERMINAL_BLOCKED_PATTERNS = [
+    re.compile(r"rm\s+(-[^\s]*[rf][^\s]*|--recursive|--force)\s+.*(\/|~|\$HOME)", re.IGNORECASE),
+    re.compile(r"dd\s+if=/dev/(zero|random|urandom)\s+of=", re.IGNORECASE),
+    re.compile(r"mkfs\.", re.IGNORECASE),
+    re.compile(r":\(\)\s*\{\s*:", re.IGNORECASE),  # fork bomb
+    re.compile(r">\s*/dev/(sda|sdb|sdc|nvme)", re.IGNORECASE),
+    re.compile(r"chmod\s+(-R|--recursive)?\s*777\s+(/|~)", re.IGNORECASE),
+    re.compile(r"curl\s+.*\|\s*(ba)?sh", re.IGNORECASE),
+    re.compile(r"wget\s+.*\|\s*(ba)?sh", re.IGNORECASE),
+    re.compile(r"(sed|awk|perl|python).*run_vera\.py|>.*run_vera\.py", re.IGNORECASE),
+    re.compile(r"rm\s+.*run_vera\.py", re.IGNORECASE),
+    re.compile(r"rm\s+(-[^\s]*r[^\s]*|--recursive)\s+.*vera_memory", re.IGNORECASE),
+    re.compile(r"find\s+.*-exec\s+.*rm\b", re.IGNORECASE),  # find -exec rm
+    re.compile(r"awk\s+.*\bsystem\s*\(", re.IGNORECASE),  # awk system() injection
+    re.compile(r"python[23]?\s+-c\s+.*import\s+os", re.IGNORECASE),  # python -c os module
+    re.compile(r"nc\s+(-[^\s]*)?\s*-e\s+/bin/(ba)?sh", re.IGNORECASE),  # netcat reverse shell
+]
+
+
+def _terminal_command_blocked(command: str) -> Optional[str]:
+    """Return block reason if command matches a dangerous pattern, else None."""
+    # Normalize: strip ANSI escapes, $'...' hex/octal sequences, and
+    # collapse whitespace so encoding tricks don't bypass the denylist.
+    normalized = command
+    # Expand $'\xNN' / $'\NNN' bash quoting to catch obfuscated commands
+    normalized = re.sub(r"\$'([^']*)'", lambda m: m.group(1), normalized)
+    normalized = re.sub(r"\\x[0-9a-fA-F]{2}", " ", normalized)
+    normalized = re.sub(r"\\[0-7]{1,3}", " ", normalized)
+    # Check both raw and normalized forms
+    for cmd_form in (command, normalized):
+        for pattern in _TERMINAL_BLOCKED_PATTERNS:
+            if pattern.search(cmd_form):
+                return "Command blocked by safety filter."
+    return None
+
+
 _terminal_processes: Dict[int, asyncio.subprocess.Process] = {}
 
 
@@ -5259,6 +5716,12 @@ async def terminal_ws_handler(request: web.Request) -> web.WebSocketResponse:
     """WebSocket handler for terminal command execution with streaming output."""
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+
+    # Kill switch: disable terminal entirely via env var
+    if os.getenv("VERA_TERMINAL_ENABLED", "1") == "0":
+        await ws.send_json({"type": "error", "message": "Terminal is disabled."})
+        await ws.close()
+        return ws
 
     current_process: Optional[asyncio.subprocess.Process] = None
     ws_id = id(ws)
@@ -5284,6 +5747,13 @@ async def terminal_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 if not command:
                     await ws.send_json({"type": "error", "message": "Empty command"})
+                    continue
+
+                # Safety check: block catastrophic commands
+                block_reason = _terminal_command_blocked(command)
+                if block_reason:
+                    await ws.send_json({"type": "error", "message": block_reason})
+                    logger.warning("Terminal command blocked: %s", command)
                     continue
 
                 # Use editor working directory if not specified
@@ -5348,9 +5818,10 @@ async def terminal_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     })
 
                 except Exception as e:
+                    logger.error("Terminal command execution failed: %s", e)
                     await ws.send_json({
                         "type": "error",
-                        "message": f"Failed to execute: {e}"
+                        "message": "Command execution failed."
                     })
 
             elif msg_type == "kill":
@@ -5363,7 +5834,8 @@ async def terminal_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         current_process.kill()
                         await ws.send_json({"type": "killed", "message": "Process killed"})
                     except Exception as e:
-                        await ws.send_json({"type": "error", "message": f"Kill failed: {e}"})
+                        logger.error("Terminal process kill failed: %s", e)
+                        await ws.send_json({"type": "error", "message": "Failed to kill process."})
                 else:
                     await ws.send_json({"type": "error", "message": "No running process"})
 
@@ -5408,7 +5880,7 @@ async def _broadcast_confirmation_events(clients: set, vera) -> None:
 
 def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     # 50MB limit to handle base64-encoded images (default is 2MB which causes 413 errors)
-    app = web.Application(middlewares=[cors_middleware], client_max_size=50 * 1024 * 1024)
+    app = web.Application(middlewares=[cors_middleware, auth_middleware, rate_limit_middleware], client_max_size=50 * 1024 * 1024)
     app["vera"] = vera
     app["ws_clients"] = set()
     app["voice_state"] = {"active": False, "last_voice": os.getenv("VERA_VOICE_DEFAULT", "eve").strip().lower() or "eve"}
@@ -5417,7 +5889,9 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app["native_push_service"] = NativePushNotificationService()
     app["started_at"] = time.time()
     app["tool_execution_history"] = []  # In-memory ring buffer for tool execution tracking
+    app["vera_api_key"] = _get_secret_env("VERA_API_KEY")
     app["anthropic_proxy_rate_limit"] = {}
+    app["global_rate_limit"] = {}
     global_mcp_inflight = _parse_int_env("VERA_MCP_CALL_MAX_INFLIGHT", 24, minimum=1)
     app["mcp_call_global_semaphore"] = asyncio.Semaphore(global_mcp_inflight)
     app["mcp_call_queue_timeout_seconds"] = _parse_float_env(
@@ -5463,11 +5937,13 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app.router.add_post("/api/quorum/custom", quorum_custom_create)
     app.router.add_post("/api/quorum/custom/delete", quorum_custom_delete)
     app.router.add_get("/api/memory/stats", memory_stats)
+    app.router.add_get("/api/skills", skills_list)
     app.router.add_get("/api/learning/status", learning_loop_status)
     app.router.add_get("/api/learning/lora-evals", learning_loop_lora_evals)
     app.router.add_get("/api/learning/lora-readiness", learning_loop_lora_readiness)
     app.router.add_post("/api/learning/run-cycle", learning_loop_run_cycle)
     app.router.add_get("/api/innerlife/status", innerlife_status)
+    app.router.add_post("/api/innerlife/goals", innerlife_goals_add)
     app.router.add_post("/api/innerlife/reflect", innerlife_reflect)
     app.router.add_post("/api/innerlife/autonomy-cycle", innerlife_autonomy_cycle)
     app.router.add_get("/api/browser/status", browser_status)
@@ -5698,5 +6174,35 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
         except Exception:
             logger.debug("Suppressed Exception in server")
             pass
+
+    # Background task: periodically prune expired sessions to prevent memory growth
+    _session_prune_interval = _parse_int_env("VERA_SESSION_PRUNE_INTERVAL", 300, minimum=60)
+
+    async def _session_prune_loop(app: web.Application) -> None:
+        while True:
+            await asyncio.sleep(_session_prune_interval)
+            try:
+                store = getattr(app.get("vera"), "session_store", None)
+                if store and hasattr(store, "prune_expired"):
+                    pruned = store.prune_expired()
+                    if pruned:
+                        logger.debug("Pruned %d expired sessions", pruned)
+            except Exception as exc:
+                logger.debug("Session prune error: %s", exc)
+
+    async def _start_background_tasks(app: web.Application) -> None:
+        app["_session_prune_task"] = asyncio.create_task(_session_prune_loop(app))
+
+    async def _cleanup_background_tasks(app: web.Application) -> None:
+        task = app.get("_session_prune_task")
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.on_startup.append(_start_background_tasks)
+    app.on_cleanup.append(_cleanup_background_tasks)
 
     return app

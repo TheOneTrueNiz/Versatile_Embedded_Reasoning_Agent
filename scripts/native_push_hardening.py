@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
@@ -108,6 +109,11 @@ def _target_preview(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Harden and validate native push filters")
+    parser.add_argument(
+        "--base-url",
+        default="",
+        help="API base URL (overrides --host/--port), e.g. http://127.0.0.1:8788",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--wait", type=float, default=45.0, help="Seconds to wait for API")
@@ -150,7 +156,16 @@ def main() -> int:
 
     provider = str(args.provider or "fcm").strip().lower() or "fcm"
     ensure_tags = _normalize_tags([part.strip() for part in args.default_tags.split(",") if part.strip()])
-    base_url = f"http://{args.host}:{args.port}"
+    base_url_raw = str(args.base_url or "").strip()
+    if base_url_raw:
+        if "://" not in base_url_raw:
+            base_url_raw = f"http://{base_url_raw}"
+        parsed = urlparse(base_url_raw)
+        if not parsed.scheme or not parsed.netloc:
+            parser.error(f"invalid --base-url: {args.base_url!r}")
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+    else:
+        base_url = f"http://{args.host}:{args.port}"
     report: Dict[str, Any] = {
         "ok": False,
         "timestamp_utc": ts,

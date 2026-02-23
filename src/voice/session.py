@@ -228,7 +228,7 @@ class VoiceSessionManager:
         """Get ephemeral token for client-side authentication."""
         try:
             import httpx
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(
                     XAI_TOKEN_URL,
                     headers={"Authorization": f"Bearer {self.api_key}"},

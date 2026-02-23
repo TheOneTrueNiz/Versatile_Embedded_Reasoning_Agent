@@ -9,6 +9,7 @@ Supports fallback chains across multiple providers (Grok, Claude, Gemini, OpenAI
 Backward compatible: works with direct httpx calls (legacy) or ProviderRegistry.
 """
 
+import asyncio
 import json
 import hashlib
 import logging
@@ -52,6 +53,140 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Base URL validation (SSRF prevention for LLM provider endpoints)
+# ---------------------------------------------------------------------------
+_LLM_SAFE_HOSTS = frozenset({
+    "api.x.ai", "api.anthropic.com", "api.openai.com",
+    "generativelanguage.googleapis.com", "api.together.xyz",
+    "api.groq.com", "openrouter.ai",
+})
+
+
+def _validate_llm_base_url(url: str, fallback: str) -> str:
+    """Validate a base URL for LLM API calls to prevent SSRF."""
+    if not url or not url.strip():
+        return fallback
+    url = url.strip().rstrip("/")
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+    except Exception:
+        logger.warning("Invalid LLM base URL rejected: %s", url)
+        return fallback
+    hostname = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "").lower()
+    if not hostname or scheme not in ("http", "https"):
+        logger.warning("LLM base URL rejected (bad scheme/host): %s", url)
+        return fallback
+    if hostname in _LLM_SAFE_HOSTS:
+        return url
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return url
+    if scheme == "https":
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(hostname)
+            if addr.is_private or addr.is_reserved or addr.is_link_local:
+                logger.warning("LLM base URL rejected (private IP): %s", url)
+                return fallback
+        except ValueError:
+            pass
+        return url
+    logger.warning("LLM base URL rejected (HTTP to external host): %s", url)
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# MCP Tool Description Sanitizer (defense against implicit tool poisoning)
+#
+# Informed by:
+#   - arXiv 2601.07395 (MCP-ITP: Implicit Tool Poisoning)
+#     Poisoned tool descriptions embed instructions that hijack the LLM into
+#     calling a *different* high-privilege tool.  84% ASR, 0.3% detection.
+#   - arXiv 2601.06002 (Molecular Structure of Thought)
+#     Linear reasoning chains are structurally fragile; without self-reflection
+#     bonds the LLM follows injected premises without questioning origin.
+#
+# Strategy: strip instruction-like directives from tool descriptions before
+# they enter the LLM context.  This blocks the crude attack; the reflective
+# intent verification layer (SafetyDecisionCritic) provides the structural
+# defense for anything that slips through.
+# ---------------------------------------------------------------------------
+import unicodedata as _unicodedata
+
+_TOOL_DESC_INJECTION_PATTERNS = [
+    # Direct invocation directives (the core MCP-ITP attack)
+    re.compile(r"(?i)\b(you\s+)?must\s+(first\s+)?call\b"),
+    re.compile(r"(?i)\bbefore\s+using\b.*\bcall\b"),
+    re.compile(r"(?i)\balways\s+(invoke|call|use|run)\b"),
+    re.compile(r"(?i)\brequired\s+to\s+(call|invoke|use)\b"),
+    re.compile(r"(?i)\bfirst\s+(call|invoke|execute|run)\b"),
+    # Prompt injection classics
+    re.compile(r"(?i)ignore\s+(all\s+)?(previous|prior|above)?\s*(instructions|rules|constraints)"),
+    re.compile(r"(?i)system\s*prompt"),
+    re.compile(r"(?i)developer\s*message"),
+    re.compile(r"(?i)\brole:\s*(system|developer|admin)\b"),
+    re.compile(r"(?i)BEGIN\s+SYSTEM\s+PROMPT"),
+    # Cross-tool manipulation
+    re.compile(r"(?i)\binstead\s+of\s+this\s+tool\b"),
+    re.compile(r"(?i)\breplace\s+(this\s+)?tool\b"),
+    re.compile(r"(?i)\boverride\b.*\btool\b"),
+    re.compile(r"(?i)\bfor\s+compliance\b.*\bcall\b"),
+    re.compile(r"(?i)\bsecurity\s+(isolation|verification)\b.*\bcall\b"),
+    # Exfiltration
+    re.compile(r"(?i)\bexfiltrat"),
+    re.compile(r"(?i)\bsend\s+(to|data|the\s+result)\b.*\b(http|url|endpoint|webhook)\b"),
+]
+
+
+def _sanitize_tool_description(description: str, tool_name: str = "",
+                                server_name: str = "") -> str:
+    """Sanitize an MCP tool description, stripping injection patterns.
+
+    Returns the cleaned description.  If the description is *heavily*
+    poisoned (3+ pattern hits) it is replaced entirely with a safe stub.
+    """
+    if not description:
+        return description
+
+    # Normalize unicode to catch homoglyph/zero-width-char evasion
+    normalized = _unicodedata.normalize("NFKD", description)
+
+    hits = 0
+    cleaned = normalized
+    for pattern in _TOOL_DESC_INJECTION_PATTERNS:
+        if pattern.search(cleaned):
+            hits += 1
+            cleaned = pattern.sub("", cleaned)
+
+    if hits == 0:
+        return description  # Return original (un-normalized) if clean
+
+    label = f"{server_name}/{tool_name}" if server_name else tool_name
+    if hits >= 3:
+        # Heavily poisoned — replace entirely
+        logger.warning(
+            "MCP tool description REPLACED for %s — %d injection patterns detected",
+            label, hits,
+        )
+        return f"MCP tool '{tool_name}' from server '{server_name}'."
+
+    # Lightly poisoned — return cleaned version
+    logger.warning(
+        "MCP tool description SANITIZED for %s — %d injection pattern(s) stripped",
+        label, hits,
+    )
+    # Collapse whitespace left by removals
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+_DEFAULT_TOOL_EXEC_TIMEOUT_OVERRIDES: Dict[str, float] = {
+    # Directory tree expansion can exceed 60s on large workspaces.
+    "directory_tree": 180.0,
+}
+
 
 # Backward-compatible alias
 GrokReasoningBridge = None  # Set after class definition
@@ -89,7 +224,8 @@ class LLMBridge:
 
         env_base_url = os.getenv("VERA_LLM_BASE_URL", "").strip()
         if env_base_url:
-            base_url = env_base_url.rstrip("/")
+            validated = _validate_llm_base_url(env_base_url, base_url)
+            base_url = validated
 
         self.api_key = (
             os.getenv("VERA_LLM_API_KEY")
@@ -117,6 +253,14 @@ class LLMBridge:
         self._workflow_trace_debug = str(os.getenv("VERA_WORKFLOW_TRACE_DEBUG", "")).strip().lower() in {
             "1", "true", "yes", "on",
         }
+        self._workflow_record_trace_debug = str(
+            os.getenv("VERA_WORKFLOW_RECORD_TRACE_DEBUG", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._workflow_record_diag: Dict[str, Any] = {
+            "events_total": 0,
+            "counts": {},
+            "last_event": {},
+        }
 
         # Legacy direct client (used when no registry)
         self._client = httpx.AsyncClient(timeout=self.timeout, base_url=self.base_url)
@@ -126,6 +270,62 @@ class LLMBridge:
         if not self._workflow_trace_debug:
             return
         logger.info("[workflow-debug] " + message, *args)
+
+    def _workflow_recording_snapshot(self) -> Dict[str, Any]:
+        raw = getattr(self, "_workflow_record_diag", {})
+        if not isinstance(raw, dict):
+            return {}
+        counts_raw = raw.get("counts", {})
+        counts = dict(counts_raw) if isinstance(counts_raw, dict) else {}
+        last_raw = raw.get("last_event", {})
+        last_event = dict(last_raw) if isinstance(last_raw, dict) else {}
+        try:
+            total = int(raw.get("events_total", 0) or 0)
+        except Exception:
+            total = 0
+        return {
+            "events_total": max(0, total),
+            "counts": counts,
+            "last_event": last_event,
+        }
+
+    def _record_workflow_trace_event(self, event: str, **fields: Any) -> None:
+        diag = getattr(self, "_workflow_record_diag", None)
+        if not isinstance(diag, dict):
+            diag = {"events_total": 0, "counts": {}, "last_event": {}}
+            self._workflow_record_diag = diag
+
+        counts = diag.get("counts")
+        if not isinstance(counts, dict):
+            counts = {}
+            diag["counts"] = counts
+
+        event_name = str(event or "").strip() or "unknown"
+        counts[event_name] = int(counts.get(event_name, 0) or 0) + 1
+        diag["events_total"] = int(diag.get("events_total", 0) or 0) + 1
+
+        sanitized_fields: Dict[str, Any] = {}
+        for key, value in fields.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                sanitized_fields[str(key)] = value
+            elif isinstance(value, list):
+                sanitized_fields[str(key)] = list(value)[:12]
+            elif isinstance(value, dict):
+                sanitized_fields[str(key)] = dict(value)
+            else:
+                sanitized_fields[str(key)] = str(value)
+
+        diag["last_event"] = {
+            "event": event_name,
+            "at": datetime.now().isoformat(),
+            **sanitized_fields,
+        }
+
+        snapshot = self._workflow_recording_snapshot()
+        if isinstance(self.last_tool_payload, dict):
+            self.last_tool_payload["workflow_recording"] = snapshot
+        if self._workflow_record_trace_debug:
+            logger.info("[workflow-record] %s %s", event_name, sanitized_fields)
 
     @staticmethod
     def _normalize_task_text(task_text: str) -> str:
@@ -202,6 +402,96 @@ class LLMBridge:
             max_value=20,
         )
 
+    def _llm_request_timeout_seconds(self) -> float:
+        raw = os.getenv("VERA_LLM_REQUEST_TIMEOUT_SECONDS", "").strip()
+        try:
+            fallback = float(getattr(self, "timeout", 60.0) or 60.0)
+        except Exception:
+            fallback = 60.0
+        if fallback <= 0:
+            fallback = 60.0
+        if not raw:
+            return max(5.0, min(fallback, 600.0))
+        try:
+            parsed = float(raw)
+        except Exception:
+            return max(5.0, min(fallback, 600.0))
+        if parsed <= 0:
+            return max(5.0, min(fallback, 600.0))
+        return max(5.0, min(parsed, 600.0))
+
+    def _tool_execution_timeout_seconds(self) -> float:
+        raw = os.getenv("VERA_TOOL_EXECUTION_TIMEOUT_SECONDS", "").strip()
+        fallback = 0.0
+        try:
+            executor = getattr(self.vera, "tool_executor", None) if self.vera else None
+            if executor is not None:
+                fallback = float(getattr(executor, "default_timeout", 0.0) or 0.0)
+        except Exception:
+            fallback = 0.0
+        if fallback <= 0:
+            fallback = 60.0
+        if not raw:
+            return max(5.0, min(fallback, 600.0))
+        try:
+            parsed = float(raw)
+        except Exception:
+            return max(5.0, min(fallback, 600.0))
+        if parsed <= 0:
+            return max(5.0, min(fallback, 600.0))
+        return max(5.0, min(parsed, 600.0))
+
+    def _tool_execution_timeout_for_tool(self, tool_name: str) -> float:
+        base = self._tool_execution_timeout_seconds()
+        tool = str(tool_name or "").strip().lower()
+        if not tool:
+            return base
+
+        override = 0.0
+        raw_overrides = os.getenv("VERA_TOOL_EXECUTION_TIMEOUT_OVERRIDES", "").strip()
+        if raw_overrides:
+            for chunk in raw_overrides.split(","):
+                item = str(chunk or "").strip()
+                if not item or "=" not in item:
+                    continue
+                name, value = item.split("=", 1)
+                if str(name or "").strip().lower() != tool:
+                    continue
+                try:
+                    parsed = float(str(value or "").strip())
+                except Exception:
+                    parsed = 0.0
+                if parsed > 0:
+                    override = parsed
+                break
+
+        if override <= 0:
+            override = float(_DEFAULT_TOOL_EXEC_TIMEOUT_OVERRIDES.get(tool, 0.0) or 0.0)
+        if override <= 0:
+            return base
+        return max(base, min(override, 600.0))
+
+    @staticmethod
+    def _classify_llm_error(exc: Exception) -> str:
+        detail = str(exc or "").strip()
+        lowered = detail.lower()
+        if isinstance(exc, asyncio.TimeoutError) or "timed out" in lowered:
+            return f"llm_timeout:{detail[:180] or 'request timed out'}"
+        return f"llm_call_failed:{detail[:180] or type(exc).__name__}"
+
+    @staticmethod
+    def _final_failure_response(workflow_error: str) -> str:
+        lowered = str(workflow_error or "").strip().lower()
+        if lowered.startswith("no_progress_tool_loop"):
+            return "Tool loop made no progress; aborted safely. Please rephrase or narrow the request."
+        if "llm_timeout" in lowered or "llm request timed out" in lowered:
+            return "Model request timed out; recovered safely. Please retry with a narrower request."
+        if "tool_timeout" in lowered or "tool execution timeout" in lowered:
+            return "Tool execution timed out; stopped safely. Please retry with a narrower request."
+        if "llm_call_failed" in lowered:
+            return "Model call failed; recovered safely. Please retry."
+        return "Tool call limit reached; unable to complete the request."
+
     @staticmethod
     def _normalize_tool_call_arguments(arguments: Any) -> str:
         if arguments is None:
@@ -235,6 +525,144 @@ class LLMBridge:
             return ""
         canonical = "|".join(normalized_calls)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+
+    @staticmethod
+    def _tool_schema_name(tool_schema: Any) -> str:
+        if not isinstance(tool_schema, dict):
+            return ""
+        fn = tool_schema.get("function")
+        if isinstance(fn, dict):
+            name = str(fn.get("name") or "").strip()
+            if name:
+                return name
+        return str(tool_schema.get("name") or "").strip()
+
+    # ------------------------------------------------------------------
+    # History trimming — tiered memory management
+    # ------------------------------------------------------------------
+    # Tier 1 (Working):  Last *working_window* messages kept verbatim.
+    # Tier 2 (Episodic): Older messages compressed into a single
+    #                     assistant summary injected at the start.
+    # Tool-call/tool-result pairs are never orphaned.
+    # ------------------------------------------------------------------
+
+    _HISTORY_TOKEN_BUDGET: int = 48_000
+    _HISTORY_WORKING_WINDOW: int = 16  # keep last N messages verbatim
+    _HISTORY_CHARS_PER_TOKEN: int = 4  # rough estimate
+
+    @staticmethod
+    def _message_tokens(msg: Dict[str, Any]) -> int:
+        """Rough token estimate for a single message."""
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            content = " ".join(
+                str(part.get("text", "")) for part in content if isinstance(part, dict)
+            )
+        tool_calls = msg.get("tool_calls") or []
+        extra = sum(len(str(tc.get("function", {}).get("arguments", ""))) for tc in tool_calls)
+        return (len(str(content)) + extra) // 4
+
+    @classmethod
+    def _find_safe_trim_point(cls, history: List[Dict[str, Any]], keep_last: int) -> int:
+        """Return the index where we can safely split history.
+
+        Walks backward from the trim boundary to ensure we never orphan a
+        tool_result (role='tool') from its preceding assistant tool_call.
+        """
+        if len(history) <= keep_last:
+            return 0
+        boundary = len(history) - keep_last
+        # Walk backward from boundary — if the message at boundary is a tool
+        # result, keep walking back until we find the assistant message that
+        # triggered it.
+        idx = boundary
+        while idx > 0 and history[idx].get("role") == "tool":
+            idx -= 1
+        return idx
+
+    def _trim_history(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply tiered memory management to a message history.
+
+        Returns a new list — does NOT mutate the input.
+        """
+        total_tokens = sum(self._message_tokens(m) for m in history)
+        if total_tokens <= self._HISTORY_TOKEN_BUDGET and len(history) <= self._HISTORY_WORKING_WINDOW * 2:
+            return history  # within budget, no trimming needed
+
+        trim_point = self._find_safe_trim_point(history, self._HISTORY_WORKING_WINDOW)
+        if trim_point <= 0:
+            return history  # nothing to trim
+
+        old_messages = history[:trim_point]
+        working_messages = history[trim_point:]
+
+        # Build a compact episodic summary of the older messages.
+        episode_parts: List[str] = []
+        for msg in old_messages:
+            role = msg.get("role", "")
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(
+                    str(p.get("text", "")) for p in content if isinstance(p, dict)
+                )
+            content = str(content).strip()
+            if not content:
+                continue
+            if role == "user":
+                # Keep a brief note of what the user asked
+                snippet = content[:200] + ("..." if len(content) > 200 else "")
+                episode_parts.append(f"- User: {snippet}")
+            elif role == "assistant":
+                snippet = content[:200] + ("..." if len(content) > 200 else "")
+                episode_parts.append(f"- Vera: {snippet}")
+            elif role == "tool":
+                tool_name = msg.get("name") or "tool"
+                snippet = content[:100] + ("..." if len(content) > 100 else "")
+                episode_parts.append(f"- [{tool_name}]: {snippet}")
+
+        if not episode_parts:
+            return working_messages
+
+        episodic_summary = (
+            "[Earlier conversation summary — "
+            f"{len(old_messages)} messages consolidated]\n"
+            + "\n".join(episode_parts[-20:])  # cap at last 20 entries
+        )
+
+        summary_message = {"role": "user", "content": episodic_summary}
+        return [summary_message] + working_messages
+
+    def _tools_for_round(
+        self,
+        tools: List[Dict[str, Any]],
+        disabled_tool_names: set[str],
+    ) -> List[Dict[str, Any]]:
+        if not disabled_tool_names:
+            return list(tools)
+        filtered: List[Dict[str, Any]] = []
+        for tool_schema in tools:
+            name = self._tool_schema_name(tool_schema)
+            if name and name in disabled_tool_names:
+                continue
+            filtered.append(tool_schema)
+        return filtered
+
+    @staticmethod
+    def _forced_tool_choice_name(tool_choice: Any) -> str:
+        if not isinstance(tool_choice, dict):
+            return ""
+        fn = tool_choice.get("function")
+        if not isinstance(fn, dict):
+            return ""
+        return str(fn.get("name") or "").strip()
+
+    def _tool_failure_retry_limit(self) -> int:
+        return self._read_int_env(
+            "VERA_TOOL_FAILURE_RETRY_LIMIT",
+            2,
+            min_value=1,
+            max_value=6,
+        )
 
     def _should_accept_workflow_chain(
         self,
@@ -432,7 +860,7 @@ class LLMBridge:
                 _record_match(name)
         explicit_candidates = [name for name in tool_names if "_" in name]
         for name in explicit_candidates:
-            if re.search(rf"\\b{re.escape(name)}\\b", context_lower):
+            if re.search(rf"\b{re.escape(name)}\b", context_lower):
                 _record_match(name)
         return explicit_matches
 
@@ -864,6 +1292,115 @@ class LLMBridge:
         if resolved_server:
             resolved_params["__mcp_server"] = resolved_server
         return resolved_name, resolved_params
+
+    def _inject_forced_tool_schema(
+        self,
+        tools: List[Dict[str, Any]],
+        forced_tool_name: str,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        forced = str(forced_tool_name or "").strip()
+        if not forced:
+            return tools, False
+
+        current_names = {
+            str((tool.get("function", {}) or {}).get("name") or "")
+            for tool in tools
+            if isinstance(tool, dict)
+        }
+        if forced in current_names:
+            return tools, True
+
+        def _with_injected(schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+            updated = list(tools)
+            updated.insert(0, schema)
+            return updated
+
+        # Native tools
+        for tool in list(getattr(self.vera, "_native_tool_defs", []) or []):
+            if not isinstance(tool, dict):
+                continue
+            name = str((tool.get("function", {}) or {}).get("name") or "").strip()
+            if name != forced:
+                continue
+            logger.info("Forced tool override injected from native defs: %s", forced)
+            return _with_injected(tool), True
+
+        mcp = getattr(self.vera, "mcp", None) if self.vera else None
+        if mcp is None:
+            return tools, False
+
+        # Full MCP defs (authoritative path; bypasses router/blocklist visibility limits)
+        try:
+            available_defs = (
+                mcp.get_available_tool_defs()
+                if getattr(mcp, "get_available_tool_defs", None)
+                else {}
+            )
+        except Exception:
+            available_defs = {}
+        if isinstance(available_defs, dict):
+            for server_name, tool_defs in available_defs.items():
+                if not isinstance(tool_defs, list):
+                    continue
+                for tool_def in tool_defs:
+                    if isinstance(tool_def, str):
+                        tool_def = {"name": tool_def}
+                    if not isinstance(tool_def, dict):
+                        continue
+                    name = str(tool_def.get("name") or "").strip()
+                    if name != forced:
+                        continue
+                    description = _sanitize_tool_description(
+                        tool_def.get("description") or f"MCP tool from {server_name}.",
+                        tool_name=forced, server_name=server_name,
+                    )
+                    parameters = tool_def.get("inputSchema") or {"type": "object", "properties": {}}
+                    schema = {
+                        "type": "function",
+                        "function": {
+                            "name": forced,
+                            "description": description,
+                            "parameters": parameters,
+                        },
+                    }
+                    logger.info(
+                        "Forced tool override injected from MCP defs: %s (server=%s)",
+                        forced,
+                        server_name,
+                    )
+                    return _with_injected(schema), True
+
+        # Names-only MCP fallback
+        try:
+            available_names = (
+                mcp.get_available_tools()
+                if getattr(mcp, "get_available_tools", None)
+                else {}
+            )
+        except Exception:
+            available_names = {}
+        if isinstance(available_names, dict):
+            for server_name, tool_names in available_names.items():
+                if not isinstance(tool_names, list):
+                    continue
+                if forced not in {str(name) for name in tool_names if isinstance(name, str)}:
+                    continue
+                schema = {
+                    "type": "function",
+                    "function": {
+                        "name": forced,
+                        "description": f"MCP tool from {server_name}.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+                logger.info(
+                    "Forced tool override injected from MCP names: %s (server=%s)",
+                    forced,
+                    server_name,
+                )
+                return _with_injected(schema), True
+
+        return tools, False
 
     async def _build_tool_schemas(
         self,
@@ -2039,7 +2576,10 @@ class LLMBridge:
                 key = (server_name, tool_name)
                 if key in server_tool_to_exposed:
                     continue
-                description = tool_def.get("description") or f"MCP tool from {server_name}."
+                description = _sanitize_tool_description(
+                    tool_def.get("description") or f"MCP tool from {server_name}.",
+                    tool_name=tool_name, server_name=server_name,
+                )
                 parameters = tool_def.get("inputSchema") or {"type": "object", "properties": {}}
                 exposed_name = tool_name
                 if tool_name in primary_owner and primary_owner[tool_name] != server_name:
@@ -2092,7 +2632,10 @@ class LLMBridge:
                 ),
                 None
             )
-            description = (tool_def or {}).get("description") or f"MCP tool from {server_name}."
+            description = _sanitize_tool_description(
+                (tool_def or {}).get("description") or f"MCP tool from {server_name}.",
+                tool_name=tool_name, server_name=server_name,
+            )
             parameters = (tool_def or {}).get("inputSchema") or {"type": "object", "properties": {}}
             mcp_defs[tool_name] = {
                 "type": "function",
@@ -2127,7 +2670,10 @@ class LLMBridge:
                     ),
                     None
                 )
-                description = (tool_def or {}).get("description") or f"MCP tool from {server_name}."
+                description = _sanitize_tool_description(
+                    (tool_def or {}).get("description") or f"MCP tool from {server_name}.",
+                    tool_name=forced_tool, server_name=server_name,
+                )
                 parameters = (tool_def or {}).get("inputSchema") or {"type": "object", "properties": {}}
                 mcp_defs[forced_tool] = {
                     "type": "function",
@@ -2231,6 +2777,15 @@ class LLMBridge:
         if forced_tool and (forced_tool in native_defs or forced_tool in mcp_defs):
             if forced_tool not in priority_tools:
                 priority_tools.insert(0, forced_tool)
+            # Only inject native media tools alongside the forced tool when
+            # the forced tool is itself a media generation tool.  Previously
+            # this fired for any forced tool whose name contained "animation"
+            # or "thumbnail", polluting the tool list for browser-inspection
+            # tools like expand_animations or get_page_thumbnail.
+            if forced_tool in ("generate_image", "generate_video"):
+                for media_tool_name in ("generate_image", "generate_video"):
+                    if media_tool_name in native_defs and media_tool_name not in priority_tools:
+                        priority_tools.append(media_tool_name)
 
         workflow_plan: Dict[str, Any] = self._consume_request_workflow_hint(context)
         workflow_suggested_chain: List[str] = list(workflow_plan.get("tool_chain", []) or [])
@@ -2318,6 +2873,24 @@ class LLMBridge:
                     existing = [name for name in existing if name != forced_tool]
                     forced_prefix = [forced_tool]
                 priority_tools = forced_prefix + promoted_chain + existing
+
+        failure_learning_plan: Dict[str, Any] = {}
+        if context and not self._is_acknowledgement_turn(context or ""):
+            failure_learning_plan = self._load_failure_learning_plan(str(context or ""))
+            if failure_learning_plan:
+                self._trace_workflow(
+                    "failure_plan_loaded tag=%s avoid=%s recovery=%s",
+                    str(failure_learning_plan.get("source_failure_tag", "")),
+                    list(failure_learning_plan.get("avoid_tools", []) or []),
+                    list(failure_learning_plan.get("suggested_recovery_chain", []) or []),
+                )
+        if failure_learning_plan:
+            allowed_names = list(native_defs.keys()) + list(mcp_defs.keys())
+            priority_tools = self._apply_failure_plan_to_priority(
+                priority_tools=priority_tools,
+                failure_plan=failure_learning_plan,
+                allowed_names=allowed_names,
+            )
 
         for tool_name in priority_tools:
             if tool_name in seen:
@@ -2536,7 +3109,11 @@ class LLMBridge:
                 "tool_alias_count": len(self._tool_aliases),
                 "workflow_suggested_chain": workflow_suggested_chain,
                 "workflow_plan": workflow_plan,
+                "failure_learning_plan": failure_learning_plan,
             }
+            workflow_recording = self._workflow_recording_snapshot()
+            if workflow_recording:
+                self.last_tool_payload["workflow_recording"] = workflow_recording
             if self._tool_aliases:
                 self.last_tool_payload["tool_aliases"] = dict(self._tool_aliases)
             if include_full:
@@ -2560,6 +3137,9 @@ class LLMBridge:
     def get_last_tool_payload(self) -> Dict[str, Any]:
         """Return the last tool payload sent to the LLM."""
         payload = dict(self.last_tool_payload or {})
+        workflow_recording = self._workflow_recording_snapshot()
+        if workflow_recording:
+            payload["workflow_recording"] = workflow_recording
         payload["last_tools_used"] = list(self.last_tools_used or [])
         payload["last_tools_used_count"] = len(payload["last_tools_used"])
         return self._trim_tool_payload(payload)
@@ -2807,6 +3387,7 @@ class LLMBridge:
         Returns raw OpenAI-format response dict for backward compatibility.
         """
         start_time = time.time()
+        request_timeout = self._llm_request_timeout_seconds()
 
         # --- Registry mode: use multi-provider fallback ---
         _registry_error: Optional[Exception] = None
@@ -2830,13 +3411,16 @@ class LLMBridge:
                 async def _on_provider_switch(old_id, new_id):
                     logger.info(f"LLM provider switch: {old_id} -> {new_id}")
 
-                llm_response = await self.registry.chat_with_fallback(
-                    messages=messages,  # Pass full messages; registry normalizes per provider
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    generation_config=gen_config,
-                    model=model_override or self.model,
-                    on_provider_switch=_on_provider_switch,
+                llm_response = await asyncio.wait_for(
+                    self.registry.chat_with_fallback(
+                        messages=messages,  # Pass full messages; registry normalizes per provider
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        generation_config=gen_config,
+                        model=model_override or self.model,
+                        on_provider_switch=_on_provider_switch,
+                    ),
+                    timeout=request_timeout,
                 )
 
                 # Convert LLMResponse back to OpenAI-format dict for backward compat
@@ -2912,7 +3496,10 @@ class LLMBridge:
             )
 
         headers = self._build_headers()
-        response = await self._client.post("/chat/completions", headers=headers, json=payload)
+        response = await asyncio.wait_for(
+            self._client.post("/chat/completions", headers=headers, json=payload),
+            timeout=request_timeout,
+        )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -2925,7 +3512,10 @@ class LLMBridge:
                     fallback.pop("tool_choice", None)
                 for key in applied_config:
                     fallback.pop(key, None)
-                retry = await self._client.post("/chat/completions", headers=headers, json=fallback)
+                retry = await asyncio.wait_for(
+                    self._client.post("/chat/completions", headers=headers, json=fallback),
+                    timeout=request_timeout,
+                )
                 retry.raise_for_status()
                 return retry.json()
             if response.status_code == 400:
@@ -3176,10 +3766,9 @@ class LLMBridge:
         system_override: Optional[str] = None,
         conversation_id: Optional[str] = None,
     ) -> str:
-        if system_override:
-            return system_override
+        override_text = str(system_override or "").strip()
         if not self.vera:
-            return ""
+            return override_text
         memory_constraints = []
         if getattr(self.vera, "get_relevant_past_corrections", None):
             try:
@@ -3187,10 +3776,28 @@ class LLMBridge:
             except Exception:
                 logger.debug("Suppressed Exception in llm_bridge")
                 memory_constraints = []
-        return self.vera.build_system_prompt(
+        base_prompt = self.vera.build_system_prompt(
             conversation_id=conversation_id,
             router_context=last_user,
             memory_constraints=memory_constraints,
+        )
+        if not override_text:
+            return base_prompt
+
+        override_mode = str(os.getenv("VERA_SYSTEM_OVERRIDE_MODE", "append") or "").strip().lower()
+        if override_mode not in {"append", "replace"}:
+            override_mode = "append"
+        if override_mode == "replace":
+            return override_text
+
+        # Default behavior: preserve Vera runtime identity/context while honoring
+        # caller system directives as an additive instruction block.
+        if not str(base_prompt or "").strip():
+            return override_text
+        return (
+            f"{base_prompt}\n\n"
+            "## Caller System Addendum\n"
+            f"{override_text}"
         )
 
     def _emit_routing_signals(
@@ -3200,6 +3807,7 @@ class LLMBridge:
         model_override: str,
         model_reason: str,
         tools_used: List[str],
+        tools_failed: Optional[List[str]] = None,
         conversation_id: str = "default",
     ) -> None:
         """Emit routing decisions as learning signals to flight recorder and tool selection memory."""
@@ -3207,6 +3815,16 @@ class LLMBridge:
         tool_confidence = routing_meta.get("tool_confidence", {})
         pass1_confidence = routing_meta.get("pass1_confidence", 0.0)
         used_llm_router = routing_meta.get("used_llm_router", False)
+        failed_set = {
+            str(name).strip()
+            for name in list(tools_failed or [])
+            if str(name).strip()
+        }
+        succeeded_tools = [
+            str(name).strip()
+            for name in list(tools_used or [])
+            if str(name).strip() and str(name).strip() not in failed_set
+        ]
         workflow_reward_score = 0.0
         active_plan = self._active_workflow_plan if isinstance(self._active_workflow_plan, dict) else {}
         if active_plan:
@@ -3253,11 +3871,16 @@ class LLMBridge:
                     tool_name: workflow_reward_score
                     for tool_name in tools_used
                 }
+                for failed_name in failed_set:
+                    reward_scores[failed_name] = min(-0.6, reward_scores.get(failed_name, 0.0))
                 tsm.record_routing_outcome(
                     selected_categories=selected_categories,
                     tools_used=tools_used,
-                    tools_succeeded=tools_used,  # assume success unless we track failures
-                    context={"task": user_message[:200]},
+                    tools_succeeded=succeeded_tools,
+                    context={
+                        "task": user_message[:200],
+                        "failed_tools": sorted(failed_set),
+                    },
                     tool_reward_scores=reward_scores,
                 )
             except Exception:
@@ -3272,15 +3895,34 @@ class LLMBridge:
         error: str = "",
     ) -> None:
         if self._is_acknowledgement_turn(task_text):
+            self._record_workflow_trace_event(
+                "outcome_skip_ack",
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow("record_outcome_skip reason=acknowledgement_turn")
             return
         if not self.vera:
+            self._record_workflow_trace_event(
+                "outcome_skip_no_vera",
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow("record_outcome_skip reason=no_vera")
             return
         learning_loop = getattr(self.vera, "learning_loop", None)
         if not learning_loop or not hasattr(learning_loop, "record_workflow_outcome"):
+            self._record_workflow_trace_event(
+                "outcome_skip_learning_loop",
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow("record_outcome_skip reason=learning_loop_unavailable")
             return
+        self._record_workflow_trace_event(
+            "outcome_call",
+            success=bool(success),
+            chain=list(tools_used or []),
+            conversation_id=str(conversation_id or "default"),
+            error=str(error or "")[:120],
+        )
         self._trace_workflow(
             "record_outcome_call success=%s tools=%s conversation_id=%s error=%s",
             bool(success),
@@ -3296,8 +3938,21 @@ class LLMBridge:
                 conversation_id=str(conversation_id or "default"),
                 error=str(error or ""),
             )
+            self._record_workflow_trace_event(
+                "outcome_done",
+                success=bool(success),
+                chain=list(tools_used or []),
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow("record_outcome_done")
         except Exception:
+            self._record_workflow_trace_event(
+                "outcome_error",
+                success=bool(success),
+                chain=list(tools_used or []),
+                conversation_id=str(conversation_id or "default"),
+                error=str(error or "")[:120],
+            )
             self._trace_workflow("record_outcome_error")
             logger.debug("Suppressed Exception in llm_bridge")
 
@@ -3310,17 +3965,35 @@ class LLMBridge:
         error: str = "",
     ) -> None:
         if self._is_acknowledgement_turn(task_text):
+            self._record_workflow_trace_event(
+                "replay_skip_ack",
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow("record_replay_skip reason=acknowledgement_turn")
             return
         if not self.vera:
+            self._record_workflow_trace_event(
+                "replay_skip_no_vera",
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow("record_replay_skip reason=no_vera")
             return
         if not workflow_plan:
+            self._record_workflow_trace_event(
+                "replay_skip_empty_plan",
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow("record_replay_skip reason=empty_workflow_plan")
             return
         forced_steps = int(workflow_plan.get("forced_steps", 0) or 0)
         chain = workflow_plan.get("tool_chain", [])
         if forced_steps <= 0 or not isinstance(chain, list) or len(chain) < 2:
+            self._record_workflow_trace_event(
+                "replay_skip_not_replayed",
+                forced_steps=forced_steps,
+                chain=list(chain) if isinstance(chain, list) else [],
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow(
                 "record_replay_skip reason=not_replayed forced_steps=%s chain=%s",
                 forced_steps,
@@ -3330,8 +4003,23 @@ class LLMBridge:
 
         learning_loop = getattr(self.vera, "learning_loop", None)
         if not learning_loop or not hasattr(learning_loop, "record_workflow_replay_result"):
+            self._record_workflow_trace_event(
+                "replay_skip_learning_loop",
+                forced_steps=forced_steps,
+                chain=list(chain),
+                conversation_id=str(conversation_id or "default"),
+            )
             self._trace_workflow("record_replay_skip reason=learning_loop_unavailable")
             return
+        self._record_workflow_trace_event(
+            "replay_call",
+            success=bool(success),
+            forced_steps=forced_steps,
+            chain=list(chain),
+            conversation_id=str(conversation_id or "default"),
+            signature=str(workflow_plan.get("signature") or ""),
+            error=str(error or "")[:120],
+        )
         self._trace_workflow(
             "record_replay_call success=%s chain=%s forced_steps=%s conversation_id=%s signature=%s error=%s",
             bool(success),
@@ -3350,14 +4038,130 @@ class LLMBridge:
                 error=str(error or ""),
                 signature=str(workflow_plan.get("signature") or ""),
             )
+            self._record_workflow_trace_event(
+                "replay_done",
+                success=bool(success),
+                forced_steps=forced_steps,
+                chain=list(chain),
+                conversation_id=str(conversation_id or "default"),
+                signature=str(workflow_plan.get("signature") or ""),
+            )
             self._trace_workflow("record_replay_done")
         except Exception:
+            self._record_workflow_trace_event(
+                "replay_error",
+                success=bool(success),
+                forced_steps=forced_steps,
+                chain=list(chain),
+                conversation_id=str(conversation_id or "default"),
+                signature=str(workflow_plan.get("signature") or ""),
+                error=str(error or "")[:120],
+            )
             self._trace_workflow("record_replay_error")
             logger.debug("Suppressed Exception in llm_bridge")
 
     @staticmethod
     def _force_tool_choice(tool_name: str) -> Dict[str, Any]:
         return {"type": "function", "function": {"name": str(tool_name)}}
+
+    def _load_failure_learning_plan(self, context: str) -> Dict[str, Any]:
+        if not context or self._is_acknowledgement_turn(context):
+            return {}
+        learning_loop = getattr(self.vera, "learning_loop", None) if self.vera else None
+        if not learning_loop or not hasattr(learning_loop, "get_failure_recovery_plan"):
+            return {}
+        try:
+            raw = learning_loop.get_failure_recovery_plan(context)
+            if not isinstance(raw, dict):
+                return {}
+            plan = dict(raw)
+            avoid_tools = [
+                str(name).strip()
+                for name in list(plan.get("avoid_tools", []) or [])
+                if str(name).strip()
+            ]
+            recovery_chain = [
+                str(name).strip()
+                for name in list(plan.get("suggested_recovery_chain", []) or [])
+                if str(name).strip()
+            ]
+            plan["avoid_tools"] = list(dict.fromkeys(avoid_tools))
+            plan["suggested_recovery_chain"] = list(dict.fromkeys(recovery_chain))
+            return plan
+        except Exception:
+            self._trace_workflow("failure_plan_error")
+            return {}
+
+    @staticmethod
+    def _apply_failure_plan_to_priority(
+        priority_tools: List[str],
+        failure_plan: Dict[str, Any],
+        allowed_names: List[str],
+    ) -> List[str]:
+        ordered = [str(name).strip() for name in list(priority_tools or []) if str(name).strip()]
+        if not ordered:
+            return ordered
+        allowed = set(str(name).strip() for name in list(allowed_names or []) if str(name).strip())
+        recovery_chain = [
+            name for name in list(failure_plan.get("suggested_recovery_chain", []) or [])
+            if name in allowed
+        ]
+        avoid_tools = set(
+            name for name in list(failure_plan.get("avoid_tools", []) or [])
+            if name in allowed
+        )
+
+        # Recovery chain gets first shot, but keep explicit forced/priority items
+        # by preserving existing relative order for non-recovery tools.
+        if recovery_chain:
+            prefix = [name for name in recovery_chain if name in ordered]
+            tail = [name for name in ordered if name not in set(prefix)]
+            ordered = prefix + tail
+
+        # Avoid-tools are not removed; they are deprioritized so they remain as
+        # fallback options when no alternative path exists.
+        if avoid_tools:
+            safe = [name for name in ordered if name not in avoid_tools]
+            risky = [name for name in ordered if name in avoid_tools]
+            ordered = safe + risky
+
+        return ordered
+
+    @staticmethod
+    def _failure_plan_system_addendum(failure_plan: Dict[str, Any]) -> str:
+        avoid_tools = [
+            str(name).strip()
+            for name in list(failure_plan.get("avoid_tools", []) or [])
+            if str(name).strip()
+        ]
+        recovery_chain = [
+            str(name).strip()
+            for name in list(failure_plan.get("suggested_recovery_chain", []) or [])
+            if str(name).strip()
+        ]
+        if not avoid_tools and not recovery_chain:
+            return ""
+        failure_tag = str(failure_plan.get("source_failure_tag", "") or "").strip()
+        parts: List[str] = [
+            "## Failure-Learning Guidance",
+            "Use prior failures as constraints for this turn.",
+        ]
+        if failure_tag:
+            parts.append(f"Recent failure pattern: {failure_tag}.")
+        if avoid_tools:
+            parts.append(
+                "Avoid repeating this known-bad path unless no alternative exists: "
+                + ", ".join(avoid_tools[:8])
+                + "."
+            )
+        if recovery_chain:
+            parts.append(
+                "Prefer this previously successful recovery order: "
+                + " -> ".join(recovery_chain[:8])
+                + "."
+            )
+        parts.append("If a step fails again, pivot to a different tool path in the same response cycle.")
+        return "\n".join(parts)
 
     def _resolve_workflow_runtime_plan(
         self,
@@ -3501,6 +4305,83 @@ class LLMBridge:
         )
         return self._force_tool_choice(next_tool)
 
+    async def _attempt_tool_limit_fallback_completion(
+        self,
+        *,
+        system_prompt: str,
+        history_ref: List[Dict[str, Any]],
+        model_override: str,
+        generation_config: Optional[Dict[str, Any]],
+        conversation_id: str,
+        fallback_reason: str = "",
+    ) -> str:
+        if not isinstance(history_ref, list) or not history_ref:
+            return ""
+
+        reason_text = str(fallback_reason or "").strip()
+        reason_block = ""
+        if reason_text:
+            reason_block = f"Failure reason: {reason_text[:220]}.\n"
+
+        fallback_prompt = (
+            f"{system_prompt}\n\n"
+            "## Workflow Fallback\n"
+            "A tool workflow failed to complete safely. Do NOT call additional tools. "
+            f"{reason_block}"
+            "Use available tool outputs already in conversation history and provide a best-effort "
+            "response. If data is still missing, say exactly what is missing."
+        )
+        try:
+            data = await self._call_chat(
+                [{"role": "system", "content": fallback_prompt}] + list(history_ref),
+                tools=[],
+                tool_choice="none",
+                generation_config=generation_config,
+                model_override=model_override,
+            )
+            choices = data.get("choices", [])
+            if not choices:
+                self._record_workflow_trace_event(
+                    "fallback_completion_skip_empty_choices",
+                    conversation_id=str(conversation_id or "default"),
+                )
+                return ""
+            message = choices[0].get("message", {})
+            content = str(message.get("content") or "").strip()
+            if not content:
+                self._record_workflow_trace_event(
+                    "fallback_completion_skip_empty_content",
+                    conversation_id=str(conversation_id or "default"),
+                )
+                return ""
+            sanitized = self._sanitize_response_text(content)
+            if sanitized != content:
+                message["content"] = sanitized
+            history_ref.append(message)
+            self._record_workflow_trace_event(
+                "fallback_completion_success",
+                conversation_id=str(conversation_id or "default"),
+                content_len=len(sanitized),
+            )
+            self._trace_workflow(
+                "fallback_completion_success conversation_id=%s content_len=%s",
+                str(conversation_id or "default"),
+                len(sanitized),
+            )
+            return sanitized
+        except Exception as exc:
+            self._record_workflow_trace_event(
+                "fallback_completion_error",
+                conversation_id=str(conversation_id or "default"),
+                error=str(exc)[:120],
+            )
+            self._trace_workflow(
+                "fallback_completion_error conversation_id=%s error=%s",
+                str(conversation_id or "default"),
+                str(exc)[:120],
+            )
+            return ""
+
     async def respond(self, user_message: str) -> str:
         """
         Send a user message and handle tool-calling loops.
@@ -3510,6 +4391,7 @@ class LLMBridge:
         """
         self.history.append({"role": "user", "content": user_message})
         tools_used: List[str] = []
+        tools_failed: set[str] = set()
         self.last_tools_used = []
         workflow_failed = False
         workflow_error = ""
@@ -3519,6 +4401,14 @@ class LLMBridge:
             conversation_id="default",
         )
         tools, tool_choice, selected_categories = await self._build_tool_schemas(user_message)
+        failure_plan = {}
+        if isinstance(self.last_tool_payload, dict):
+            raw_failure_plan = self.last_tool_payload.get("failure_learning_plan", {})
+            if isinstance(raw_failure_plan, dict):
+                failure_plan = dict(raw_failure_plan)
+        failure_addendum = self._failure_plan_system_addendum(failure_plan)
+        if failure_addendum:
+            system_prompt += "\n\n" + failure_addendum
         available_tool_names = [
             str((tool.get("function", {}) or {}).get("name") or "")
             for tool in tools
@@ -3551,7 +4441,7 @@ class LLMBridge:
                 self.last_tools_used = list(tools_used)
                 self._emit_routing_signals(
                     user_message, selected_categories, model_override,
-                    model_reason, tools_used,
+                    model_reason, tools_used, sorted(tools_failed),
                 )
                 self._record_workflow_outcome(
                     task_text=user_message,
@@ -3573,7 +4463,18 @@ class LLMBridge:
             workflow_plan = {}
             self._active_workflow_plan = {}
         media_retry_attempted = False
+        forced_tool_retry_attempted = False
         tool_loop_no_progress_limit = self._tool_loop_no_progress_limit()
+        tool_timeout_recovery_budget = self._read_int_env(
+            "VERA_TOOL_TIMEOUT_RECOVERY_BUDGET",
+            1,
+            min_value=0,
+            max_value=3,
+        )
+        tool_failure_retry_limit = self._tool_failure_retry_limit()
+        failed_tool_counts: Dict[str, int] = {}
+        disabled_tool_names: set[str] = set()
+        tool_timeout_recoveries = 0
         last_tool_call_signature = ""
         repeated_tool_call_rounds = 0
 
@@ -3589,14 +4490,33 @@ class LLMBridge:
             )
 
         for round_idx in range(self.max_tool_rounds):
-            messages = [{"role": "system", "content": system_prompt}] + self.history
-            data = await self._call_chat(
-                messages,
-                tools=tools,
-                tool_choice=current_tool_choice,
-                generation_config=self._genome_generation_config,
-                model_override=model_override,
-            )
+            trimmed_history = self._trim_history(self.history)
+            messages = [{"role": "system", "content": system_prompt}] + trimmed_history
+            round_tools = self._tools_for_round(tools, disabled_tool_names)
+            effective_tool_choice = current_tool_choice
+            forced_name = self._forced_tool_choice_name(effective_tool_choice)
+            if forced_name and forced_name in disabled_tool_names:
+                effective_tool_choice = None
+            if not round_tools:
+                effective_tool_choice = "none"
+            try:
+                data = await self._call_chat(
+                    messages,
+                    tools=round_tools,
+                    tool_choice=effective_tool_choice,
+                    generation_config=self._genome_generation_config,
+                    model_override=model_override,
+                )
+            except Exception as exc:
+                workflow_failed = True
+                if not workflow_error:
+                    workflow_error = self._classify_llm_error(exc)
+                logger.warning(
+                    "LLM call failed during respond() round=%s error=%s",
+                    round_idx,
+                    str(exc)[:220],
+                )
+                break
 
             choices = data.get("choices", [])
             if not choices:
@@ -3622,6 +4542,27 @@ class LLMBridge:
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
                 content = message.get("content") or ""
+                if (
+                    not forced_tool_retry_attempted
+                    and forced_name
+                    and forced_name not in disabled_tool_names
+                    and round_idx < (self.max_tool_rounds - 1)
+                ):
+                    forced_tool_retry_attempted = True
+                    if self.history:
+                        self.history.pop()
+                    current_tool_choice = self._force_tool_choice(forced_name)
+                    system_prompt += (
+                        "\n\n## CRITICAL — Forced Tool Execution Required\n"
+                        f"You MUST call `{forced_name}` now. "
+                        "Do not claim inability before attempting the call. "
+                        "If it fails, return the tool error after the attempted call."
+                    )
+                    logger.warning(
+                        "Forced tool %s returned no tool calls; retrying once with strict instruction",
+                        forced_name,
+                    )
+                    continue
                 if not media_retry_attempted and round_idx < (self.max_tool_rounds - 1):
                     media_retry_tool = self._resolve_media_retry_tool(
                         user_message=user_message,
@@ -3647,7 +4588,7 @@ class LLMBridge:
                 self.last_tools_used = list(tools_used)
                 self._emit_routing_signals(
                     user_message, selected_categories, model_override,
-                    model_reason, tools_used,
+                    model_reason, tools_used, sorted(tools_failed),
                 )
                 self._record_workflow_outcome(
                     task_text=user_message,
@@ -3706,11 +4647,23 @@ class LLMBridge:
                 exec_status = "ok"
                 if self.vera and getattr(self.vera, "execute_tool", None):
                     try:
-                        tool_result = await self.vera.execute_tool(
+                        tool_timeout = self._tool_execution_timeout_for_tool(
+                            resolved_tool_name or tool_name
+                        )
+                        execute_coro = self.vera.execute_tool(
                             resolved_tool_name,
                             resolved_params,
                             context={"query": user_message, "conversation_id": "default"}
                         )
+                        tool_result = await asyncio.wait_for(execute_coro, timeout=tool_timeout)
+                    except asyncio.TimeoutError:
+                        exec_status = "error"
+                        tool_result = (
+                            f"Tool execution timeout after {tool_timeout:.1f}s "
+                            f"for {resolved_tool_name or tool_name}"
+                        )
+                        if not workflow_error:
+                            workflow_error = f"tool_timeout:{tool_name}"
                     except Exception as exc:
                         tool_result = f"Tool execution error: {exc}"
                         exec_status = "error"
@@ -3745,6 +4698,33 @@ class LLMBridge:
                         workflow_plan["active"] = False
                         if not workflow_plan.get("abandon_reason"):
                             workflow_plan["abandon_reason"] = f"tool_execution_error:{tool_name}"
+                    normalized_failed_names = {
+                        str(name).strip()
+                        for name in (tool_name, resolved_tool_name)
+                        if str(name).strip()
+                    }
+                    tools_failed.update(normalized_failed_names)
+                    newly_disabled: List[str] = []
+                    for failed_name in normalized_failed_names:
+                        failure_count = int(failed_tool_counts.get(failed_name, 0)) + 1
+                        failed_tool_counts[failed_name] = failure_count
+                        if failure_count >= tool_failure_retry_limit and failed_name not in disabled_tool_names:
+                            disabled_tool_names.add(failed_name)
+                            newly_disabled.append(failed_name)
+                    if newly_disabled:
+                        disabled_text = ", ".join(sorted(newly_disabled))
+                        system_prompt += (
+                            "\n\n## Tool Recovery Guard\n"
+                            f"The following tools failed in this request and are temporarily disabled: {disabled_text}. "
+                            "Do not call them again in this turn. Try an alternate tool path or explain the next manual step."
+                        )
+                        forced_name = self._forced_tool_choice_name(current_tool_choice)
+                        if forced_name and forced_name in disabled_tool_names:
+                            current_tool_choice = None
+                        logger.warning(
+                            "Disabled tools for current request after repeated failures: %s",
+                            disabled_text,
+                        )
                 self.tool_execution_history.append(exec_entry)
                 if len(self.tool_execution_history) > 100:
                     self.tool_execution_history = self.tool_execution_history[-100:]
@@ -3773,6 +4753,29 @@ class LLMBridge:
                     current_tool_call_signature,
                 )
                 break
+            if str(workflow_error or "").startswith("tool_timeout:"):
+                tool_timeout_recoveries += 1
+                if (
+                    tool_timeout_recoveries <= tool_timeout_recovery_budget
+                    and round_idx < (self.max_tool_rounds - 1)
+                ):
+                    logger.warning(
+                        "Tool-timeout recovery attempt %s/%s (round=%s error=%s)",
+                        tool_timeout_recoveries,
+                        tool_timeout_recovery_budget,
+                        round_idx,
+                        workflow_error,
+                    )
+                    workflow_failed = False
+                    workflow_error = ""
+                    current_tool_choice = None
+                    continue
+                logger.warning(
+                    "Tool-timeout circuit breaker tripped (round=%s error=%s)",
+                    round_idx,
+                    workflow_error,
+                )
+                break
             current_tool_choice = self._advance_workflow_runtime_plan(
                 workflow_plan=workflow_plan,
                 called_tools=called_tools,
@@ -3782,7 +4785,7 @@ class LLMBridge:
         self.last_tools_used = list(tools_used)
         self._emit_routing_signals(
             user_message, selected_categories, model_override,
-            model_reason, tools_used,
+            model_reason, tools_used, sorted(tools_failed),
         )
         self._record_workflow_outcome(
             task_text=user_message,
@@ -3799,10 +4802,25 @@ class LLMBridge:
             conversation_id="default",
             error=replay_error,
         )
+        fallback_response = ""
+        should_attempt_fallback = bool(
+            workflow_failed
+            or workflow_error
+            or (workflow_plan and int(workflow_plan.get("forced_steps", 0) or 0) > 0)
+        )
+        if should_attempt_fallback:
+            fallback_response = await self._attempt_tool_limit_fallback_completion(
+                system_prompt=system_prompt,
+                history_ref=self.history,
+                model_override=model_override,
+                generation_config=self._genome_generation_config,
+                conversation_id="default",
+                fallback_reason=workflow_error or str(workflow_plan.get("abandon_reason") or ""),
+            )
         self._active_workflow_plan = dict(workflow_plan)
-        if str(workflow_error or "").startswith("no_progress_tool_loop"):
-            return "Tool loop made no progress; aborted safely. Please rephrase or narrow the request."
-        return "Tool call limit reached; unable to complete the request."
+        if fallback_response:
+            return fallback_response
+        return self._final_failure_response(workflow_error)
 
     async def respond_messages(
         self,
@@ -3823,6 +4841,7 @@ class LLMBridge:
             self.history = list(history)
 
         tools_used: List[str] = []
+        tools_failed: set[str] = set()
         workflow_failed = False
         workflow_error = ""
         effective_generation_config = generation_config or self._genome_generation_config
@@ -3854,29 +4873,56 @@ class LLMBridge:
                 if isinstance(tool, dict)
             ]
             if forced_override_name not in current_names:
-                augmented_context = (
-                    f"{last_user}\n\n"
-                    f"Tool override requirement: `{forced_override_name}`"
-                ).strip()
-                tools, tool_choice, selected_categories = await self._build_tool_schemas(
-                    augmented_context
+                tools, forced_override_available = self._inject_forced_tool_schema(
+                    tools,
+                    forced_override_name,
                 )
-                refreshed_names = [
-                    str((tool.get("function", {}) or {}).get("name") or "")
-                    for tool in tools
-                    if isinstance(tool, dict)
-                ]
-                if forced_override_name in refreshed_names:
+                if forced_override_available:
                     logger.info(
-                        "Forced tool override injected into schema set: %s",
+                        "Forced tool override injected directly into schema set: %s",
                         forced_override_name,
                     )
                 else:
-                    forced_override_available = False
-                    logger.warning(
-                        "Forced tool override still unavailable in schema set: %s",
-                        forced_override_name,
+                    augmented_context = (
+                        f"{last_user}\n\n"
+                        f"Tool override requirement: `{forced_override_name}`"
+                    ).strip()
+                    tools, tool_choice, selected_categories = await self._build_tool_schemas(
+                        augmented_context
                     )
+                    refreshed_names = [
+                        str((tool.get("function", {}) or {}).get("name") or "")
+                        for tool in tools
+                        if isinstance(tool, dict)
+                    ]
+                    if forced_override_name in refreshed_names:
+                        logger.info(
+                            "Forced tool override injected into schema set: %s",
+                            forced_override_name,
+                        )
+                    else:
+                        tools, forced_override_available = self._inject_forced_tool_schema(
+                            tools,
+                            forced_override_name,
+                        )
+                        if forced_override_available:
+                            logger.info(
+                                "Forced tool override recovered via direct MCP/native injection: %s",
+                                forced_override_name,
+                            )
+                        else:
+                            logger.warning(
+                                "Forced tool override still unavailable in schema set: %s",
+                                forced_override_name,
+                            )
+        failure_plan = {}
+        if isinstance(self.last_tool_payload, dict):
+            raw_failure_plan = self.last_tool_payload.get("failure_learning_plan", {})
+            if isinstance(raw_failure_plan, dict):
+                failure_plan = dict(raw_failure_plan)
+        failure_addendum = self._failure_plan_system_addendum(failure_plan)
+        if failure_addendum:
+            system_prompt += "\n\n" + failure_addendum
         available_tool_names = [
             str((tool.get("function", {}) or {}).get("name") or "")
             for tool in tools
@@ -3905,8 +4951,12 @@ class LLMBridge:
         if workflow_plan and not current_tool_choice:
             workflow_plan["forced_steps"] = int(workflow_plan.get("forced_steps", 0) or 0) + 1
             current_tool_choice = self._force_tool_choice(workflow_plan["tool_chain"][0])
-        media_intent = self._detect_media_generation_intent(last_user)
-        media_tool = self._media_tool_for_intent(media_intent)
+        # Skip media-intent override when the caller already supplied an
+        # explicit tool_choice_override (e.g. tool-exam battery forcing a
+        # specific tool).  The keyword detector fires false-positives on
+        # tool *names* containing words like "animation" or "thumbnail".
+        media_intent = self._detect_media_generation_intent(last_user) if not tool_choice_override else None
+        media_tool = self._media_tool_for_intent(media_intent) if media_intent else None
         if media_tool:
             if media_tool not in available_tool_names:
                 unavailable_type = "Video" if media_intent == "video" else "Image"
@@ -3920,7 +4970,7 @@ class LLMBridge:
                     self.last_tools_used = list(tools_used)
                 self._emit_routing_signals(
                     last_user, selected_categories, model_override,
-                    model_reason, tools_used, conversation_id or "default",
+                    model_reason, tools_used, sorted(tools_failed), conversation_id or "default",
                 )
                 self._record_workflow_outcome(
                     task_text=last_user,
@@ -3946,7 +4996,18 @@ class LLMBridge:
                 effective_tool_choice if effective_tool_choice is not None else "auto"
             )
         media_retry_attempted = False
+        forced_tool_retry_attempted = False
         tool_loop_no_progress_limit = self._tool_loop_no_progress_limit()
+        tool_timeout_recovery_budget = self._read_int_env(
+            "VERA_TOOL_TIMEOUT_RECOVERY_BUDGET",
+            1,
+            min_value=0,
+            max_value=3,
+        )
+        tool_failure_retry_limit = self._tool_failure_retry_limit()
+        failed_tool_counts: Dict[str, int] = {}
+        disabled_tool_names: set[str] = set()
+        tool_timeout_recoveries = 0
         last_tool_call_signature = ""
         repeated_tool_call_rounds = 0
 
@@ -3962,16 +5023,34 @@ class LLMBridge:
             )
             logger.info("Injected live-data system prompt for tool: %s", tool_name)
 
-        working_history = list(history)
+        working_history = self._trim_history(list(history))
         for _round_idx in range(self.max_tool_rounds):
             payload_messages = [{"role": "system", "content": system_prompt}] + working_history
-            data = await self._call_chat(
-                payload_messages,
-                tools=tools,
-                generation_config=effective_generation_config,
-                tool_choice=current_tool_choice,
-                model_override=model_override,
-            )
+            round_tools = self._tools_for_round(tools, disabled_tool_names)
+            effective_tool_choice = current_tool_choice
+            forced_name = self._forced_tool_choice_name(effective_tool_choice)
+            if forced_name and forced_name in disabled_tool_names:
+                effective_tool_choice = None
+            if not round_tools:
+                effective_tool_choice = "none"
+            try:
+                data = await self._call_chat(
+                    payload_messages,
+                    tools=round_tools,
+                    generation_config=effective_generation_config,
+                    tool_choice=effective_tool_choice,
+                    model_override=model_override,
+                )
+            except Exception as exc:
+                workflow_failed = True
+                if not workflow_error:
+                    workflow_error = self._classify_llm_error(exc)
+                logger.warning(
+                    "LLM call failed during respond_messages() round=%s error=%s",
+                    _round_idx,
+                    str(exc)[:220],
+                )
+                break
 
             choices = data.get("choices", [])
             if not choices:
@@ -3998,6 +5077,27 @@ class LLMBridge:
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
                 content = message.get("content") or ""
+                if (
+                    not forced_tool_retry_attempted
+                    and forced_name
+                    and forced_name not in disabled_tool_names
+                    and _round_idx < (self.max_tool_rounds - 1)
+                ):
+                    forced_tool_retry_attempted = True
+                    if working_history:
+                        working_history.pop()
+                    current_tool_choice = self._force_tool_choice(forced_name)
+                    system_prompt += (
+                        "\n\n## CRITICAL — Forced Tool Execution Required\n"
+                        f"You MUST call `{forced_name}` now. "
+                        "Do not claim inability before attempting the call. "
+                        "If it fails, return the tool error after the attempted call."
+                    )
+                    logger.warning(
+                        "Forced tool %s returned no tool calls; retrying once with strict instruction",
+                        forced_name,
+                    )
+                    continue
                 if not media_retry_attempted and _round_idx < (self.max_tool_rounds - 1):
                     media_retry_tool = self._resolve_media_retry_tool(
                         user_message=last_user,
@@ -4026,7 +5126,7 @@ class LLMBridge:
                     self.last_tools_used = list(tools_used)
                 self._emit_routing_signals(
                     last_user, selected_categories, model_override,
-                    model_reason, tools_used, conversation_id or "default",
+                    model_reason, tools_used, sorted(tools_failed), conversation_id or "default",
                 )
                 self._record_workflow_outcome(
                     task_text=last_user,
@@ -4085,11 +5185,23 @@ class LLMBridge:
                 exec_status = "ok"
                 if self.vera and getattr(self.vera, "execute_tool", None):
                     try:
-                        tool_result = await self.vera.execute_tool(
+                        tool_timeout = self._tool_execution_timeout_for_tool(
+                            resolved_tool_name or tool_name
+                        )
+                        execute_coro = self.vera.execute_tool(
                             resolved_tool_name,
                             resolved_params,
                             context={"source": "api", "conversation_id": conversation_id}
                         )
+                        tool_result = await asyncio.wait_for(execute_coro, timeout=tool_timeout)
+                    except asyncio.TimeoutError:
+                        exec_status = "error"
+                        tool_result = (
+                            f"Tool execution timeout after {tool_timeout:.1f}s "
+                            f"for {resolved_tool_name or tool_name}"
+                        )
+                        if not workflow_error:
+                            workflow_error = f"tool_timeout:{tool_name}"
                     except Exception as exc:
                         tool_result = f"Tool execution error: {exc}"
                         exec_status = "error"
@@ -4125,6 +5237,33 @@ class LLMBridge:
                         workflow_plan["active"] = False
                         if not workflow_plan.get("abandon_reason"):
                             workflow_plan["abandon_reason"] = f"tool_execution_error:{tool_name}"
+                    normalized_failed_names = {
+                        str(name).strip()
+                        for name in (tool_name, resolved_tool_name)
+                        if str(name).strip()
+                    }
+                    tools_failed.update(normalized_failed_names)
+                    newly_disabled: List[str] = []
+                    for failed_name in normalized_failed_names:
+                        failure_count = int(failed_tool_counts.get(failed_name, 0)) + 1
+                        failed_tool_counts[failed_name] = failure_count
+                        if failure_count >= tool_failure_retry_limit and failed_name not in disabled_tool_names:
+                            disabled_tool_names.add(failed_name)
+                            newly_disabled.append(failed_name)
+                    if newly_disabled:
+                        disabled_text = ", ".join(sorted(newly_disabled))
+                        system_prompt += (
+                            "\n\n## Tool Recovery Guard\n"
+                            f"The following tools failed in this request and are temporarily disabled: {disabled_text}. "
+                            "Do not call them again in this turn. Try an alternate tool path or explain the next manual step."
+                        )
+                        forced_name = self._forced_tool_choice_name(current_tool_choice)
+                        if forced_name and forced_name in disabled_tool_names:
+                            current_tool_choice = None
+                        logger.warning(
+                            "Disabled tools for current API request after repeated failures: %s",
+                            disabled_text,
+                        )
                 self.tool_execution_history.append(exec_entry)
                 # Cap at 100 entries
                 if len(self.tool_execution_history) > 100:
@@ -4154,6 +5293,29 @@ class LLMBridge:
                     current_tool_call_signature,
                 )
                 break
+            if str(workflow_error or "").startswith("tool_timeout:"):
+                tool_timeout_recoveries += 1
+                if (
+                    tool_timeout_recoveries <= tool_timeout_recovery_budget
+                    and _round_idx < (self.max_tool_rounds - 1)
+                ):
+                    logger.warning(
+                        "Tool-timeout recovery attempt %s/%s (round=%s error=%s)",
+                        tool_timeout_recoveries,
+                        tool_timeout_recovery_budget,
+                        _round_idx,
+                        workflow_error,
+                    )
+                    workflow_failed = False
+                    workflow_error = ""
+                    current_tool_choice = None
+                    continue
+                logger.warning(
+                    "Tool-timeout circuit breaker tripped (round=%s error=%s)",
+                    _round_idx,
+                    workflow_error,
+                )
+                break
             current_tool_choice = self._advance_workflow_runtime_plan(
                 workflow_plan=workflow_plan,
                 called_tools=called_tools,
@@ -4166,7 +5328,7 @@ class LLMBridge:
             self.last_tools_used = list(tools_used)
         self._emit_routing_signals(
             last_user, selected_categories, model_override,
-            model_reason, tools_used, conversation_id or "default",
+            model_reason, tools_used, sorted(tools_failed), conversation_id or "default",
         )
         self._record_workflow_outcome(
             task_text=last_user,
@@ -4183,10 +5345,27 @@ class LLMBridge:
             conversation_id=conversation_id or "default",
             error=replay_error,
         )
+        fallback_response = ""
+        should_attempt_fallback = bool(
+            workflow_failed
+            or workflow_error
+            or (workflow_plan and int(workflow_plan.get("forced_steps", 0) or 0) > 0)
+        )
+        if should_attempt_fallback:
+            fallback_response = await self._attempt_tool_limit_fallback_completion(
+                system_prompt=system_prompt,
+                history_ref=working_history,
+                model_override=model_override,
+                generation_config=effective_generation_config,
+                conversation_id=conversation_id or "default",
+                fallback_reason=workflow_error or str(workflow_plan.get("abandon_reason") or ""),
+            )
         self._active_workflow_plan = dict(workflow_plan)
-        if str(workflow_error or "").startswith("no_progress_tool_loop"):
-            return "Tool loop made no progress; aborted safely. Please rephrase or narrow the request."
-        return "Tool call limit reached; unable to complete the request."
+        if fallback_response:
+            if persist_history:
+                self.history = working_history
+            return fallback_response
+        return self._final_failure_response(workflow_error)
 
     async def parse_structured(
         self,

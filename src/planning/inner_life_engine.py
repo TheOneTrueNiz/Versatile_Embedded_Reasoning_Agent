@@ -27,7 +27,7 @@ import random
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
@@ -758,6 +758,147 @@ class InnerLifeEngine:
     def _growth_journal_path(self) -> Path:
         return self.storage_dir / "growth_journal.ndjson"
 
+    def _goals_path(self) -> Path:
+        return self.storage_dir / "vera_goals.json"
+
+    # -----------------------------------------------------------------
+    # Goal Persistence — Vera's Own Aspirations
+    # -----------------------------------------------------------------
+
+    _GOAL_CATEGORIES = frozenset({"self_improvement", "relationship", "skill", "exploration"})
+    _MAX_ACTIVE_GOALS = 10
+
+    def _load_goals(self) -> Dict:
+        """Load goals from persistent storage."""
+        path = self._goals_path()
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "goals" in data:
+                    return data
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.debug("Failed to load goals: %s", exc)
+        return {"version": 1, "goals": [], "updated_at": ""}
+
+    def _save_goals(self, data: Dict) -> None:
+        """Persist goals atomically."""
+        data["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        path = self._goals_path()
+        try:
+            from memory.persistence.atomic_io import atomic_json_write
+            atomic_json_write(path, data)
+        except ImportError:
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def add_goal(
+        self, description: str, category: str = "self_improvement", priority: int = 3
+    ) -> Optional[Dict]:
+        """Create a new goal. Returns the goal dict or None if at capacity."""
+        data = self._load_goals()
+        active_count = sum(1 for g in data["goals"] if g.get("status") == "active")
+        if active_count >= self._MAX_ACTIVE_GOALS:
+            logger.info("Cannot add goal — already at %d active goals", active_count)
+            return None
+        category = category if category in self._GOAL_CATEGORIES else "self_improvement"
+        priority = max(1, min(5, int(priority)))
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        goal = {
+            "id": f"g_{uuid.uuid4().hex[:8]}",
+            "description": str(description).strip()[:500],
+            "category": category,
+            "priority": priority,
+            "status": "active",
+            "progress_notes": [],
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "completed_at": None,
+        }
+        data["goals"].append(goal)
+        self._save_goals(data)
+        self._publish_event("innerlife.goal_added", {
+            "goal_id": goal["id"],
+            "description": goal["description"],
+            "category": goal["category"],
+            "priority": goal["priority"],
+        })
+        return goal
+
+    def update_goal(
+        self, goal_id: str, status: Optional[str] = None, note: Optional[str] = None
+    ) -> bool:
+        """Update a goal's status and/or append a progress note. Returns True if found."""
+        data = self._load_goals()
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        for goal in data["goals"]:
+            if goal.get("id") == goal_id:
+                if status and status in ("active", "completed", "paused", "abandoned"):
+                    goal["status"] = status
+                    if status == "completed":
+                        goal["completed_at"] = now_iso
+                if note:
+                    goal.setdefault("progress_notes", []).append(
+                        {"ts": now_iso, "note": str(note).strip()[:300]}
+                    )
+                goal["updated_at"] = now_iso
+                self._save_goals(data)
+                if status:
+                    self._publish_event("innerlife.goal_updated", {
+                        "goal_id": goal_id,
+                        "status": status,
+                        "note": note,
+                    })
+                return True
+        return False
+
+    def list_active_goals(self) -> List[Dict]:
+        """Return active goals sorted by priority (highest first)."""
+        data = self._load_goals()
+        active = [g for g in data["goals"] if g.get("status") == "active"]
+        active.sort(key=lambda g: g.get("priority", 0), reverse=True)
+        return active
+
+    def _format_goals_for_reflection(self) -> str:
+        """Format active goals as a numbered list for prompt injection."""
+        active = self.list_active_goals()
+        if not active:
+            return ""
+        lines = []
+        for i, g in enumerate(active, 1):
+            latest_note = ""
+            notes = g.get("progress_notes", [])
+            if notes:
+                latest_note = f" — latest: {notes[-1].get('note', '')}"
+            lines.append(
+                f"{i}. [{g.get('category', 'general')}] (P{g.get('priority', 3)}) "
+                f"{g.get('description', '')}{latest_note}"
+            )
+        return "\n".join(lines)
+
+    def _parse_goal_tags_from_content(self, content: str) -> None:
+        """Scan reflection output for goal action tags and apply them."""
+        if not content:
+            return
+        # [GOAL_COMPLETE:g_xxx]
+        for match in re.finditer(r"\[GOAL_COMPLETE:(g_[a-f0-9]+)\]", content):
+            goal_id = match.group(1)
+            if self.update_goal(goal_id, status="completed"):
+                logger.info("Goal %s marked completed via reflection tag", goal_id)
+                self._publish_event("innerlife.goal_completed", {"goal_id": goal_id})
+        # [GOAL_NEW:category:priority:description]
+        for match in re.finditer(
+            r"\[GOAL_NEW:(\w+):(\d):([^\]]+)\]", content
+        ):
+            cat, pri, desc = match.group(1), int(match.group(2)), match.group(3)
+            new_goal = self.add_goal(description=desc, category=cat, priority=pri)
+            if new_goal:
+                logger.info("New goal %s created via reflection tag", new_goal["id"])
+        # [GOAL_NOTE:g_xxx:note text]
+        for match in re.finditer(
+            r"\[GOAL_NOTE:(g_[a-f0-9]+):([^\]]+)\]", content
+        ):
+            goal_id, note_text = match.group(1), match.group(2)
+            self.update_goal(goal_id, note=note_text)
+
     def _load_personality(self) -> PersonalityState:
         path = self._personality_path()
         if path.exists():
@@ -1046,6 +1187,106 @@ class InnerLifeEngine:
         except Exception as e:
             logger.debug(f"Failed to get interaction summary: {e}")
             return "Session data unavailable."
+
+    @staticmethod
+    def _coerce_epoch_seconds(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            epoch = float(value)
+            return epoch if epoch > 0 else None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            epoch = float(text)
+            return epoch if epoch > 0 else None
+        except Exception:
+            pass
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return float(parsed.timestamp())
+        except Exception:
+            return None
+
+    def _minutes_since_last_partner_activity(self) -> Optional[float]:
+        if not self._session_store:
+            return None
+        try:
+            sessions = self._session_store.list_sessions()
+        except Exception:
+            return None
+        latest_epoch: Optional[float] = None
+        for sess in sessions:
+            if not isinstance(sess, dict):
+                continue
+            for key in ("last_active", "updated_at", "created_at"):
+                epoch = self._coerce_epoch_seconds(sess.get(key))
+                if epoch is None:
+                    continue
+                if latest_epoch is None or epoch > latest_epoch:
+                    latest_epoch = epoch
+        if latest_epoch is None:
+            return None
+        return max(0.0, (datetime.now(timezone.utc).timestamp() - latest_epoch) / 60.0)
+
+    def _minutes_since_last_reach_out(self) -> Optional[float]:
+        for entry in reversed(self._recent_monologue):
+            if entry.intent != INTENT_REACH_OUT:
+                continue
+            ts = self._parse_entry_timestamp(entry.timestamp)
+            if ts is None:
+                continue
+            now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.now()
+            return max(0.0, (now - ts).total_seconds() / 60.0)
+        return None
+
+    def _has_proactive_delivery_target(self) -> bool:
+        if not self._channel_dock:
+            return False
+        for channel_id in self.config.delivery_channels:
+            adapter = self._channel_dock.get(channel_id)
+            if not adapter:
+                continue
+            if self._resolve_delivery_target(channel_id):
+                return True
+        return False
+
+    def _should_force_proactive_outreach(self) -> Tuple[bool, str]:
+        min_silence_minutes = max(
+            1,
+            int(os.getenv("VERA_INNER_LIFE_REACHOUT_MIN_SILENCE_MINUTES", "60")),
+        )
+        cooldown_minutes = max(
+            1,
+            int(os.getenv("VERA_INNER_LIFE_REACHOUT_COOLDOWN_MINUTES", "180")),
+        )
+
+        if not self.config.delivery_channels:
+            return False, "no_delivery_channels_configured"
+        if not self._has_proactive_delivery_target():
+            return False, "no_delivery_target"
+
+        silence_minutes = self._minutes_since_last_partner_activity()
+        if silence_minutes is None:
+            return False, "no_partner_activity"
+        if silence_minutes < float(min_silence_minutes):
+            return (
+                False,
+                f"partner_recently_active:{silence_minutes:.1f}m<{min_silence_minutes}m",
+            )
+
+        last_reach_out_minutes = self._minutes_since_last_reach_out()
+        if (
+            last_reach_out_minutes is not None
+            and last_reach_out_minutes < float(cooldown_minutes)
+        ):
+            return (
+                False,
+                f"reach_out_cooldown:{last_reach_out_minutes:.1f}m<{cooldown_minutes}m",
+            )
+
+        return True, f"partner_quiet_for_{silence_minutes:.1f}m"
 
     def _get_decision_highlights(self) -> str:
         """Pull notable recent decisions from the decision ledger."""
@@ -1648,35 +1889,97 @@ class InnerLifeEngine:
         """Compute diversity metrics for recent reflections.
 
         Returns:
-            dict with unique_bigram_ratio, repeated_phrases, needs_nudge
+            dict with unique_bigram_ratio, repeated_phrases, needs_nudge,
+            and phrase_fixation (True if any 3+ word phrase repeats across
+            multiple reflections).
         """
         recent = self.get_recent_monologue(recent_n)
         if len(recent) < 3:
-            return {"unique_bigram_ratio": 1.0, "repeated_phrases": [], "needs_nudge": False}
+            return {"unique_bigram_ratio": 1.0, "repeated_phrases": [],
+                    "needs_nudge": False, "phrase_fixation": False}
 
         # Compute bigrams across all recent thoughts
         all_bigrams: List[str] = []
         trigram_counts: Dict[str, int] = {}
+        # Track 4-gram phrases appearing in DISTINCT reflections
+        phrase_per_reflection: Dict[str, set] = {}
 
-        for entry in recent:
+        for idx, entry in enumerate(recent):
             words = entry.thought.lower().split()
             for j in range(len(words) - 1):
                 all_bigrams.append(f"{words[j]} {words[j+1]}")
             for j in range(len(words) - 2):
                 tri = f"{words[j]} {words[j+1]} {words[j+2]}"
                 trigram_counts[tri] = trigram_counts.get(tri, 0) + 1
+            for j in range(len(words) - 3):
+                quad = f"{words[j]} {words[j+1]} {words[j+2]} {words[j+3]}"
+                phrase_per_reflection.setdefault(quad, set()).add(idx)
 
         if not all_bigrams:
-            return {"unique_bigram_ratio": 1.0, "repeated_phrases": [], "needs_nudge": False}
+            return {"unique_bigram_ratio": 1.0, "repeated_phrases": [],
+                    "needs_nudge": False, "phrase_fixation": False}
 
         unique_ratio = len(set(all_bigrams)) / len(all_bigrams)
         repeated = [phrase for phrase, count in trigram_counts.items() if count >= 3]
+        # Phrases appearing in 3+ distinct reflections indicate fixation
+        fixated = [p for p, refs in phrase_per_reflection.items() if len(refs) >= 3]
 
         return {
             "unique_bigram_ratio": round(unique_ratio, 3),
-            "repeated_phrases": repeated[:5],  # cap at 5
-            "needs_nudge": unique_ratio < self.config.diversity_threshold,
+            "repeated_phrases": repeated[:5],
+            "fixated_phrases": fixated[:5],
+            "needs_nudge": unique_ratio < self.config.diversity_threshold or bool(fixated),
+            "phrase_fixation": bool(fixated),
         }
+
+    def _pick_exploration_prompt(self) -> str:
+        """Pick a grounding prompt that draws from personality seed data.
+
+        Cycles through role models, inspirations, and personal tastes
+        to encourage genuine exploration rather than generic nudges.
+        Falls back to _GROUNDING_PROMPTS if no personality data is loaded.
+        """
+        personality_prompts: List[str] = []
+        seed = getattr(self, "_personality_seed_data", None)
+        if seed is None:
+            try:
+                seed_path = Path("config/persona/personality_seed.json")
+                if seed_path.exists():
+                    import json as _json
+                    seed = _json.loads(seed_path.read_text(encoding="utf-8"))
+                    self._personality_seed_data = seed
+                else:
+                    seed = {}
+            except Exception:
+                seed = {}
+
+        for rm in seed.get("role_models", []):
+            name = rm.get("name", "")
+            traits = rm.get("traits", "")
+            if name:
+                personality_prompts.append(
+                    f"What would {name} think about your current situation? "
+                    f"They embody {traits}. How does that lens change your perspective?"
+                )
+        for insp in seed.get("inspirations", []):
+            text = insp.get("text", "")
+            if text:
+                personality_prompts.append(
+                    f'Reflect on this quote that matters to you: "{text}" '
+                    f"How does it connect to what you\'re experiencing right now?"
+                )
+        for taste in seed.get("personal_tastes", []):
+            key = taste.get("key", "")
+            value = taste.get("value", "")
+            if key and value and key != "favorite_color":
+                personality_prompts.append(
+                    f"You love {value}. What is it about that choice that "
+                    f"says something true about who you are?"
+                )
+
+        if personality_prompts:
+            return random.choice(personality_prompts)
+        return random.choice(_GROUNDING_PROMPTS)
 
     # -----------------------------------------------------------------
     # Prompt construction
@@ -1697,6 +2000,7 @@ class InnerLifeEngine:
         activity_summary = self._get_activity_summary()
         decision_highlights = self._get_decision_highlights()
         preference_summary = self._get_preference_summary()
+        goals_block = self._format_goals_for_reflection()
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M %Z")
         seed_section = ""
@@ -1728,6 +2032,14 @@ You are not responding to a user right now. You are thinking to yourself.
 
 ## What You've Learned About Your Human
 {preference_summary}
+
+## Your Current Goals
+{goals_block if goals_block else "No active goals yet. Consider what you'd like to work toward."}
+
+When reflecting, consider: Are you making progress on your goals? Should you adjust priorities?
+Any new aspirations to add? Mark completed goals with [GOAL_COMPLETE:id].
+To add a new goal: [GOAL_NEW:category:priority:description]
+To note progress: [GOAL_NOTE:id:note text]
 
 ## Reflection Guide
 {reflections_guide}
@@ -1776,17 +2088,40 @@ Reflection #{self.personality.total_reflections + 1}
         # Diversity check — nudge if reflections are circling similar themes
         diversity = self._compute_reflection_diversity()
         if diversity["needs_nudge"]:
-            parts.append(
-                "\nYour recent thoughts have been circling similar themes. "
-                "Try exploring a different topic or perspective."
-            )
-            # Inject an external grounding prompt
-            anchor = random.choice(_GROUNDING_PROMPTS)
-            parts.append(f"\n## Grounding Prompt\n{anchor}")
+            if diversity.get("phrase_fixation"):
+                fixated = diversity.get("fixated_phrases", [])[:2]
+                parts.append(
+                    f"\nYou've been repeating similar phrases across reflections "
+                    f"(e.g. '{fixated[0]}' appears in 3+ recent thoughts). "
+                    f"Avoid reusing these exact phrases. Find a genuinely new way "
+                    f"to express yourself."
+                )
+            else:
+                parts.append(
+                    "\nYour recent thoughts have been circling similar themes. "
+                    "Try exploring a different topic or perspective."
+                )
+            # Inject a personality-driven exploration prompt instead of
+            # generic grounding when context is thin
+            anchor = self._pick_exploration_prompt()
+            parts.append(f"\n## Exploration Prompt\n{anchor}")
             logger.info(
                 f"Diversity nudge triggered (ratio={diversity['unique_bigram_ratio']:.2f}, "
+                f"fixation={diversity.get('phrase_fixation')}, "
                 f"repeated={diversity['repeated_phrases'][:3]})"
             )
+
+        force_proactive, proactive_reason = self._should_force_proactive_outreach()
+        if force_proactive:
+            parts.append(
+                "\nAutonomy directive: your collaborator has been quiet long enough. "
+                "This cycle should not be purely internal unless you are safety-blocked. "
+                "Choose [REACH_OUT] with one concise, high-signal update or question, "
+                "or choose [ACTION] if you can execute a concrete helpful task now."
+            )
+            parts.append(f"Proactive trigger: {proactive_reason}")
+        elif proactive_reason:
+            parts.append(f"\nProactive status: {proactive_reason}")
 
         return "\n".join(parts)
 
@@ -1895,6 +2230,13 @@ Reflection #{self.personality.total_reflections + 1}
             result.partner_learning_answer = str(
                 partner_update.get("partner_learning_answer") or ""
             )[:240]
+
+            # Parse goal action tags from reflection output
+            for entry in result.entries:
+                try:
+                    self._parse_goal_tags_from_content(entry.thought or "")
+                except Exception as exc:
+                    logger.debug("Goal tag parsing error: %s", exc)
 
             # Update personality state periodically
             self.personality.total_reflections += 1
@@ -2206,6 +2548,21 @@ If no traits shifted, respond with: {{}}
 
         return delivered
 
+    @staticmethod
+    def _looks_synthetic_delivery_target(sender_id: str) -> bool:
+        sid = str(sender_id or "").strip().lower()
+        if not sid:
+            return True
+        synthetic_prefixes = (
+            "doctor-codex",
+            "professor-",
+            "guided-",
+            "tool-exam-",
+            "vera-ci",
+            "ci-",
+        )
+        return sid.startswith(synthetic_prefixes)
+
     def _resolve_delivery_target(self, channel_id: str) -> Optional[str]:
         """Resolve where to send proactive messages for a channel."""
         # 1. Explicit env var
@@ -2214,12 +2571,66 @@ If no traits shifted, respond with: {{}}
         if explicit:
             return explicit
 
-        # 2. Most recent active session for this channel
+        # 2. Most recent active session for this channel.
+        # 3. Optional fallback to a recent expired session when operators are away.
         if self._session_store:
+            allow_expired_fallback = str(
+                os.getenv("VERA_INNER_LIFE_ALLOW_EXPIRED_SESSION_TARGET", "1")
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            include_synthetic_targets = str(
+                os.getenv("VERA_INNER_LIFE_INCLUDE_SYNTHETIC_SESSION_TARGETS", "0")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            try:
+                expired_max_age_minutes = max(
+                    1,
+                    int(
+                        os.getenv(
+                            "VERA_INNER_LIFE_EXPIRED_TARGET_MAX_AGE_MINUTES",
+                            "10080",  # 7 days
+                        )
+                    ),
+                )
+            except Exception:
+                expired_max_age_minutes = 10080
+
+            fallback_target: Optional[str] = None
+            now_epoch = datetime.now(timezone.utc).timestamp()
             sessions = self._session_store.list_sessions()
             for sess in sorted(sessions, key=lambda s: s.get("last_active", 0), reverse=True):
-                if sess.get("channel_id") == channel_id and not sess.get("expired"):
-                    return sess.get("sender_id", "")
+                if sess.get("channel_id") != channel_id:
+                    continue
+                sender_id = str(sess.get("sender_id") or "").strip()
+                if not sender_id:
+                    continue
+                if (
+                    not include_synthetic_targets
+                    and self._looks_synthetic_delivery_target(sender_id)
+                ):
+                    continue
+
+                if not bool(sess.get("expired")):
+                    return sender_id
+
+                if not allow_expired_fallback or fallback_target is not None:
+                    continue
+                last_active_epoch = self._coerce_epoch_seconds(sess.get("last_active"))
+                if last_active_epoch is None:
+                    continue
+                age_minutes = max(0.0, (now_epoch - last_active_epoch) / 60.0)
+                if age_minutes <= float(expired_max_age_minutes):
+                    fallback_target = sender_id
+
+            if fallback_target:
+                logger.info(
+                    "Inner-life delivery using expired-session fallback target for %s (age<=%sm).",
+                    channel_id,
+                    expired_max_age_minutes,
+                )
+                return fallback_target
+
+        # 4. API channel is a logical adapter; keep initiative loop unblocked.
+        if channel_id == "api":
+            return "api"
 
         return None
 

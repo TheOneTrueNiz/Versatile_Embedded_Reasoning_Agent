@@ -770,7 +770,7 @@ Please analyze this task and provide your assessment following the output format
         temperature = AGENT_TEMPERATURES.get(agent_name, DEFAULT_TEMPERATURE)
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     headers=self._build_headers(),
@@ -865,7 +865,7 @@ Agent Analyses:
 Please synthesize these perspectives and provide a final recommendation."""
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     headers=self._build_headers(),

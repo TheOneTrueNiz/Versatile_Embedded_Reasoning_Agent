@@ -754,7 +754,8 @@ class MCPConnection:
             self._send_notification("notifications/initialized", {})
             notified = True
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("MCP initialization handshake failed: %s", exc)
             return False
         finally:
             if not notified:
@@ -1119,7 +1120,8 @@ class MCPOrchestrator:
                 try:
                     pgid = os.getpgid(process.pid)
                     os.killpg(pgid, signal.SIGTERM)
-                except Exception:
+                except Exception as exc:
+                    logger.debug("killpg SIGTERM failed (%s), falling back to terminate()", exc)
                     process.terminate()
             else:
                 process.terminate()
@@ -1134,7 +1136,8 @@ class MCPOrchestrator:
                     try:
                         pgid = os.getpgid(process.pid)
                         os.killpg(pgid, signal.SIGKILL)
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("killpg SIGKILL failed (%s), falling back to kill()", exc)
                         process.kill()
                 else:
                     process.kill()
@@ -1189,7 +1192,11 @@ class MCPOrchestrator:
         if server_name in self.connections:
             del self.connections[server_name]
         if server_name in self._stderr_threads:
-            del self._stderr_threads[server_name]
+            thread = self._stderr_threads.pop(server_name)
+            try:
+                thread.join(timeout=2)
+            except Exception:
+                pass  # Thread may already be dead
 
     def _stream_stderr(self, server_name: str, stream, log_path: Path) -> None:
         """Stream MCP stderr to a log file for diagnostics."""

@@ -7,6 +7,7 @@ Ported from Moltbot's session store pattern with file-based persistence.
 """
 
 import logging
+import secrets
 import time
 import uuid
 from pathlib import Path
@@ -145,7 +146,7 @@ class SessionStore:
             return existing
 
         # Create new session
-        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        session_id = f"sess_{secrets.token_urlsafe(32)}"
         transcript_path = str(
             self._storage_dir / f"{self._sanitize_key(canonical_key)}.jsonl"
         )

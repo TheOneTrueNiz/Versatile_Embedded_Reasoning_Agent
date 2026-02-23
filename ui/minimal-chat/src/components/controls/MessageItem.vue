@@ -304,8 +304,30 @@ async function deleteMessage(content) {
     saveMessagesHandler();
 }
 
+const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'm4v', 'avi', 'mkv']);
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif']);
+const VIDEO_URL_HINTS = [
+    'vidgen.x.ai',
+    '/xai-vidgen',
+    'xai-video-',
+    'grok-imagine-video',
+    'generated video',
+    'video url'
+];
+const IMAGE_URL_HINTS = [
+    'imgen.x.ai',
+    '/xai-imgen',
+    'xai-tmp-imgen-',
+    'grok-imagine-image',
+    'generated image',
+    'image url',
+    'download image'
+];
+const URL_REGEX = /https?:\/\/[^\s<>()`"']+/gi;
+
 const md = new MarkdownIt({
     breaks: true,
+    linkify: true,
     highlight: (str, lang) => {
         if (lang && hljs.getLanguage(lang)) {
             return hljs.highlight(str, { language: lang }).value;
@@ -313,6 +335,225 @@ const md = new MarkdownIt({
         return hljs.highlightAuto(str).value;
     },
 });
+
+function escapeHtmlAttribute(value) {
+    return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function escapeHtmlText(value) {
+    return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function normalizeMediaUrl(url) {
+    let normalized = String(url || '').trim();
+    if (!normalized) return '';
+    normalized = normalized.replace(/^`+|`+$/g, '');
+    normalized = normalized.replace(/^[<([{"']+/, '');
+    normalized = normalized.replace(/[>\])}"',.;:!?]+$/g, '');
+    return normalized.trim();
+}
+
+function extractUrlsFromText(text) {
+    if (!text || typeof text !== 'string') return [];
+    const matches = text.match(URL_REGEX);
+    if (!matches) return [];
+    const unique = new Set();
+    matches.forEach((entry) => {
+        const normalized = normalizeMediaUrl(entry);
+        if (normalized) unique.add(normalized);
+    });
+    return Array.from(unique);
+}
+
+function getPathnameFromUrl(url) {
+    const normalizedUrl = normalizeMediaUrl(url);
+    if (!normalizedUrl) return '';
+    try {
+        const parsed = new URL(normalizedUrl, window.location.origin);
+        return parsed.pathname || '';
+    } catch {
+        return normalizedUrl;
+    }
+}
+
+function getMediaTypeFromUrl(url, contextText = '') {
+    const normalizedUrl = normalizeMediaUrl(url);
+    if (!normalizedUrl) return null;
+
+    const pathname = getPathnameFromUrl(url);
+    const segment = pathname.split('/').pop() || '';
+    const ext = segment.includes('.') ? segment.split('.').pop().toLowerCase() : '';
+    if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+    if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+
+    const haystack = `${normalizedUrl} ${contextText || ''}`.toLowerCase();
+    if (VIDEO_URL_HINTS.some((hint) => haystack.includes(hint))) return 'video';
+    if (IMAGE_URL_HINTS.some((hint) => haystack.includes(hint))) return 'image';
+
+    return null;
+}
+
+function getDownloadFileName(url, mediaType = 'media') {
+    const normalizedUrl = normalizeMediaUrl(url);
+    const pathname = getPathnameFromUrl(url);
+    const segment = (pathname.split('/').pop() || '').trim();
+    if (segment) {
+        if (!segment.includes('.') && mediaType === 'video') {
+            return `${segment}.mp4`;
+        }
+        if (!segment.includes('.') && mediaType === 'image') {
+            return `${segment}.png`;
+        }
+        return segment;
+    }
+    if (normalizedUrl) {
+        const fallbackId = normalizedUrl.split('/').pop() || '';
+        if (fallbackId) return fallbackId;
+    }
+    return mediaType === 'video' ? 'generated-video.mp4' : 'generated-image.png';
+}
+
+function createMediaCardMarkup(url, mediaType, index = 1) {
+    const normalizedUrl = normalizeMediaUrl(url);
+    const escapedUrl = escapeHtmlAttribute(normalizedUrl);
+    const escapedPath = escapeHtmlText(normalizedUrl);
+    const fileName = escapeHtmlAttribute(getDownloadFileName(url, mediaType));
+    const isVideo = mediaType === 'video';
+    const label = isVideo ? 'Video' : 'Image';
+    const mediaElement = isVideo
+        ? `<video class="generated-media generated-video" controls preload="metadata" src="${escapedUrl}"></video>`
+        : `<img class="generated-media generated-image" src="${escapedUrl}" alt="Generated ${label} ${index}" loading="lazy" decoding="async" />`;
+
+    return `
+        <div class="generated-media-card ${isVideo ? 'video-card' : 'image-card'}">
+            ${mediaElement}
+            <div class="generated-media-actions">
+                <button type="button"
+                    class="media-download-button"
+                    data-download-url="${escapedUrl}"
+                    data-download-filename="${fileName}"
+                    data-media-type="${isVideo ? 'video' : 'image'}">
+                    Download ${label}
+                </button>
+                <a class="media-open-link" href="${escapedUrl}" target="_blank" rel="noopener noreferrer">
+                    Open
+                </a>
+            </div>
+            <div class="generated-media-path">Download path: <span class="path-value">${escapedPath}</span></div>
+        </div>
+    `.trim();
+}
+
+function replaceNodeWithMediaCard(node, mediaUrl, mediaType, index, documentRef) {
+    const wrapper = documentRef.createElement('div');
+    wrapper.innerHTML = createMediaCardMarkup(mediaUrl, mediaType, index);
+    const card = wrapper.firstElementChild;
+    if (!card) return;
+
+    const parent = node.parentElement;
+    if (parent && parent.tagName.toLowerCase() === 'p' && parent.childNodes.length === 1) {
+        parent.replaceWith(card);
+    } else {
+        node.replaceWith(card);
+    }
+}
+
+function enhanceRenderedMedia(renderedHtml) {
+    if (!renderedHtml || typeof window === 'undefined' || typeof DOMParser === 'undefined') {
+        return renderedHtml;
+    }
+
+    const parser = new DOMParser();
+    const documentRef = parser.parseFromString(`<div class="media-render-root">${renderedHtml}</div>`, 'text/html');
+    const root = documentRef.body.firstElementChild;
+    if (!root) return renderedHtml;
+
+    let imageIndex = 0;
+    let videoIndex = 0;
+
+    const links = Array.from(root.querySelectorAll('a[href]'));
+    links.forEach((link) => {
+        if (link.closest('.generated-media-card')) return;
+        const href = link.getAttribute('href') || '';
+        const mediaType = getMediaTypeFromUrl(href, `${link.textContent || ''} ${link.getAttribute('title') || ''}`);
+        if (!mediaType) return;
+
+        if (mediaType === 'video') {
+            videoIndex += 1;
+            replaceNodeWithMediaCard(link, href, mediaType, videoIndex, documentRef);
+            return;
+        }
+
+        imageIndex += 1;
+        replaceNodeWithMediaCard(link, href, mediaType, imageIndex, documentRef);
+    });
+
+    const images = Array.from(root.querySelectorAll('img'));
+    images.forEach((img) => {
+        if (img.closest('.generated-media-card')) return;
+        const src = img.getAttribute('src') || '';
+        if (!src) return;
+        imageIndex += 1;
+        replaceNodeWithMediaCard(img, src, 'image', imageIndex, documentRef);
+    });
+
+    const codeBlocks = Array.from(root.querySelectorAll('code'));
+    codeBlocks.forEach((codeBlock) => {
+        if (codeBlock.closest('.generated-media-card')) return;
+        const urls = extractUrlsFromText(codeBlock.textContent || '');
+        if (urls.length === 0) return;
+
+        const mediaUrl = urls[0];
+        const mediaType = getMediaTypeFromUrl(mediaUrl, codeBlock.parentElement?.textContent || '');
+        if (!mediaType) return;
+
+        if (mediaType === 'video') {
+            videoIndex += 1;
+            replaceNodeWithMediaCard(codeBlock, mediaUrl, mediaType, videoIndex, documentRef);
+        } else {
+            imageIndex += 1;
+            replaceNodeWithMediaCard(codeBlock, mediaUrl, mediaType, imageIndex, documentRef);
+        }
+    });
+
+    const plainTextBlocks = Array.from(root.querySelectorAll('p, li'));
+    plainTextBlocks.forEach((block) => {
+        if (block.closest('.generated-media-card')) return;
+        if (block.querySelector('a, img, video, code')) return;
+
+        const rawText = block.textContent || '';
+        const urls = extractUrlsFromText(rawText);
+        if (urls.length === 0) return;
+
+        const cards = [];
+        urls.forEach((mediaUrl) => {
+            const mediaType = getMediaTypeFromUrl(mediaUrl, rawText);
+            if (!mediaType) return;
+            if (mediaType === 'video') {
+                videoIndex += 1;
+                cards.push(createMediaCardMarkup(mediaUrl, mediaType, videoIndex));
+            } else {
+                imageIndex += 1;
+                cards.push(createMediaCardMarkup(mediaUrl, mediaType, imageIndex));
+            }
+        });
+
+        if (cards.length === 0) return;
+        const wrapper = documentRef.createElement('div');
+        wrapper.className = 'generated-media-stack';
+        wrapper.innerHTML = cards.join('');
+        block.after(wrapper);
+    });
+
+    return root.innerHTML;
+}
 
 function formatMessage(content) {
     let combinedContent = '';
@@ -352,7 +593,58 @@ function formatMessage(content) {
         combinedContent = content;
     }
 
-    return md.render(combinedContent);
+    const rendered = md.render(combinedContent);
+    return enhanceRenderedMedia(rendered);
+}
+
+async function downloadMediaAsset(mediaUrl, desiredFileName, mediaType = 'media') {
+    const fileName = desiredFileName || getDownloadFileName(mediaUrl, mediaType);
+    try {
+        const response = await fetch(mediaUrl, { mode: 'cors' });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = objectUrl;
+        anchor.download = fileName;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        URL.revokeObjectURL(objectUrl);
+        showToast(`${mediaType === 'video' ? 'Video' : 'Image'} downloaded.`);
+        return;
+    } catch (error) {
+        console.warn('Direct media download failed; falling back to open link.', error);
+    }
+
+    const fallbackAnchor = document.createElement('a');
+    fallbackAnchor.href = mediaUrl;
+    fallbackAnchor.target = '_blank';
+    fallbackAnchor.rel = 'noopener noreferrer';
+    fallbackAnchor.download = fileName;
+    document.body.appendChild(fallbackAnchor);
+    fallbackAnchor.click();
+    fallbackAnchor.remove();
+    showToast('Opened media link. Use Save As if download is blocked.');
+}
+
+function handleMessageContentClick(event) {
+    const target = event?.target?.closest?.('.media-download-button');
+    if (!target) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const mediaUrl = target.getAttribute('data-download-url');
+    if (!mediaUrl) {
+        showToast('Missing media URL.');
+        return;
+    }
+
+    const fileName = target.getAttribute('data-download-filename') || '';
+    const mediaType = target.getAttribute('data-media-type') || 'media';
+    void downloadMediaAsset(mediaUrl, fileName, mediaType);
 }
 
 const menu = ref(null);
@@ -548,13 +840,14 @@ const menuItems = computed(() => {
             <div class="message-contents" :id="'message-' + item.id"
                 v-show="!hasFile && !hasImage"
                 :contenteditable="isEditing" @dblclick="editMessage(item)" @blur="saveEditedMessage(item, $event)"
+                @click="handleMessageContentClick"
                 v-html="formatMessage(item.content)">
             </div>
             
             <!-- Non-image file messages -->
             <div class="message-contents file-content" :id="'message-' + item.id"
                 v-show="hasFile" :contenteditable="isEditing"
-                @dblclick="editMessage(item)" @blur="saveEditedMessage(item, $event)">
+                @dblclick="editMessage(item)" @blur="saveEditedMessage(item, $event)" @click="handleMessageContentClick">
                 <div class="file-info-display">
                     <Link class="file-icon" size="18" />
                     <span class="file-name">{{ extractFileName(item?.content[0]?.text) }}</span>
@@ -564,7 +857,7 @@ const menuItems = computed(() => {
             <!-- Image messages -->
             <div class="message-contents" :id="'message-' + item.id"
                 v-show="hasImage" :contenteditable="isEditing"
-                @dblclick="editMessage(item)" @blur="saveEditedMessage(item, $event)">
+                @dblclick="editMessage(item)" @blur="saveEditedMessage(item, $event)" @click="handleMessageContentClick">
                 <div class="file-info-display image-info" v-if="hasImageName">
                     <FileCheck2 class="file-icon" size="18" />
                     <span class="file-name">{{ extractFileName(getTextContent(item?.content)) }}</span>
@@ -1102,6 +1395,64 @@ const menuItems = computed(() => {
             transform: scale(1.01);
         }
     }
+}
+
+.generated-media-card {
+    background: color-mix(in srgb, var(--vera-panel-alt) 85%, transparent);
+    border: 1px solid color-mix(in srgb, var(--vera-accent) 20%, transparent);
+    border-radius: 12px;
+    padding: 10px;
+    margin: 10px 0;
+}
+
+.generated-media {
+    width: 100%;
+    max-width: 100%;
+    border-radius: 10px;
+    display: block;
+}
+
+.generated-video {
+    max-height: 460px;
+    background: #000;
+}
+
+.generated-media-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+    align-items: center;
+}
+
+.media-download-button,
+.media-open-link {
+    font-size: 0.82rem;
+    border-radius: 8px;
+    padding: 6px 10px;
+    border: 1px solid color-mix(in srgb, var(--vera-accent) 35%, transparent);
+    background: color-mix(in srgb, var(--vera-accent) 12%, transparent);
+    color: var(--vera-text);
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.15s ease, transform 0.12s ease;
+}
+
+.media-download-button:hover,
+.media-open-link:hover {
+    background: color-mix(in srgb, var(--vera-accent) 24%, transparent);
+    transform: translateY(-1px);
+}
+
+.generated-media-path {
+    margin-top: 8px;
+    font-size: 0.76rem;
+    color: var(--vera-text-muted);
+    word-break: break-all;
+}
+
+.generated-media-path .path-value {
+    color: var(--vera-text-soft, var(--vera-text));
 }
 
 // Inline Thinking Section Styles

@@ -145,6 +145,11 @@ class SelfImprovementRunner:
                     cmd.extend(["--limit", str(limit)])
                 base_url = params.get("base_url")
                 if base_url:
+                    # Only allow localhost URLs for regression testing
+                    from urllib.parse import urlparse as _urlparse
+                    parsed = _urlparse(str(base_url))
+                    if (parsed.hostname or "").lower() not in ("localhost", "127.0.0.1", "::1"):
+                        raise ValueError(f"base_url must be localhost, got: {parsed.hostname}")
                     cmd.extend(["--base-url", str(base_url)])
                 result = self._run_script(cmd, env=params.get("env"))
             elif action == "train_reward_model":
@@ -196,11 +201,27 @@ class SelfImprovementRunner:
     def _python_bin(self) -> str:
         return os.getenv("VERA_PYTHON_BIN", "python")
 
+    # Env keys that must never be overridden by API callers
+    _ENV_BLOCKLIST = frozenset({
+        "PATH", "HOME", "USER", "SHELL", "LOGNAME",
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+        "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+        "VERA_API_KEY", "VERA_LLM_BASE_URL", "VERA_LLM_API_KEY",
+        "XAI_API_KEY", "API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+        "GOOGLE_API_KEY", "GEMINI_API_KEY", "BRAVE_API_KEY",
+        "VERA_TRUSTED_PROXIES", "VERA_CORS_ORIGIN",
+    })
+
     def _run_script(self, command: list[str], env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         self._log(f"Running command: {' '.join(command)}")
         merged_env = os.environ.copy()
         if env:
-            merged_env.update({str(k): str(v) for k, v in env.items()})
+            for k, v in env.items():
+                key = str(k).strip()
+                if key.upper() in self._ENV_BLOCKLIST:
+                    self._log(f"Blocked env override for protected key: {key}")
+                    continue
+                merged_env[key] = str(v)
         completed = subprocess.run(
             command,
             capture_output=True,

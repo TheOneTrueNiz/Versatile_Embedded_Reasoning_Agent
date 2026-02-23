@@ -1039,6 +1039,226 @@ class ProactiveManager:
 
         return {"ok": True, "task_id": task.id, "status": status, "response_preview": (response_text or "")[:280]}
 
+    # -----------------------------------------------------------------
+    # Calendar Proactive Check
+    # -----------------------------------------------------------------
+
+    PROACTIVE_SAFE_TOOLS = frozenset({
+        # Time/info
+        "time", "calculate", "sequentialthinking",
+        # Search (read-only)
+        "search_wikipedia", "searxng_search", "brave_web_search",
+        # Memory (read-only)
+        "read_graph", "search_nodes",
+        # Calendar (read-only)
+        "get_events", "list_calendars",
+        # Notifications (outbound to owner only)
+        "send_native_push", "send_mobile_push",
+        # Filesystem (read-only)
+        "list_allowed_directories", "read_file",
+    })
+
+    async def _check_calendar_proactive(self) -> Optional[Dict[str, Any]]:
+        """Poll Google Calendar for upcoming events and alert if near."""
+        if os.getenv("VERA_CALENDAR_PROACTIVE", "0") != "1":
+            return None
+
+        # Rate limit: skip if polled < 30 min ago
+        state_path = self._memory_dir / "calendar_alerts_state.json"
+        state = safe_json_read(state_path, default={})
+        last_poll = _parse_iso_utc(str(state.get("last_poll_utc") or ""))
+        now_utc = _utc_now()
+        if last_poll and (now_utc - last_poll).total_seconds() < 1800:
+            return {"ok": True, "skipped": True, "reason": "cooldown_active"}
+
+        # Clear expired alerted event IDs daily
+        expiry = _parse_iso_utc(str(state.get("alerted_event_ids_expiry") or ""))
+        if not expiry or now_utc > expiry:
+            state["alerted_event_ids"] = []
+            state["alerted_event_ids_expiry"] = (
+                now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+                + timedelta(days=1)
+            ).isoformat().replace("+00:00", "Z")
+
+        alerted_ids = set(state.get("alerted_event_ids") or [])
+        lookahead = int(os.getenv("VERA_CALENDAR_LOOKAHEAD_MINUTES", "120"))
+        alert_minutes = int(os.getenv("VERA_CALENDAR_ALERT_MINUTES", "15"))
+
+        # Use process_messages to call get_events via the LLM
+        time_max = (now_utc + timedelta(minutes=lookahead)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        calendar_prompt = (
+            f"Check my calendar for events in the next {lookahead} minutes "
+            f"(up to {time_max}). Use the get_events tool with time_max='{time_max}' "
+            f"and max_results=10 and detailed=true. "
+            f"Return a JSON array of events with fields: id, summary, start_time (ISO), "
+            f"end_time (ISO), location. If no events, return an empty array []."
+        )
+
+        try:
+            response_text = await self._owner.process_messages(
+                messages=[{"role": "user", "content": calendar_prompt}],
+                conversation_id="autonomy:calendar_check",
+            )
+        except Exception as exc:
+            logger.debug("Calendar proactive check error: %s", exc)
+            return {"ok": False, "reason": "calendar_tool_unavailable", "error": str(exc)}
+
+        # Update poll timestamp
+        state["last_poll_utc"] = _utc_iso()
+
+        # Try to parse events from the response for near-term alerts
+        alerts_sent = []
+        try:
+            # Extract JSON array from response
+            text = str(response_text or "")
+            import re as _re
+            json_match = _re.search(r"\[.*\]", text, _re.DOTALL)
+            if json_match:
+                events = json.loads(json_match.group())
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    event_id = str(event.get("id") or event.get("summary") or "")
+                    if event_id in alerted_ids:
+                        continue
+                    start_str = str(event.get("start_time") or event.get("start") or "")
+                    start_dt = _parse_iso_utc(start_str)
+                    if start_dt and (start_dt - now_utc).total_seconds() <= alert_minutes * 60:
+                        summary = event.get("summary", "Upcoming event")
+                        minutes_away = max(0, int((start_dt - now_utc).total_seconds() / 60))
+                        alert_msg = f"Reminder: '{summary}' starts in {minutes_away} minutes."
+                        location = event.get("location")
+                        if location:
+                            alert_msg += f" Location: {location}"
+
+                        # Send notification via push
+                        try:
+                            await self._owner.process_messages(
+                                messages=[{"role": "user", "content": f"Send a push notification to my human: {alert_msg}"}],
+                                conversation_id="autonomy:calendar_alert",
+                            )
+                        except Exception:
+                            logger.debug("Calendar alert delivery failed for: %s", summary)
+
+                        alerted_ids.add(event_id)
+                        alerts_sent.append({"event_id": event_id, "summary": summary, "minutes_away": minutes_away})
+        except (json.JSONDecodeError, ValueError):
+            logger.debug("Could not parse calendar events from response")
+
+        state["alerted_event_ids"] = list(alerted_ids)
+        atomic_json_write(state_path, state)
+
+        bus = getattr(self._owner, "event_bus", None)
+        if bus:
+            try:
+                bus.publish("innerlife.calendar_check", payload={
+                    "alerts_sent": len(alerts_sent),
+                    "events_checked": True,
+                    "skipped": False,
+                }, source="proactive_manager")
+            except Exception:
+                logger.debug("Failed to publish calendar_check event")
+
+        return {
+            "ok": True,
+            "alerts_sent": alerts_sent,
+            "events_checked": True,
+        }
+
+    # -----------------------------------------------------------------
+    # Sentinel Recommendation Processing (Proactive Execution)
+    # -----------------------------------------------------------------
+
+    async def _process_sentinel_recommendations(self) -> Optional[Dict[str, Any]]:
+        """Check sentinel for pending recommendations and execute high-priority safe ones."""
+        if os.getenv("VERA_PROACTIVE_EXECUTION", "0") != "1":
+            return None
+
+        # Respect DND
+        if hasattr(self, "dnd") and not self.dnd.can_interrupt(InterruptUrgency.HIGH):
+            return {"skipped": True, "reason": "dnd_active"}
+
+        pending = self.sentinel.recommender.get_pending_recommendations()
+        if not pending:
+            return {"processed": 0, "pending": 0}
+
+        max_per_cycle = int(os.getenv("VERA_PROACTIVE_MAX_PER_CYCLE", "3"))
+        executed = []
+        notified = []
+        logged = []
+
+        for rec in pending[: max_per_cycle * 2]:
+            if rec.priority in (ActionPriority.URGENT, ActionPriority.HIGH):
+                # AUTO-EXECUTE via _execute_inner_action_workflow
+                # Set proactive tool whitelist on owner to constrain tool selection
+                try:
+                    self._owner._proactive_tool_whitelist = self.PROACTIVE_SAFE_TOOLS
+                    result = await self._execute_inner_action_workflow(
+                        action_text=rec.description,
+                        run_id=f"sentinel:{rec.action_id}",
+                    )
+                finally:
+                    self._owner._proactive_tool_whitelist = None
+                self.sentinel.recommender.mark_executed(rec.action_id)
+
+                # Log to decision ledger
+                if getattr(self, "decision_ledger", None):
+                    try:
+                        self.decision_ledger.log_decision(
+                            decision_type="PROACTIVE_EXECUTION",
+                            action=rec.description[:300],
+                            reasoning=f"Auto-executed sentinel recommendation {rec.action_id} (priority={rec.priority.name})",
+                            confidence=0.7,
+                            context={"action_id": rec.action_id, "priority": rec.priority.name},
+                        )
+                    except Exception:
+                        logger.debug("Suppressed decision ledger error in proactive execution")
+
+                executed.append({"action_id": rec.action_id, "result": result})
+
+            elif rec.priority == ActionPriority.NORMAL:
+                # NOTIFY via push or compose message
+                try:
+                    await self._owner.process_messages(
+                        messages=[{"role": "user", "content": (
+                            f"Send a push notification about this pending recommendation: "
+                            f"{rec.description[:300]}"
+                        )}],
+                        conversation_id=f"autonomy:sentinel_notify:{rec.action_id}",
+                    )
+                except Exception:
+                    logger.debug("Sentinel notification delivery failed for: %s", rec.action_id)
+                self.sentinel.recommender.acknowledge(rec.action_id)
+                notified.append(rec.action_id)
+
+            else:  # LOW, BACKGROUND
+                # LOG only
+                self.sentinel.recommender.acknowledge(rec.action_id)
+                logged.append(rec.action_id)
+
+            if len(executed) >= max_per_cycle:
+                break
+
+        bus = getattr(self._owner, "event_bus", None)
+        if bus:
+            try:
+                bus.publish("innerlife.proactive_execution", payload={
+                    "processed": len(executed) + len(notified) + len(logged),
+                    "executed": len(executed),
+                    "notified": len(notified),
+                    "logged": len(logged),
+                }, source="proactive_manager")
+            except Exception:
+                logger.debug("Failed to publish proactive_execution event")
+
+        return {
+            "processed": len(executed) + len(notified) + len(logged),
+            "executed": executed,
+            "notified": notified,
+            "logged": logged,
+            "pending_remaining": max(0, len(pending) - len(executed) - len(notified) - len(logged)),
+        }
+
     async def _run_autonomy_cycle_async(self, trigger: str = "sentinel", force: bool = False) -> Dict[str, Any]:
         if self._autonomy_cycle_running:
             return {"scheduled": False, "skipped": True, "reason": "cycle_already_running"}
@@ -1163,12 +1383,66 @@ class ProactiveManager:
                         "cooldown_remaining_seconds": int(cooldown_remaining),
                     }
 
+            # --- Calendar proactive check ---
+            calendar_result: Optional[dict] = None
+            try:
+                calendar_result = await self._check_calendar_proactive()
+            except Exception as exc:
+                logger.debug("Calendar proactive check error: %s", exc)
+
+            # --- Sentinel recommendation processing ---
+            sentinel_result: Optional[dict] = None
+            try:
+                sentinel_result = await self._process_sentinel_recommendations()
+            except Exception as exc:
+                logger.debug("Sentinel recommendation processing error: %s", exc)
+
+            # --- Self-improvement auto-trigger (red-team) ---
+            self_improvement_result: Optional[dict] = None
+            if os.getenv("VERA_SELF_IMPROVEMENT_AUTO", "0") == "1":
+                try:
+                    rt_state = self.load_red_team_state()
+                    last_run_at = rt_state.get("last_run_at", "")
+                    hours_since = 999.0
+                    if last_run_at:
+                        try:
+                            last_dt = datetime.fromisoformat(last_run_at)
+                            if last_dt.tzinfo is None:
+                                last_dt = last_dt.replace(tzinfo=timezone.utc)
+                            hours_since = (
+                                datetime.now(timezone.utc) - last_dt
+                            ).total_seconds() / 3600
+                        except Exception:
+                            pass
+                    min_hours = float(os.getenv("VERA_SELF_IMPROVEMENT_INTERVAL_HOURS", "12"))
+                    if hours_since >= min_hours and not self._red_team_running:
+                        logger.info(
+                            "Self-improvement auto-trigger: %.1fh since last red-team run (threshold %.0fh)",
+                            hours_since, min_hours,
+                        )
+                        loop = asyncio.get_running_loop()
+                        self_improvement_result = await loop.run_in_executor(
+                            None, self.action_red_team, {},
+                        )
+                    else:
+                        self_improvement_result = {
+                            "ran": False,
+                            "reason": "not_due" if hours_since < min_hours else "already_running",
+                            "hours_since_last": round(hours_since, 1),
+                        }
+                except Exception as exc:
+                    logger.debug("Self-improvement auto-trigger error: %s", exc)
+                    self_improvement_result = {"ran": False, "reason": "error", "error": str(exc)}
+
             result.update(
                 {
                     "reflection_reason": reflection_reason,
                     "reflection_outcome": getattr(reflection_result, "outcome", None) if reflection_result else None,
                     "workflow_result": workflow_result,
                     "followthrough_result": followthrough_result,
+                    "calendar_result": calendar_result,
+                    "sentinel_result": sentinel_result,
+                    "self_improvement_result": self_improvement_result,
                     "active_window_reflections": int(state.get("active_window_reflections") or 0),
                     "active_window_workflows": int(state.get("active_window_workflows") or 0),
                 }

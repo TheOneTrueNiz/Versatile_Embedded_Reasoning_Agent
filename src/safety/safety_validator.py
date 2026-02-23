@@ -29,6 +29,7 @@ Research basis:
 import re
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -591,20 +592,25 @@ class SafetyValidatorIntegration:
             return False, "Validation error"
 
     def _execute(self, command: str) -> Tuple[bool, str]:
-        """Actually execute the command"""
+        """Actually execute the command (no shell=True to prevent injection)."""
+        try:
+            argv = shlex.split(command)
+        except ValueError as e:
+            return False, f"Failed to parse command: {e}"
         try:
             result = subprocess.run(
-                command,
-                shell=True,
+                argv,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=60,
             )
             success = result.returncode == 0
             output = result.stdout if success else result.stderr
             return success, output
         except subprocess.TimeoutExpired:
             return False, "Command timed out after 60 seconds"
+        except FileNotFoundError:
+            return False, f"Command not found: {argv[0]}"
         except Exception as e:
             return False, f"Execution error: {str(e)}"
 

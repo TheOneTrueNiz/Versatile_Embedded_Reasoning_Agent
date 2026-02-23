@@ -376,10 +376,11 @@ async function handleImagePrompt(imagePrompt, addMessage, selectedModel, localMo
             return;
         }
 
-        let videoURLStrings = `${promptText} \n\n`;
+        let videoURLStrings = `Prompt: ${promptText}\n\n`;
         response.data.forEach((video, idx) => {
             if (!video.url) return;
-            videoURLStrings += `Video ${idx + 1}: ${video.url}\n`;
+            videoURLStrings += `[Generated Video ${idx + 1}](${video.url})\n\n`;
+            videoURLStrings += `Download path ${idx + 1}: ${video.url}\n\n`;
         });
         addMessage('assistant', videoURLStrings);
         return;
@@ -402,10 +403,14 @@ async function handleImagePrompt(imagePrompt, addMessage, selectedModel, localMo
         return;
     }
 
-    let imageURLStrings = `${promptText} \n\n`;
+    let imageURLStrings = `Prompt: ${promptText}\n\n`;
+    let imageIndex = 0;
     for (const image of response.data) {
         if (!image.url) continue;
-        imageURLStrings += `![${promptText}](${image.url}) \n`;
+        imageIndex += 1;
+        imageURLStrings += `![${promptText}](${image.url})\n\n`;
+        imageURLStrings += `[Download Image ${imageIndex}](${image.url})\n\n`;
+        imageURLStrings += `Download path ${imageIndex}: ${image.url}\n\n`;
     }
 
     addMessage('assistant', imageURLStrings);

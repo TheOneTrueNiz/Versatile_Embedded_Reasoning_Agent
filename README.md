@@ -12,7 +12,9 @@ VERA is a local-first agent runtime with:
 - One-time dev secret migration (optional): `./scripts/vera_secret_store.sh migrate-creds "${HOME}/Documents/creds"`
 - Offline bootstrap: `export VERA_WHEELHOUSE_DIR=/mnt/storage/vera_wheelhouse && VERA_NO_RUN=1 ./scripts/run_vera.sh`
 - Normal run: `./scripts/run_vera.sh`
+- Local release gate: `./scripts/vera_release_gate_local.py`
 - Monolithic check: `python3 run_vera_monolithic.py --help`
+- Guided learning drill: `.venv/bin/python scripts/vera_guided_learning_curriculum.py --base-url http://127.0.0.1:8788`
 
 ## Quickstart
 
@@ -66,6 +68,24 @@ VERA_NO_RUN=1 ./scripts/run_vera.sh
 - API + UI launcher: `scripts/run_vera_gui.sh`
 - MCP hub wrapper: `scripts/run_mcp_hub.sh` (requires `MCP_HUB_COMMAND` to be set)
 
+## Guided Learning Harness
+
+- Vera-side guided curriculum runner:
+
+```bash
+.venv/bin/python scripts/vera_guided_learning_curriculum.py --base-url http://127.0.0.1:8788
+```
+
+- Doctor/Professor CI gate with guided curriculum enabled:
+
+```bash
+.venv/bin/python scripts/vera_doctor_professor_ci_gate.py --base-url http://127.0.0.1:8788 --run-guided-learning
+```
+
+- Curriculum and protocol files:
+  - `config/doctor_professor/vera_guided_learning_curriculum.json`
+  - `config/doctor_professor/vera_professor_protocol.md`
+
 ## Manual Halt Sentinel
 
 - Path: `vera_memory/manual_halt`
@@ -108,6 +128,12 @@ Excluded / expected external:
 - `RUNBOOK.md` for operator commands and runtime flow
 - `OFFLINE_BOOTSTRAP.md` for offline/bootstrap behavior details
 - `SECRETS.md` for keychain and credential migration workflows
+
+## Contributors
+
+- Niz Nyzio
+- Claude
+- Codex (OpenAI)
 
 ## Ops Changes (2026-02-18)
 

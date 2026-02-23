@@ -124,6 +124,11 @@ class EventBus:
         "innerlife.personality_update": "Personality state evolved",
         "innerlife.error": "Inner life reflection failed",
         "innerlife.outside_hours": "Reflection skipped (outside active hours)",
+        "innerlife.goal_added": "Vera created a new personal goal",
+        "innerlife.goal_updated": "Vera updated a goal status or progress",
+        "innerlife.goal_completed": "Vera completed a personal goal",
+        "innerlife.calendar_check": "Proactive calendar check completed",
+        "innerlife.proactive_execution": "Sentinel recommendations processed",
     }
 
     def __init__(

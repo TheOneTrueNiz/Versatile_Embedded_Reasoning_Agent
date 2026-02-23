@@ -47,6 +47,31 @@ class ToolOrchestrator:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._owner, name)
 
+    @staticmethod
+    def _extract_embedded_tool_error(result: Any) -> str:
+        """Detect tool-level errors returned as structured payloads."""
+        if not isinstance(result, dict):
+            return ""
+
+        err = result.get("error")
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+        if isinstance(err, dict):
+            for key in ("message", "detail", "error"):
+                value = err.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        status = str(result.get("status") or "").strip().lower()
+        if status in {"error", "failed"}:
+            for key in ("message", "detail", "reason"):
+                value = result.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return f"Tool returned status={status}"
+
+        return ""
+
     def _refresh_tool_source_cache(self) -> None:
         fallback_server_categories = {
             "filesystem": ["files"],
@@ -584,6 +609,35 @@ class ToolOrchestrator:
                     success=True,
                     latency=0.0
                 )
+                if self.flight_recorder:
+                    try:
+                        self.flight_recorder.record_tool_call(
+                            tool_name=tool_name,
+                            params=params,
+                            result={
+                                "cached": True,
+                                "result_preview": str(cached)[:400],
+                            },
+                            success=True,
+                            latency_ms=0.0,
+                            conversation_id=conversation_id,
+                            source_type="cache",
+                            error=None,
+                        )
+                    except Exception:
+                        logger.debug("Suppressed Exception in vera")
+                        pass
+                self._publish_tool_event(
+                    "tool.completed",
+                    {
+                        "tool_name": tool_name,
+                        "success": True,
+                        "latency_ms": 0.0,
+                        "conversation_id": conversation_id,
+                        "source_type": "cache",
+                        "cached": True,
+                    },
+                )
                 return cached
 
         if not skip_safety:
@@ -643,6 +697,41 @@ class ToolOrchestrator:
                     force=True,
                 )
                 return f"{safety_decision.message}\n\nReply 'yes' to proceed or 'no' to cancel."
+
+        # --- Quorum auto-trigger for high-severity actions ---
+        if (
+            not skip_safety
+            and safety_decision.severity >= 4
+            and os.getenv("VERA_QUORUM_AUTO_TRIGGER", "0") == "1"
+        ):
+            convo_id = self._normalize_conversation_id(
+                context.get("conversation_id") if context else None
+            )
+            auto_trigger_key = f"_quorum_auto_triggered_{convo_id}"
+            if not getattr(self._owner, auto_trigger_key, False):
+                try:
+                    setattr(self._owner, auto_trigger_key, True)
+                    advisory = await self._owner._run_quorum_tool(
+                        mode="quorum",
+                        params={
+                            "question": (
+                                f"Safety severity {safety_decision.severity} for "
+                                f"tool '{tool_name}'. Should this proceed? "
+                                f"Pattern: {safety_decision.matched_pattern}"
+                            ),
+                            "context": json.dumps(params, default=str)[:500],
+                        },
+                        manual=True,
+                        trigger="auto_safety",
+                    )
+                    logger.info(
+                        "Quorum auto-trigger advisory for %s (severity %d): %s",
+                        tool_name, safety_decision.severity, advisory[:200],
+                    )
+                except Exception:
+                    logger.debug(
+                        "Quorum auto-trigger failed for %s", tool_name, exc_info=True
+                    )
 
         two_source_message = self._maybe_require_two_source_confirmation(tool_name, params, context)
         if two_source_message:
@@ -740,6 +829,9 @@ class ToolOrchestrator:
                 status = task_result.get("status")
                 if status == "completed":
                     raw_result = task_result.get("result")
+                    embedded_error = self._extract_embedded_tool_error(raw_result)
+                    if embedded_error:
+                        raise RuntimeError(embedded_error)
                 else:
                     raise RuntimeError(task_result.get("error", "Unknown tool error"))
                 tool_success = True
@@ -845,18 +937,19 @@ class ToolOrchestrator:
             result_text = json.dumps(compressed, ensure_ascii=True, default=str)
 
         latency = time.time() - start_time
+        execution_success = bool(tool_success)
 
         # Emit thinking event for tool completion
         thinking_tool(
             f"Completed {tool_name} ({latency*1000:.0f}ms)",
             tool=tool_name,
             latency_ms=latency * 1000,
-            success=True
+            success=execution_success
         )
         self.tool_selection.record_result(
             tool_name=tool_name,
             context=context,
-            success=True,
+            success=execution_success,
             latency=latency
         )
 
@@ -896,7 +989,7 @@ class ToolOrchestrator:
                     "tags": ["tool", tool_name],
                     "provenance": {
                         "tool": tool_name,
-                        "success": True,
+                        "success": execution_success,
                         "source_type": source_info.get("source_type", "tool"),
                     },
                     "created_by": "tool_execution",

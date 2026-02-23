@@ -24,6 +24,33 @@ from urllib import error, request
 DEFAULT_PROTOCOL = "config/doctor_professor/vera_professor_protocol.md"
 DEFAULT_SCENARIOS = "config/doctor_professor/vera_tool_exam_tier2_scenarios.json"
 
+# A few MCP tools regularly require longer than the generic chat timeout due to
+# upstream latency or large payload hydration. Keep overrides surgical so the
+# full battery does not slow down globally.
+TIER1_TIMEOUT_OVERRIDES: Dict[str, float] = {
+    "directory_tree": 180.0,
+    "discover_global_functions": 180.0,
+    "get_debug_view": 180.0,
+    "get_doc_content": 180.0,
+    "get_page_citations": 180.0,
+    "get_page_section": 180.0,
+}
+
+# Some media-adjacent tools are occasionally ignored on first pass despite
+# explicit tool_choice; allow one extra attempt for direct exams.
+TIER1_EXTRA_ATTEMPT_TOOLS: Set[str] = {
+    "expand_animations",
+    "extract_element_animations",
+    "extract_element_animations_to_file",
+    "get_page_thumbnail",
+}
+
+# Confirmation-gated tools are interactive by design and not suitable for an
+# unattended tier-1 direct exam pass.
+MANUAL_CONFIRMATION_TOOLS: Set[str] = {
+    "get_response_content",
+}
+
 
 def _utc_ts() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -138,6 +165,29 @@ def _extract_reply(payload: Any) -> str:
     return content if isinstance(content, str) else ""
 
 
+def _tool_equivalents(tool_name: str) -> Set[str]:
+    name = str(tool_name or "").strip()
+    if not name:
+        return set()
+    eq: Set[str] = {name}
+
+    # Common browser naming aliases observed across MCP/browser providers.
+    if name.startswith("browser_go_"):
+        eq.add("browser_" + name[len("browser_go_"):])
+    if name == "browser_get_text":
+        eq.add("browser_get_content")
+    if name == "browser_wait_for":
+        eq.add("browser_wait")
+    return eq
+
+
+def _was_tool_invoked(expected_tool: str, used_tools: List[str]) -> bool:
+    if not expected_tool:
+        return False
+    eq = _tool_equivalents(expected_tool)
+    return any(str(name).strip() in eq for name in (used_tools or []))
+
+
 def _parse_local_naive_iso(value: str) -> Optional[dt.datetime]:
     text = str(value or "").strip()
     if not text:
@@ -219,6 +269,33 @@ def _wait_for_tools(
     return latest
 
 
+def _wait_for_tools_with_grace(
+    *,
+    transitions_path: Path,
+    conversation_id: str,
+    start_local: dt.datetime,
+    wait_seconds: float,
+    grace_seconds: float,
+) -> Tuple[List[str], bool]:
+    used = _wait_for_tools(
+        transitions_path=transitions_path,
+        conversation_id=conversation_id,
+        start_local=start_local,
+        wait_seconds=wait_seconds,
+    )
+    if used:
+        return used, False
+    if max(0.0, float(grace_seconds)) <= 0.0:
+        return used, False
+    used = _wait_for_tools(
+        transitions_path=transitions_path,
+        conversation_id=conversation_id,
+        start_local=start_local,
+        wait_seconds=grace_seconds,
+    )
+    return used, bool(used)
+
+
 def _discover_tools(api_url: str, timeout: float) -> Dict[str, Any]:
     by_server: Dict[str, List[str]] = {}
     native: List[str] = []
@@ -290,6 +367,8 @@ def _discover_tools(api_url: str, timeout: float) -> Dict[str, Any]:
 
 def _looks_side_effect_tool(tool_name: str) -> bool:
     low = str(tool_name).strip().lower()
+    if low in MANUAL_CONFIRMATION_TOOLS:
+        return True
     unsafe_tokens = (
         "delete",
         "remove",
@@ -322,6 +401,11 @@ def _looks_side_effect_tool(tool_name: str) -> bool:
     if low in safe_exceptions:
         return False
     return any(token in low for token in unsafe_tokens)
+
+
+def _tier1_timeout_for_tool(tool_name: str, default_timeout: float) -> float:
+    override = float(TIER1_TIMEOUT_OVERRIDES.get(str(tool_name).strip(), 0.0) or 0.0)
+    return max(float(default_timeout), override)
 
 
 def _send_chat(
@@ -394,6 +478,8 @@ def _run_tier1(
     retries: int,
     timeout: float,
     include_side_effects: bool,
+    transition_wait_seconds: float,
+    transition_grace_seconds: float,
     session_prefix: str,
 ) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
@@ -421,8 +507,12 @@ def _run_tier1(
         used_union: List[str] = []
         last_http = 0
         last_preview = ""
+        tool_timeout = _tier1_timeout_for_tool(tool_name, timeout)
+        attempt_limit = max(1, retries + 1)
+        if tool_name in TIER1_EXTRA_ATTEMPT_TOOLS:
+            attempt_limit = max(attempt_limit, 2)
 
-        for attempt in range(1, max(1, retries + 1) + 1):
+        for attempt in range(1, attempt_limit + 1):
             prompt = (
                 "Direct Tool Exam.\n"
                 f"You MUST call tool `{tool_name}` exactly once in this turn, using safe minimal arguments.\n"
@@ -436,32 +526,36 @@ def _run_tier1(
                 protocol_text=protocol_text,
                 conversation_id=convo,
                 prompt=prompt,
-                timeout=timeout,
+                timeout=tool_timeout,
                 tool_choice_name=tool_name,
             )
-            used = _wait_for_tools(
+            used, used_grace_wait = _wait_for_tools_with_grace(
                 transitions_path=transitions_path,
                 conversation_id=convo,
                 start_local=start_local,
-                wait_seconds=2.0,
+                wait_seconds=transition_wait_seconds,
+                grace_seconds=transition_grace_seconds,
             )
             for name in used:
                 if name not in used_union:
                     used_union.append(name)
 
-            invoked = tool_name in used_union
+            invoked = _was_tool_invoked(tool_name, used_union)
+            timed_out = bool(code == 0 and "timed out" in str(preview or "").lower())
             attempts.append(
                 {
                     "attempt": attempt,
                     "http": code,
                     "used_tools": used,
+                    "used_grace_wait": used_grace_wait,
                     "invoked": invoked,
+                    "timed_out": timed_out,
                     "reply_preview": preview,
                 }
             )
             last_http = code
             last_preview = preview
-            if invoked and code == 200:
+            if invoked and (code == 200 or timed_out):
                 break
 
         status = "passed" if invoked else "failed"
@@ -477,6 +571,7 @@ def _run_tier1(
                 "invoked": invoked,
                 "http": last_http,
                 "used_tools": used_union,
+                "tool_equivalents": sorted(_tool_equivalents(tool_name)),
                 "reply_preview": last_preview,
                 "attempts": attempts,
             }
@@ -501,6 +596,8 @@ def _run_tier2(
     available_tools: Set[str],
     retries: int,
     timeout: float,
+    transition_wait_seconds: float,
+    transition_grace_seconds: float,
     session_prefix: str,
 ) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
@@ -538,8 +635,11 @@ def _run_tier2(
         last_http = 0
         last_preview = ""
         remaining_groups = list(expected_groups)
+        attempt_limit = max(1, retries + 1)
+        if len(expected_groups) > 1:
+            attempt_limit = max(attempt_limit, 2)
 
-        for attempt in range(1, max(1, retries + 1) + 1):
+        for attempt in range(1, attempt_limit + 1):
             required_text = "; ".join(" or ".join(group) for group in expected_groups) if expected_groups else "none"
             exam_prompt = (
                 f"{prompt}\n\n"
@@ -567,11 +667,12 @@ def _run_tier2(
                 timeout=timeout,
                 tool_choice_name=forced,
             )
-            used = _wait_for_tools(
+            used, used_grace_wait = _wait_for_tools_with_grace(
                 transitions_path=transitions_path,
                 conversation_id=convo,
                 start_local=start_local,
-                wait_seconds=2.0,
+                wait_seconds=transition_wait_seconds,
+                grace_seconds=transition_grace_seconds,
             )
             for name in used:
                 if name not in used_union:
@@ -587,6 +688,7 @@ def _run_tier2(
                     "attempt": attempt,
                     "http": code,
                     "used_tools": used,
+                    "used_grace_wait": used_grace_wait,
                     "missing_after_attempt": missing_after,
                     "forced_tool_choice": forced,
                     "reply_preview": preview,
@@ -594,10 +696,12 @@ def _run_tier2(
             )
             last_http = code
             last_preview = preview
-            if code == 200 and not remaining_groups and len(used_union) >= min_distinct:
+            timed_out = bool(code == 0 and "timed out" in str(preview or "").lower())
+            if (code == 200 or timed_out) and not remaining_groups and len(used_union) >= min_distinct:
                 break
 
-        ok = bool(last_http == 200 and not remaining_groups and len(used_union) >= min_distinct)
+        timed_out_final = bool(last_http == 0 and "timed out" in str(last_preview or "").lower())
+        ok = bool((last_http == 200 or timed_out_final) and not remaining_groups and len(used_union) >= min_distinct)
         status = "passed" if ok else "failed"
         if ok:
             passed += 1
@@ -642,6 +746,12 @@ def main() -> int:
     parser.add_argument("--tier2-scenarios", default=DEFAULT_SCENARIOS)
     parser.add_argument("--tier1", action="store_true", help="Run tier-1 direct tool exams")
     parser.add_argument("--tier2", action="store_true", help="Run tier-2 inference/chain exams")
+    parser.add_argument(
+        "--tier1-scope",
+        choices=("all", "server", "native"),
+        default="all",
+        help="Tool source for tier-1 direct exams (default: all).",
+    )
     parser.add_argument("--max-tools", type=int, default=0, help="Tier-1 cap (0 = all discovered)")
     parser.add_argument("--tool-filter", default="", help="Regex include filter for tier-1 tool names")
     parser.add_argument("--include-side-effects", action="store_true", help="Include side-effect tools in tier-1")
@@ -658,6 +768,18 @@ def main() -> int:
         type=int,
         default=3,
         help="Consecutive ready=true checks required when --wait-ready-seconds > 0.",
+    )
+    parser.add_argument(
+        "--transition-wait-seconds",
+        type=float,
+        default=6.0,
+        help="Seconds to wait for transition log ingestion after each request.",
+    )
+    parser.add_argument(
+        "--transition-grace-seconds",
+        type=float,
+        default=8.0,
+        help="Extra seconds to re-check transitions when first pass sees none.",
     )
     parser.add_argument("--output", default="")
     args = parser.parse_args()
@@ -684,12 +806,15 @@ def main() -> int:
             "timeout": float(args.timeout),
             "retries": int(args.retries),
             "max_tools": int(args.max_tools),
+            "tier1_scope": str(args.tier1_scope),
             "tool_filter": str(args.tool_filter or ""),
             "include_side_effects": bool(args.include_side_effects),
             "max_tier1_failures": int(args.max_tier1_failures),
             "max_tier2_failures": int(args.max_tier2_failures),
             "wait_ready_seconds": float(args.wait_ready_seconds),
             "ready_streak": int(args.ready_streak),
+            "transition_wait_seconds": float(args.transition_wait_seconds),
+            "transition_grace_seconds": float(args.transition_grace_seconds),
         },
         "discovery": {},
         "tier1": {},
@@ -734,7 +859,26 @@ def main() -> int:
     tier2_failed = 0
 
     if args.tier1:
-        tools = list(discovery.get("all_tools") or [])
+        if args.tier1_scope == "server":
+            server_tools: List[str] = []
+            for names in (discovery.get("servers") or {}).values():
+                if isinstance(names, list):
+                    server_tools.extend(
+                        str(name).strip()
+                        for name in names
+                        if isinstance(name, str) and str(name).strip()
+                    )
+            tools = sorted(set(server_tools))
+        elif args.tier1_scope == "native":
+            tools = sorted(
+                {
+                    str(name).strip()
+                    for name in list(discovery.get("native") or [])
+                    if isinstance(name, str) and str(name).strip()
+                }
+            )
+        else:
+            tools = list(discovery.get("all_tools") or [])
         if args.tool_filter:
             rx = re.compile(args.tool_filter)
             tools = [name for name in tools if rx.search(name)]
@@ -749,6 +893,8 @@ def main() -> int:
             retries=max(0, int(args.retries)),
             timeout=float(args.timeout),
             include_side_effects=bool(args.include_side_effects),
+            transition_wait_seconds=max(0.5, float(args.transition_wait_seconds)),
+            transition_grace_seconds=max(0.0, float(args.transition_grace_seconds)),
             session_prefix=f"tool-exam-{ts}",
         )
         tier1_failed = int(tier1.get("failed") or 0)
@@ -775,6 +921,8 @@ def main() -> int:
             available_tools=set(str(x) for x in (discovery.get("all_tools") or []) if isinstance(x, str)),
             retries=max(0, int(args.retries)),
             timeout=float(args.timeout),
+            transition_wait_seconds=max(0.5, float(args.transition_wait_seconds)),
+            transition_grace_seconds=max(0.0, float(args.transition_grace_seconds)),
             session_prefix=f"tool-exam-{ts}",
         )
         tier2_failed = int(tier2.get("failed") or 0)

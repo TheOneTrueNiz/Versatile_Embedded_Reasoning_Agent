@@ -189,7 +189,12 @@ def resolve_credential(
         creds_dir = Path(os.getenv("CREDS_DIR", "~/Documents/creds")).expanduser()
 
     base_url_env = os.getenv("VERA_LLM_BASE_URL", "").strip()
-    base_url = base_url_env or PROVIDER_BASE_URLS.get(provider_id)
+    default_url = PROVIDER_BASE_URLS.get(provider_id, "https://api.x.ai/v1")
+    if base_url_env:
+        from orchestration.llm_bridge import _validate_llm_base_url
+        base_url = _validate_llm_base_url(base_url_env, default_url)
+    else:
+        base_url = default_url
 
     # Layer 1: Config file credentials
     if config_credentials and provider_id in config_credentials:

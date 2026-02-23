@@ -270,11 +270,33 @@ export async function customModelVideoGeneration(conversation, localModelEndpoin
 
         const result = await response.json();
 
-        if (result.data?.length > 0) {
-            retryCounters.imageGen = 0;
+        const urls = [];
+        if (Array.isArray(result.data)) {
+            result.data.forEach((item) => {
+                if (item?.url) urls.push(item.url);
+            });
+        }
+        if (result?.video?.url) {
+            urls.push(result.video.url);
+        }
+        if (result?.url) {
+            urls.push(result.url);
+        }
+
+        if (urls.length > 0) {
+            retryCounters.videoGen = 0;
+            if (!Array.isArray(result.data) || result.data.length === 0) {
+                result.data = urls.map((url) => ({ url }));
+            }
             return result;
         }
-        return "I'm sorry, I couldn't generate a video. The prompt may not be allowed by the API.";
+
+        if (result?.error?.message) {
+            return `Video generation failed: ${result.error.message}`;
+        }
+
+        const statusHint = result?.status ? ` (status: ${result.status})` : '';
+        return `Video generation did not return a playable URL${statusHint}.`;
     } catch (error) {
         if (await handleRetry(
             () => customModelVideoGeneration(conversation, localModelEndpoint, model),
