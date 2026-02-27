@@ -1135,8 +1135,11 @@ class SentinelEngine:
     def _poll_loop(self) -> None:
         """Background polling loop."""
         while not self._stop_event.is_set():
-            if self.state == SentinelState.RUNNING:
-                self._poll_sources()
+            try:
+                if self.state == SentinelState.RUNNING:
+                    self._poll_sources()
+            except Exception as exc:
+                logger.warning("Sentinel poll loop recovered from error: %s", exc)
 
             self._stop_event.wait(self._poll_interval)
 

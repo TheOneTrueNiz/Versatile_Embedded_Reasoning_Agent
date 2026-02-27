@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Tuple
 import httpx
 
 _SHUTDOWN_FLAG: Path | None = None
+_RESPECT_SHUTDOWN_FLAG = False
 
 
 def _request_json(client: httpx.Client, method: str, url: str, **kwargs) -> Tuple[bool, Any, str]:
@@ -87,7 +88,7 @@ def _call_tool(
     args: Dict[str, Any],
     timeout: float,
 ) -> Tuple[bool, str]:
-    if _SHUTDOWN_FLAG and _SHUTDOWN_FLAG.exists():
+    if _RESPECT_SHUTDOWN_FLAG and _SHUTDOWN_FLAG and _SHUTDOWN_FLAG.exists():
         return False, "shutdown requested"
     ok, data, err = _request_json(
         client,
@@ -124,12 +125,19 @@ def main() -> int:
     parser.add_argument("--youtube-test-url", default="", help="YouTube URL/ID for youtube-transcript verification")
     parser.add_argument("--youtube-search-query", default="", help="Query for youtube-transcript search_youtube verification")
     parser.add_argument("--wait", type=int, default=30, help="Seconds to wait for API readiness")
+    parser.add_argument(
+        "--respect-shutdown-flag",
+        action="store_true",
+        help="Honor tmp/shutdown_requested and skip verification when present.",
+    )
     args = parser.parse_args()
 
     base_url = f"http://{args.host}:{args.port}"
     root_dir = Path(__file__).resolve().parents[1]
     global _SHUTDOWN_FLAG
+    global _RESPECT_SHUTDOWN_FLAG
     _SHUTDOWN_FLAG = root_dir / "tmp" / "shutdown_requested"
+    _RESPECT_SHUTDOWN_FLAG = bool(args.respect_shutdown_flag)
     tmp_dir = root_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -157,7 +165,7 @@ def main() -> int:
             _print_status("FAIL", "api", "API not ready")
             return 1
 
-        if _SHUTDOWN_FLAG.exists():
+        if _RESPECT_SHUTDOWN_FLAG and _SHUTDOWN_FLAG.exists():
             _print_status("SKIP", "verify", "shutdown requested")
             return 0
 

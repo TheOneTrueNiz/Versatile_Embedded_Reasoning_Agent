@@ -117,11 +117,17 @@ def main() -> int:
     parser.add_argument("--skip-call-me", action="store_true")
     parser.add_argument("--run-native-push-hardening", action="store_true")
     parser.add_argument("--native-push-no-live-send", action="store_true")
+    parser.add_argument(
+        "--run-id",
+        default="",
+        help="Optional stable run id passed through to vera_tool_exam_battery.py.",
+    )
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
     ts = _utc_ts()
+    run_id = str(args.run_id or "").strip() or f"tool-exam-{ts}"
     logs_dir = Path(args.logs_dir) if args.logs_dir else (root / "tmp" / "tool_exam_campaign" / ts)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,6 +162,8 @@ def main() -> int:
         "999999",
         "--max-tier2-failures",
         "999999",
+        "--run-id",
+        str(run_id),
         "--output",
         str(battery_report),
     ]
@@ -261,6 +269,7 @@ def main() -> int:
     manifest = {
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "repo_root": str(root),
+        "run_id": run_id,
         "logs_dir": str(logs_dir),
         "overall_ok": overall_ok,
         "python": py_bin,

@@ -66,6 +66,50 @@ class TestCheckRateLimit:
         assert allowed is False
 
 
+# ── rate-limit bucket routing ──────────────────────────────────────────────
+
+class TestResolveRateLimitBucket:
+    """Ensure heavy/poll paths do not share the default global bucket."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from api.server import _resolve_rate_limit_bucket
+        self._resolve = _resolve_rate_limit_bucket
+
+    @staticmethod
+    def _fake_request(path: str, method: str = "GET"):
+        class FakeReq:
+            pass
+        req = FakeReq()
+        req.path = path
+        req.method = method
+        return req
+
+    def test_tools_call_uses_dedicated_bucket(self, monkeypatch):
+        monkeypatch.setenv("VERA_RATE_LIMIT_TOOLS_CALL_MAX", "321")
+        monkeypatch.setenv("VERA_RATE_LIMIT_TOOLS_CALL_WINDOW", "33")
+        bucket, max_req, window = self._resolve(self._fake_request("/api/tools/call", method="POST"))
+        assert bucket == "tools_call_rate_limit"
+        assert max_req == 321
+        assert window == 33.0
+
+    def test_polling_get_uses_poll_bucket(self, monkeypatch):
+        monkeypatch.setenv("VERA_RATE_LIMIT_POLL_MAX", "456")
+        monkeypatch.setenv("VERA_RATE_LIMIT_POLL_WINDOW", "45")
+        bucket, max_req, window = self._resolve(self._fake_request("/api/editor", method="GET"))
+        assert bucket == "poll_rate_limit"
+        assert max_req == 456
+        assert window == 45.0
+
+    def test_non_poll_post_uses_global_bucket(self, monkeypatch):
+        monkeypatch.setenv("VERA_RATE_LIMIT_MAX", "77")
+        monkeypatch.setenv("VERA_RATE_LIMIT_WINDOW", "70")
+        bucket, max_req, window = self._resolve(self._fake_request("/v1/chat/completions", method="POST"))
+        assert bucket == "global_rate_limit"
+        assert max_req == 77
+        assert window == 70.0
+
+
 # ── Auth skip-path logic ──────────────────────────────────────────────────
 
 class TestAuthSkipPaths:

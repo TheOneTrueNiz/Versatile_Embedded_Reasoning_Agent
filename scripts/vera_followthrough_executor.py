@@ -877,7 +877,9 @@ def _count_window_evidence(
         "window_used_schedule": used_schedule,
         "tool_call_count": len(tool_calls),
         "blocked_attempt_count": len(blocked_attempts),
-        "has_execution_evidence": bool(tool_calls or blocked_attempts),
+        # Blocked attempts are diagnostics, not successful execution evidence.
+        "has_execution_evidence": bool(tool_calls),
+        "has_blocked_evidence": bool(blocked_attempts),
     }
 
 
@@ -1126,6 +1128,7 @@ def main() -> int:
     parser.add_argument("--min-workflow-confidence", type=float, default=0.45)
     parser.add_argument("--logs-root", default="tmp/followthrough_runs")
     parser.add_argument("--lock-file", default="tmp/followthrough_executor.lock")
+    parser.add_argument("--escalate-failures", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -1486,6 +1489,14 @@ def main() -> int:
 
             overall_ok = bool(isinstance(manifest, dict) and manifest.get("overall_ok") is True)
             status = "completed" if (rc == 0 and overall_ok) else "failed"
+            failure_reason = ""
+            if status != "completed":
+                if rc != 0:
+                    failure_reason = f"executor_returncode:{rc}"
+                elif not overall_ok:
+                    failure_reason = "manifest_not_ok"
+                else:
+                    failure_reason = "executor_failed"
 
             _write_scaffold_note(
                 run_dir / "scaffold.md",
@@ -1502,16 +1513,23 @@ def main() -> int:
                 attempt_count = 1
             entry["attempt_count"] = attempt_count
             entry["status"] = status
+            previous_consecutive_failures = int(entry.get("consecutive_failures") or 0)
+            if status == "completed":
+                entry["consecutive_failures"] = 0
+            else:
+                entry["consecutive_failures"] = previous_consecutive_failures + 1
             entry["last_attempt_utc"] = _utc_iso()
             entry["last_attempt_result"] = {
                 "executor_returncode": rc,
                 "manifest_path": str(manifest_path) if manifest_path else "",
                 "manifest_overall_ok": overall_ok,
+                "failure_reason": failure_reason,
             }
             entry["artifacts_dir"] = str(run_dir)
             ledger[commitment_id] = entry
             action["last_execution_attempt_utc"] = _utc_iso()
             action["last_execution_attempt_status"] = status
+            action["last_execution_failure_reason"] = failure_reason
 
             _append_event(
                 events_path,
@@ -1524,15 +1542,37 @@ def main() -> int:
                     "executor_returncode": rc,
                     "manifest_path": str(manifest_path) if manifest_path else "",
                     "manifest_overall_ok": overall_ok,
+                    "failure_reason": failure_reason,
+                    "consecutive_failures": int(entry.get("consecutive_failures") or 0),
                     "artifacts_dir": str(run_dir),
                 },
             )
 
             if status == "completed":
                 action["completed_via_executor"] = True
+                action["needs_human_review"] = False
+                action["review_reason"] = ""
                 _set_action_status(action=action, new_status="completed", reason="executor_success", action_events_path=action_events_path)
             else:
-                _set_action_status(action=action, new_status="failed", reason="executor_failed", action_events_path=action_events_path)
+                status_reason = f"executor_failed:{failure_reason}" if failure_reason else "executor_failed"
+                _set_action_status(action=action, new_status="failed", reason=status_reason, action_events_path=action_events_path)
+                escalate_threshold = max(1, int(args.escalate_failures))
+                if int(entry.get("consecutive_failures") or 0) >= escalate_threshold:
+                    action["needs_human_review"] = True
+                    action["review_reason"] = (
+                        f"consecutive_failures>={escalate_threshold}:{failure_reason or 'executor_failed'}"
+                    )
+                    _append_event(
+                        action_events_path,
+                        {
+                            "ts_utc": _utc_iso(),
+                            "type": "action_escalation_needed",
+                            "action_id": commitment_id,
+                            "consecutive_failures": int(entry.get("consecutive_failures") or 0),
+                            "threshold": escalate_threshold,
+                            "failure_reason": failure_reason,
+                        },
+                    )
             _sync_action_step_statuses(
                 action=action,
                 evidence=(action.get("evidence") if isinstance(action.get("evidence"), dict) else {}),
@@ -1551,6 +1591,8 @@ def main() -> int:
                     "executor_returncode": rc,
                     "manifest_path": str(manifest_path) if manifest_path else "",
                     "manifest_overall_ok": overall_ok,
+                    "failure_reason": failure_reason,
+                    "consecutive_failures": int(entry.get("consecutive_failures") or 0),
                     "artifacts_dir": str(run_dir),
                 },
             )
@@ -1580,11 +1622,14 @@ def main() -> int:
                 unresolved += 1
 
         action_status_counts: Dict[str, int] = {}
+        actions_needing_human_review = 0
         for value in actions.values():
             if not isinstance(value, dict):
                 continue
             status = str(value.get("status") or "unknown")
             action_status_counts[status] = action_status_counts.get(status, 0) + 1
+            if bool(value.get("needs_human_review") is True):
+                actions_needing_human_review += 1
 
         workflow_outcome_counts: Dict[str, Dict[str, int]] = {}
         workflows_obj = workflow_stats.get("workflows")
@@ -1610,6 +1655,7 @@ def main() -> int:
                     "failed": failed,
                     "unresolved": unresolved,
                     "action_status_counts": action_status_counts,
+                    "actions_needing_human_review": actions_needing_human_review,
                     "workflow_catalog_size": len(workflow_specs),
                     "workflow_outcome_counts": workflow_outcome_counts,
                     "state_file": str(state_path),

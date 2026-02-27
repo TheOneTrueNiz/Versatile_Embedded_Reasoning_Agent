@@ -538,6 +538,13 @@ class ToolOrchestrator:
             "created_by": "tool_execution",
         })
 
+    def _skip_command_tree_for_tool(self, tool_name: str) -> bool:
+        # Command-tree parsing is tuned for shell-like command strings. Structured
+        # tool args (for example edit_file JSON payloads) can false-positive.
+        raw = os.getenv("VERA_SAFETY_SKIP_COMMAND_TREE_TOOLS", "edit_file")
+        skip_tools = {item.strip().lower() for item in raw.split(",") if item.strip()}
+        return str(tool_name or "").strip().lower() in skip_tools
+
     async def execute_tool(
         self,
         tool_name: str,
@@ -641,8 +648,13 @@ class ToolOrchestrator:
                 return cached
 
         if not skip_safety:
+            safety_context = {
+                "tool_name": tool_name,
+                "skip_command_tree": self._skip_command_tree_for_tool(tool_name),
+            }
             safety_decision = self.safety_validator.validate(
-                f"{tool_name} {json.dumps(params, ensure_ascii=True, default=str)}"
+                f"{tool_name} {json.dumps(params, ensure_ascii=True, default=str)}",
+                context=safety_context,
             )
             if safety_decision.result == ValidationResult.BLOCKED:
                 self._log_tool_block(

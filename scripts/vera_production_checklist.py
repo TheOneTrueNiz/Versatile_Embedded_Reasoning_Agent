@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,45 @@ def _request_json(
         return True, response.json(), ""
     except Exception:
         return True, response.text, ""
+
+
+def _chat_probe_with_retry(
+    client: httpx.Client,
+    base_url: str,
+    payload: Dict[str, Any],
+    retries: int = 2,
+    retry_sleep_seconds: float = 0.25,
+) -> Tuple[bool, str]:
+    attempts = max(1, int(retries))
+    retry_sleep = max(0.0, float(retry_sleep_seconds))
+    transient_timeout = False
+    last_detail = "invalid chat response"
+
+    for attempt in range(1, attempts + 1):
+        ok, data, err = _request_json(client, "POST", f"{base_url}/v1/chat/completions", json=payload)
+        preview = ""
+        if ok and isinstance(data, dict):
+            choices = data.get("choices", [])
+            if isinstance(choices, list) and choices:
+                first = choices[0] if isinstance(choices[0], dict) else {}
+                preview = str(first.get("message", {}).get("content", "")).strip().replace("\n", " ")
+        if ok and preview:
+            if attempt > 1:
+                return True, f"{preview[:140]} [attempt {attempt}/{attempts}]"
+            return True, preview[:160]
+
+        last_detail = (err or "invalid chat response").strip()
+        lowered = last_detail.lower()
+        if "timed out" in lowered or "timeout" in lowered:
+            transient_timeout = True
+        if attempt < attempts:
+            # Short backoff to absorb transient provider/network latency spikes.
+            time.sleep(retry_sleep * attempt)
+
+    detail = f"{last_detail}; attempts={attempts}"
+    if transient_timeout:
+        detail = f"{detail}; transient_timeout=true"
+    return False, detail[:220]
 
 
 def _print_check(result: CheckResult) -> None:
@@ -285,11 +325,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Production checklist for Vera_2.0 deployment")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
-    parser.add_argument("--timeout", type=float, default=25.0, help="HTTP timeout seconds")
+    # Keep checklist probes resilient to transient provider latency spikes.
+    parser.add_argument("--timeout", type=float, default=45.0, help="HTTP timeout seconds")
     parser.add_argument("--min-running-mcp", type=int, default=8, help="Minimum running MCP servers")
     parser.add_argument("--skip-chat", action="store_true", help="Skip /v1/chat/completions check")
     parser.add_argument("--chat-model", default="", help="Optional model id for chat probe")
     parser.add_argument("--chat-message", default="Return exactly: VERA_CHECK_OK", help="Chat probe message")
+    parser.add_argument(
+        "--chat-retries",
+        type=int,
+        default=2,
+        help="Retry attempts for chat probe (for transient timeout resilience)",
+    )
+    parser.add_argument(
+        "--chat-retry-sleep",
+        type=float,
+        default=0.25,
+        help="Base sleep seconds between chat probe retries",
+    )
     parser.add_argument("--with-live-call-me", action="store_true", help="Run scripts/call_me_live_smoke.py")
     parser.add_argument(
         "--live-call-me-skip-sms",
@@ -384,16 +437,15 @@ def main() -> int:
                 payload = {
                     "model": chosen_model,
                     "messages": [{"role": "user", "content": args.chat_message}],
+                    "max_tokens": 32,
                 }
-                ok, data, err = _request_json(client, "POST", f"{base_url}/v1/chat/completions", json=payload)
-                preview = ""
-                if ok and isinstance(data, dict):
-                    choices = data.get("choices", [])
-                    if isinstance(choices, list) and choices:
-                        first = choices[0] if isinstance(choices[0], dict) else {}
-                        preview = str(first.get("message", {}).get("content", "")).strip().replace("\n", " ")
-                chat_ok = ok and bool(preview)
-                detail = preview[:160] if chat_ok else (err or "invalid chat response")
+                chat_ok, detail = _chat_probe_with_retry(
+                    client,
+                    base_url,
+                    payload=payload,
+                    retries=args.chat_retries,
+                    retry_sleep_seconds=args.chat_retry_sleep,
+                )
                 results.append(CheckResult("chat_completion", chat_ok, True, detail))
 
         ok, data, err = _request_json(client, "GET", f"{base_url}/api/tools")
@@ -472,14 +524,33 @@ def main() -> int:
 
         ok, data, err = _request_json(client, "GET", f"{base_url}/api/memory/stats")
         memvid_enabled = False
+        memvid_source = "missing"
         if ok and isinstance(data, dict):
+            memvid_block: Dict[str, Any] = {}
+            # Support both schemas:
+            # - legacy: {"stats": {"memvid_sdk": {...}}}
+            # - current: {"memvid_sdk": {...}, ...}
             stats = data.get("stats", {})
             if isinstance(stats, dict):
-                memvid_block = stats.get("memvid_sdk", {})
-                if isinstance(memvid_block, dict):
-                    memvid_enabled = bool(memvid_block.get("enabled"))
+                nested = stats.get("memvid_sdk", {})
+                if isinstance(nested, dict):
+                    memvid_block = nested
+                    memvid_source = "stats.memvid_sdk"
+            if not memvid_block:
+                top_level = data.get("memvid_sdk", {})
+                if isinstance(top_level, dict):
+                    memvid_block = top_level
+                    memvid_source = "memvid_sdk"
+            memvid_enabled = bool(memvid_block.get("enabled"))
         results.append(CheckResult("memory_stats", ok, True, "ok" if ok else (err or "failed")))
-        results.append(CheckResult("memory_memvid_enabled", memvid_enabled, True, f"enabled={memvid_enabled}"))
+        results.append(
+            CheckResult(
+                "memory_memvid_enabled",
+                memvid_enabled,
+                True,
+                f"enabled={memvid_enabled}; source={memvid_source}",
+            )
+        )
 
         ok, data, err = _request_json(client, "GET", f"{base_url}/api/push/native/status")
         native_push_detail = err or "unavailable"

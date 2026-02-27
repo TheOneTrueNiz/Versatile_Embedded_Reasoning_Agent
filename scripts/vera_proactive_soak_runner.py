@@ -42,6 +42,27 @@ def _safe_read_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _safe_read_jsonl(path: Optional[Path]) -> List[Dict[str, Any]]:
+    if not path or not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(item, dict):
+                    rows.append(item)
+    except Exception:
+        return []
+    return rows
+
+
 def _request_json(client: httpx.Client, method: str, url: str, **kwargs: Any) -> Tuple[bool, Any, str, int]:
     try:
         response = client.request(method, url, **kwargs)
@@ -114,6 +135,7 @@ class SoakState:
     seen_run_ids: Set[str] = field(default_factory=set)
     new_reflection_runs: Set[str] = field(default_factory=set)
     reachout_runs: Set[str] = field(default_factory=set)
+    delivery_channels_seen: Set[str] = field(default_factory=set)
     readiness_failures: int = 0
     cycle_updates: int = 0
     samples: int = 0
@@ -130,6 +152,8 @@ def run_soak(
     output_json: Path,
     output_jsonl: Path,
     log_path: Path,
+    user_ack_jsonl: Optional[Path] = None,
+    require_user_ack: bool = False,
 ) -> int:
     start_ts = _utc_iso()
     started_at = time.time()
@@ -190,6 +214,12 @@ def run_soak(
             if isinstance(inner_payload, dict):
                 parsed = _parse_status(inner_payload)
                 sample["autonomy"] = parsed
+                channels = parsed.get("delivery_channels")
+                if isinstance(channels, list):
+                    for channel in channels:
+                        text = str(channel).strip()
+                        if text:
+                            state.delivery_channels_seen.add(text)
                 current_cycle_utc = str(parsed.get("last_cycle_utc") or "")
                 if current_cycle_utc and current_cycle_utc != state.last_cycle_utc:
                     state.cycle_updates += 1
@@ -253,17 +283,53 @@ def run_soak(
         if any(fcm_success_pattern.search(w) for w in window):
             reached_out_with_fcm += 1
 
+    reachout_generated_runs = set(state.reachout_runs)
+    reachout_generated_runs.update(
+        str(row.get("run_id") or "") for row in reachout_log_runs if str(row.get("run_id") or "").strip()
+    )
+    reachout_generated_runs = {run_id for run_id in reachout_generated_runs if run_id}
+
+    user_ack_rows = _safe_read_jsonl(user_ack_jsonl)
+    user_ack_match_count = 0
+    user_ack_matched_run_ids: Set[str] = set()
+    for row in user_ack_rows:
+        run_id = str(row.get("run_id") or "").strip()
+        if run_id and run_id in reachout_generated_runs:
+            user_ack_match_count += 1
+            user_ack_matched_run_ids.add(run_id)
+
+    delivery_channels_observed = sorted(state.delivery_channels_seen)
+    api_only_delivery = delivery_channels_observed == ["api"]
+    reachout_generated_count = len(reachout_generated_runs)
+    # Tier-2 must be correlated to a reach-out run; raw FCM 201 lines can come
+    # from unrelated push/test traffic during the same log window.
+    transport_accept_observed = reached_out_with_fcm >= 1
+    user_visible_confirmed = user_ack_match_count >= 1
+
+    success_tiers = {
+        "tier1_reachout_generated": reachout_generated_count >= 1,
+        "tier2_transport_accepted": transport_accept_observed,
+        "tier3_user_visible_confirmed": user_visible_confirmed,
+    }
+
     pass_flags = {
         "service_ready_during_soak": state.readiness_failures == 0,
         "autonomy_cycles_observed": state.cycle_updates >= 1,
         "new_reflections_observed": (state.ended_reflections - state.started_reflections) >= 1 or len(state.new_reflection_runs) >= 1,
-        "proactive_reachout_observed": len(state.reachout_runs) >= 1 or len(reachout_log_runs) >= 1,
-        "delivery_evidence_observed": reached_out_with_fcm >= 1 or fcm_success_count >= 1,
+        "proactive_reachout_observed": success_tiers["tier1_reachout_generated"],
+        "delivery_evidence_observed": success_tiers["tier2_transport_accepted"],
     }
-    overall_ok = all(pass_flags.values())
+    pass_flags_strict = {
+        **pass_flags,
+        "user_visible_delivery_confirmed": (not require_user_ack) or success_tiers["tier3_user_visible_confirmed"],
+    }
+    overall_ok_base = all(pass_flags.values())
+    overall_ok = all(pass_flags_strict.values())
 
     summary = {
         "ok": overall_ok,
+        "ok_base": overall_ok_base,
+        "ok_strict": all(pass_flags_strict.values()),
         "started_at_utc": start_ts,
         "ended_at_utc": _utc_iso(),
         "duration_minutes": duration_minutes,
@@ -278,13 +344,28 @@ def run_soak(
         "reflection_delta": state.ended_reflections - state.started_reflections,
         "autonomy_cycle_updates": state.cycle_updates,
         "readiness_failures": state.readiness_failures,
+        "delivery_channels_observed": delivery_channels_observed,
+        "delivery_channel_mode": "api_only" if api_only_delivery else "multi_channel",
         "new_reflection_runs": sorted(state.new_reflection_runs),
         "reachout_runs_from_recent_thoughts": sorted(state.reachout_runs),
+        "reachout_generated_runs": sorted(reachout_generated_runs),
+        "reachout_generated_count": reachout_generated_count,
         "log_run_outcomes": outcome_rows[-40:],
         "log_reached_out_runs": reachout_log_runs[-20:],
         "fcm_success_count": fcm_success_count,
         "reached_out_with_fcm_count": reached_out_with_fcm,
+        "success_tiers": success_tiers,
+        "require_user_ack": bool(require_user_ack),
+        "user_ack_jsonl": str(user_ack_jsonl) if user_ack_jsonl else "",
+        "user_ack_rows": len(user_ack_rows),
+        "user_ack_matched_count": user_ack_match_count,
+        "user_ack_matched_run_ids": sorted(user_ack_matched_run_ids),
+        "delivery_semantics": (
+            "tier2=transport acceptance evidence (provider/API), "
+            "tier3 requires explicit user/client acknowledgment rows."
+        ),
         "pass_flags": pass_flags,
+        "pass_flags_strict": pass_flags_strict,
         "final_status": final_status,
     }
 
@@ -302,6 +383,19 @@ def main() -> int:
     parser.add_argument("--output", default="")
     parser.add_argument("--samples-output", default="")
     parser.add_argument("--log-path", default="logs/vera_debug.log")
+    parser.add_argument(
+        "--user-ack-jsonl",
+        default="",
+        help=(
+            "Optional JSONL file containing explicit user/client delivery acknowledgements (run_id keyed). "
+            "Defaults to vera_memory/push_user_ack.jsonl when unset."
+        ),
+    )
+    parser.add_argument(
+        "--require-user-ack",
+        action="store_true",
+        help="Require tier3 user-visible acknowledgement to pass.",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -315,6 +409,10 @@ def main() -> int:
     log_path = Path(args.log_path)
     if not log_path.is_absolute():
         log_path = root / log_path
+    default_user_ack_jsonl = root / "vera_memory" / "push_user_ack.jsonl"
+    user_ack_jsonl: Optional[Path] = Path(args.user_ack_jsonl) if args.user_ack_jsonl else default_user_ack_jsonl
+    if user_ack_jsonl and not user_ack_jsonl.is_absolute():
+        user_ack_jsonl = root / user_ack_jsonl
 
     return run_soak(
         base_url=args.base_url,
@@ -323,6 +421,8 @@ def main() -> int:
         output_json=output,
         output_jsonl=samples,
         log_path=log_path,
+        user_ack_jsonl=user_ack_jsonl,
+        require_user_ack=bool(args.require_user_ack),
     )
 
 

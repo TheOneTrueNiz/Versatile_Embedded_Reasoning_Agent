@@ -71,6 +71,32 @@ registerRoute(
   })
 );
 
+async function postPushAck(notificationData, ackType = 'opened') {
+  const runId = String(notificationData?.run_id || '').trim();
+  if (!runId) return;
+  const endpoint = String(notificationData?.ack_endpoint || '/api/push/native/ack').trim() || '/api/push/native/ack';
+  const payload = {
+    run_id: runId,
+    ack_type: String(ackType || 'opened').trim().toLowerCase() || 'opened',
+    source: 'web_push_sw',
+    channel: 'web_push',
+    event_type: String(notificationData?.event_type || '').trim(),
+    metadata: {
+      target_url: String(notificationData?.url || '/'),
+    },
+  };
+
+  try {
+    await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (_error) {
+    // Ack is best-effort telemetry and should never block notification UX.
+  }
+}
+
 self.addEventListener('push', (event) => {
   let data = {};
   try {
@@ -94,8 +120,9 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl = event.notification?.data?.url || '/';
-  event.waitUntil(
+  const notificationData = event.notification?.data || {};
+  const targetUrl = notificationData.url || '/';
+  const openPromise =
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientsArr) => {
       for (const client of clientsArr) {
         if (client.url.includes(targetUrl) && 'focus' in client) {
@@ -107,5 +134,8 @@ self.addEventListener('notificationclick', (event) => {
       }
       return null;
     })
-  );
+  ;
+  const ackType = String(notificationData?.ack_type || 'opened').trim().toLowerCase() || 'opened';
+  const ackPromise = postPushAck(notificationData, ackType);
+  event.waitUntil(Promise.allSettled([openPromise, ackPromise]));
 });

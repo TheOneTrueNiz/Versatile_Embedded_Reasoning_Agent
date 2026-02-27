@@ -81,7 +81,17 @@ def _preview(text: str, limit: int = 220) -> str:
     return single[:limit]
 
 
-def _build_checklist_cmd(python_bin: str, root: Path, host: str, port: int, out: Path) -> List[str]:
+def _build_checklist_cmd(
+    python_bin: str,
+    root: Path,
+    host: str,
+    port: int,
+    out: Path,
+    *,
+    http_timeout: float,
+    chat_retries: int,
+    chat_retry_sleep: float,
+) -> List[str]:
     return [
         python_bin,
         str(root / "scripts" / "vera_production_checklist.py"),
@@ -91,6 +101,12 @@ def _build_checklist_cmd(python_bin: str, root: Path, host: str, port: int, out:
         str(port),
         "--min-running-mcp",
         "8",
+        "--timeout",
+        str(max(5.0, float(http_timeout))),
+        "--chat-retries",
+        str(max(1, int(chat_retries))),
+        "--chat-retry-sleep",
+        str(max(0.0, float(chat_retry_sleep))),
         "--output",
         str(out),
     ]
@@ -129,6 +145,24 @@ def main() -> int:
     parser.add_argument("--duration-hours", type=float, default=12.0)
     parser.add_argument("--interval-seconds", type=int, default=900)
     parser.add_argument("--check-timeout", type=float, default=360.0)
+    parser.add_argument(
+        "--check-http-timeout",
+        type=float,
+        default=60.0,
+        help="HTTP timeout passed to vera_production_checklist.py --timeout",
+    )
+    parser.add_argument(
+        "--check-chat-retries",
+        type=int,
+        default=3,
+        help="Chat probe retry attempts passed to checklist",
+    )
+    parser.add_argument(
+        "--check-chat-retry-sleep",
+        type=float,
+        default=0.5,
+        help="Base retry sleep passed to checklist chat probe",
+    )
     parser.add_argument("--run-regression", action="store_true")
     parser.add_argument("--regression-limit", type=int, default=4)
     parser.add_argument("--regression-max-seconds", type=float, default=180.0)
@@ -183,7 +217,16 @@ def main() -> int:
         cycle_started = time.time()
         cycle_ts = _utc_ts()
         checklist_out = root / "tmp" / "soak" / f"checklist_{cycle_ts}.json"
-        checklist_cmd = _build_checklist_cmd(python_bin, root, args.host, args.port, checklist_out)
+        checklist_cmd = _build_checklist_cmd(
+            python_bin,
+            root,
+            args.host,
+            args.port,
+            checklist_out,
+            http_timeout=args.check_http_timeout,
+            chat_retries=args.check_chat_retries,
+            chat_retry_sleep=args.check_chat_retry_sleep,
+        )
         checklist_run = _run(checklist_cmd, timeout=args.check_timeout)
         checklist_payload = _load_json(checklist_out) if checklist_out.exists() else {}
 
@@ -308,6 +351,9 @@ def main() -> int:
         "recoveries": recoveries,
         "auto_recover": bool(args.auto_recover),
         "failure_threshold": args.failure_threshold,
+        "check_http_timeout": args.check_http_timeout,
+        "check_chat_retries": args.check_chat_retries,
+        "check_chat_retry_sleep": args.check_chat_retry_sleep,
         "log_jsonl": str(output),
     }
     summary.write_text(json.dumps(final, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")

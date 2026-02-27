@@ -323,51 +323,82 @@ class OAuth21SessionStore:
             issuer: Token issuer (e.g., "https://accounts.google.com")
         """
         with self._lock:
+            existing_info = self._sessions.get(user_email, {})
             normalized_expiry = _normalize_expiry_to_naive_utc(expiry)
+
+            # Preserve refresh/client metadata when partial updates are written.
+            # Google token refresh needs refresh_token + token_uri + client_id + client_secret.
+            resolved_refresh_token = refresh_token or existing_info.get("refresh_token")
+            resolved_token_uri = (
+                token_uri
+                or existing_info.get("token_uri")
+                or "https://oauth2.googleapis.com/token"
+            )
+            resolved_client_id = client_id or existing_info.get("client_id")
+            resolved_client_secret = client_secret or existing_info.get("client_secret")
+            resolved_scopes = (
+                scopes if scopes is not None else existing_info.get("scopes", [])
+            )
+            resolved_expiry = (
+                normalized_expiry
+                if normalized_expiry is not None
+                else existing_info.get("expiry")
+            )
+            resolved_session_id = session_id or existing_info.get("session_id")
+            resolved_mcp_session_id = (
+                mcp_session_id or existing_info.get("mcp_session_id")
+            )
+            resolved_issuer = issuer if issuer is not None else existing_info.get(
+                "issuer"
+            )
+
             session_info = {
                 "access_token": access_token,
-                "refresh_token": refresh_token,
-                "token_uri": token_uri,
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "scopes": scopes or [],
-                "expiry": normalized_expiry,
-                "session_id": session_id,
-                "mcp_session_id": mcp_session_id,
-                "issuer": issuer,
+                "refresh_token": resolved_refresh_token,
+                "token_uri": resolved_token_uri,
+                "client_id": resolved_client_id,
+                "client_secret": resolved_client_secret,
+                "scopes": resolved_scopes,
+                "expiry": resolved_expiry,
+                "session_id": resolved_session_id,
+                "mcp_session_id": resolved_mcp_session_id,
+                "issuer": resolved_issuer,
             }
 
             self._sessions[user_email] = session_info
 
             # Store MCP session mapping if provided
-            if mcp_session_id:
+            if resolved_mcp_session_id:
                 # Create immutable session binding (first binding wins, cannot be changed)
-                if mcp_session_id not in self._session_auth_binding:
-                    self._session_auth_binding[mcp_session_id] = user_email
+                if resolved_mcp_session_id not in self._session_auth_binding:
+                    self._session_auth_binding[resolved_mcp_session_id] = user_email
                     logger.info(
-                        f"Created immutable session binding: {mcp_session_id} -> {user_email}"
+                        f"Created immutable session binding: {resolved_mcp_session_id} -> {user_email}"
                     )
-                elif self._session_auth_binding[mcp_session_id] != user_email:
+                elif self._session_auth_binding[resolved_mcp_session_id] != user_email:
                     # Security: Attempt to bind session to different user
                     logger.error(
-                        f"SECURITY: Attempt to rebind session {mcp_session_id} from {self._session_auth_binding[mcp_session_id]} to {user_email}"
+                        f"SECURITY: Attempt to rebind session {resolved_mcp_session_id} from {self._session_auth_binding[resolved_mcp_session_id]} to {user_email}"
                     )
                     raise ValueError(
-                        f"Session {mcp_session_id} is already bound to a different user"
+                        f"Session {resolved_mcp_session_id} is already bound to a different user"
                     )
 
-                self._mcp_session_mapping[mcp_session_id] = user_email
+                self._mcp_session_mapping[resolved_mcp_session_id] = user_email
                 logger.info(
-                    f"Stored OAuth 2.1 session for {user_email} (session_id: {session_id}, mcp_session_id: {mcp_session_id})"
+                    f"Stored OAuth 2.1 session for {user_email} (session_id: {resolved_session_id}, mcp_session_id: {resolved_mcp_session_id})"
                 )
             else:
                 logger.info(
-                    f"Stored OAuth 2.1 session for {user_email} (session_id: {session_id})"
+                    f"Stored OAuth 2.1 session for {user_email} (session_id: {resolved_session_id})"
                 )
 
             # Also create binding for the OAuth session ID
-            if session_id and session_id not in self._session_auth_binding:
-                self._session_auth_binding[session_id] = user_email
+            if (
+                resolved_session_id
+                and resolved_session_id not in self._session_auth_binding
+            ):
+                self._session_auth_binding[resolved_session_id] = user_email
 
     def get_credentials(self, user_email: str) -> Optional[Credentials]:
         """

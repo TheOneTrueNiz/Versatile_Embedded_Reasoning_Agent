@@ -379,6 +379,51 @@ class LLMBridge:
         )
 
     @staticmethod
+    def _tool_result_indicates_failure(result: Any) -> bool:
+        lowered = str(result or "").strip().lower()
+        if not lowered:
+            return False
+        failure_prefixes = (
+            "error:",
+            "tool execution error:",
+            "tool execution timeout",
+            "tool execution unavailable",
+            "⚠️",
+        )
+        if any(lowered.startswith(prefix) for prefix in failure_prefixes):
+            return True
+        failure_markers = (
+            "action required: google authentication needed",
+            "google authentication needed",
+            "rate limit exceeded",
+            "quota exceeded",
+            "internal server error",
+            "timed out after",
+            "failed to start",
+            "must authorize this application",
+        )
+        return any(marker in lowered for marker in failure_markers)
+
+    @staticmethod
+    def _classify_tool_result_failure(tool_name: str, result: Any) -> str:
+        lowered = str(result or "").strip().lower()
+        tool = str(tool_name or "").strip()
+        if (
+            "google authentication needed" in lowered
+            or "must authorize this application" in lowered
+            or "click here to authorize" in lowered
+            or "googleauthenticationerror" in lowered
+        ):
+            return f"tool_auth_required:{tool}"
+        if "rate limit exceeded" in lowered or "429" in lowered:
+            return f"tool_rate_limited:{tool}"
+        if "quota exceeded" in lowered:
+            return f"tool_quota_exceeded:{tool}"
+        if "timed out" in lowered:
+            return f"tool_timeout:{tool}"
+        return f"tool_execution_error:{tool}"
+
+    @staticmethod
     def _parse_float(value: Any, default: float = 0.0) -> float:
         try:
             return float(value)
@@ -488,9 +533,49 @@ class LLMBridge:
             return "Model request timed out; recovered safely. Please retry with a narrower request."
         if "tool_timeout" in lowered or "tool execution timeout" in lowered:
             return "Tool execution timed out; stopped safely. Please retry with a narrower request."
+        if "tool_auth_required" in lowered:
+            return "Tool authorization is required before continuing. Re-authorize and retry."
+        if "tool_rate_limited" in lowered:
+            return "Tool calls were rate-limited; please retry in a moment."
+        if "tool_quota_exceeded" in lowered:
+            return "Tool quota was exceeded; retry later or adjust limits."
+        if "tool_execution_error" in lowered:
+            return "Tool execution failed; recovered safely. Please retry or narrow the request."
         if "llm_call_failed" in lowered:
             return "Model call failed; recovered safely. Please retry."
         return "Tool call limit reached; unable to complete the request."
+
+    @staticmethod
+    def _is_non_retryable_tool_failure(workflow_error: str) -> bool:
+        lowered = str(workflow_error or "").strip().lower()
+        if not lowered:
+            return False
+        if lowered.startswith("confirmation_required:"):
+            return True
+        if lowered.startswith("tool_auth_required:"):
+            return True
+        if lowered.startswith("tool_rate_limited:"):
+            return True
+        if lowered.startswith("tool_quota_exceeded:"):
+            return True
+        if lowered.startswith("tool_execution_error:"):
+            return True
+        if "tool execution unavailable" in lowered:
+            return True
+        return False
+
+    @staticmethod
+    def _mark_tool_round_budget_exhausted(
+        workflow_plan: Dict[str, Any],
+        workflow_error: str,
+    ) -> str:
+        """Normalize max-round exhaustion into a classified workflow failure."""
+        normalized_error = str(workflow_error or "").strip() or "tool_call_limit_reached"
+        if workflow_plan:
+            workflow_plan["active"] = False
+            if not workflow_plan.get("abandon_reason"):
+                workflow_plan["abandon_reason"] = "tool_call_limit_reached"
+        return normalized_error
 
     @staticmethod
     def _normalize_tool_call_arguments(arguments: Any) -> str:
@@ -672,6 +757,7 @@ class LLMBridge:
         workflow_chain: List[str],
         explicit_tools: List[str],
         forced_tool: Optional[str],
+        avoid_tools: Optional[List[str]] = None,
     ) -> Tuple[bool, str]:
         chain = [
             str(name).strip()
@@ -693,6 +779,16 @@ class LLMBridge:
         forced = str(forced_tool or "").strip()
         if forced and forced not in chain:
             return False, f"forced_tool_mismatch:{forced}"
+
+        avoid = {
+            str(name).strip()
+            for name in list(avoid_tools or [])
+            if isinstance(name, str) and str(name).strip()
+        }
+        if avoid:
+            overlap = [name for name in chain if name in avoid]
+            if overlap:
+                return False, f"avoid_tools_overlap:{','.join(overlap[:3])}"
 
         source = str(workflow_plan.get("source") or "").strip().lower()
         if source == "fuzzy":
@@ -875,74 +971,17 @@ class LLMBridge:
         tool_set = set(tool_names or [])
         explicit_matches = LLMBridge._extract_explicit_tool_mentions(context, tool_names)
 
-        # Only force a tool when the user explicitly asks for exactly one.
+        # Only force a tool when the user explicitly asks for exactly one
+        # by name (e.g. backticked `create_event` or literal tool name).
         # When multiple explicit tool names are present, keep tool_choice=auto
         # so multi-tool chains are not accidentally collapsed.
         if len(explicit_matches) == 1:
             return explicit_matches[0]
 
-        # Conservative intent forcing: only for direct action requests,
-        # not "capability" questions ("can you", "is it possible", etc.).
-        capability_query = (
-            "?" in context_lower
-            and any(
-                phrase in context_lower
-                for phrase in (
-                    "can you",
-                    "could you",
-                    "would you",
-                    "do you",
-                    "are you able",
-                    "is it possible",
-                )
-            )
-        )
-        action_request = any(
-            phrase in context_lower
-            for phrase in (
-                "set ",
-                "schedule",
-                "book",
-                "create ",
-                "send ",
-                "remind",
-                "notify",
-            )
-        )
-
-        if action_request and not capability_query:
-            reminder_signal = any(
-                phrase in context_lower
-                for phrase in (
-                    "remind me",
-                    "set reminder",
-                    "set a reminder",
-                    "reminder",
-                    "schedule",
-                    "calendar",
-                    "appointment",
-                    "event",
-                )
-            )
-            if reminder_signal:
-                for name in ("create_event", "create_task", "create_task_list", "set_reminder"):
-                    if name in tool_set:
-                        return name
-
-            push_signal = any(
-                phrase in context_lower
-                for phrase in (
-                    "push",
-                    "notification",
-                    "notify",
-                    "alert",
-                    "ping",
-                )
-            )
-            if push_signal:
-                for name in ("send_native_push", "send_mobile_push", "send_sms", "send_mms"):
-                    if name in tool_set:
-                        return name
+        # Let the LLM decide which tool to call based on context.
+        # Keyword-based intent heuristics were removed because they caused
+        # mis-routing (e.g. forcing create_event when the user asked to
+        # *view* calendar events, or forcing it before auth was complete).
         return None
 
     def _select_model_for_task(
@@ -1880,6 +1919,11 @@ class LLMBridge:
             or spec_signal
             or question_signal
         )
+        time_math_signal = bool(
+            ("utc" in context_text or "timezone" in context_text)
+            and ("minute" in context_text or "minutes" in context_text or "hour" in context_text)
+            and ("until" in context_text or "remain" in context_text or "remaining" in context_text)
+        )
         number_or_time_signal = number_signal or time_recency_signal
         long_context_signal = len(context_text) >= long_context_trigger or any(
             keyword in context_text for keyword in (*summarize_keywords, *long_context_keywords)
@@ -2528,10 +2572,21 @@ class LLMBridge:
             context,
             list(native_defs.keys()) + all_mcp_tools,
         )
+        available_tool_names = set(native_defs.keys()) | set(all_mcp_tools)
+        inferred_required_tools: List[str] = []
+        if time_math_signal:
+            for required_tool in ("time", "calculate"):
+                if required_tool in available_tool_names and required_tool not in inferred_required_tools:
+                    inferred_required_tools.append(required_tool)
+        for required_tool in inferred_required_tools:
+            if required_tool not in explicit_tools:
+                explicit_tools.append(required_tool)
         forced_tool = self._detect_forced_tool_choice(
             context,
             list(native_defs.keys()) + all_mcp_tools
         )
+        if not forced_tool and inferred_required_tools:
+            forced_tool = inferred_required_tools[0]
 
         # Auto-detect media generation intent and force the native tool
         if not forced_tool and context:
@@ -2541,21 +2596,32 @@ class LLMBridge:
             elif media_intent == "image" and "generate_image" in native_defs:
                 forced_tool = "generate_image"
 
-        # Auto-detect live data intent and force web search
+        # Auto-detect live data intent — ensure web search is AVAILABLE but
+        # do not force it as the sole tool.  The genome's memory-first policy
+        # instructs the LLM to check memory before web search; forcing a web
+        # tool here bypasses that and causes Grok to skip memory entirely.
         self._live_data_forced_tool: Optional[str] = None
         if not forced_tool and context:
             if self._detect_live_data_intent(context):
-                # Prefer brave_ai_grounding for factual queries, fallback to brave_web_search
+                # Ensure web category is included so search servers are selected
+                if "web" not in selected_categories:
+                    selected_categories.append("web")
+                # Ensure memory category is also included so LLM can check
+                # memory first per genome policy
+                if "memory" not in selected_categories:
+                    selected_categories.append("memory")
+                # Record which search tool would be preferred (used for
+                # priority_tools below) but do NOT force it as tool_choice
                 search_tools = [t for t in all_mcp_tools if t in (
                     "brave_ai_grounding", "brave_web_search", "searxng_search",
                 )]
                 if search_tools:
-                    forced_tool = search_tools[0]
-                    self._live_data_forced_tool = forced_tool
-                    # Ensure web category is included so search servers are selected
-                    if "web" not in selected_categories:
-                        selected_categories.append("web")
-                    logger.info("Live data intent detected — forcing tool: %s", forced_tool)
+                    self._live_data_forced_tool = search_tools[0]
+                    logger.info(
+                        "Live data intent detected — web search available: %s "
+                        "(not forced; memory-first policy applies)",
+                        self._live_data_forced_tool,
+                    )
 
         self._tool_aliases = {}
         mcp_defs: Dict[str, Dict[str, Any]] = {}
@@ -2740,6 +2806,9 @@ class LLMBridge:
             priority_tools.append("brave_summarize")
         if long_context_signal:
             priority_tools.append("recursive_summarize")
+        for required_tool in inferred_required_tools:
+            if required_tool in mcp_defs and required_tool not in priority_tools:
+                priority_tools.append(required_tool)
         if phone_hit and "initiate_call" in mcp_defs:
             priority_tools.append("initiate_call")
         if reminder_signal:
@@ -2774,6 +2843,17 @@ class LLMBridge:
             if (tool_name in native_defs or tool_name in mcp_defs) and tool_name not in priority_tools:
                 priority_tools.append(tool_name)
 
+        # When live data intent was detected, add memory tools first (so LLM
+        # checks memory before web search per genome policy), then the search
+        # tool.  This makes both available without forcing tool_choice.
+        if self._live_data_forced_tool:
+            for mem_tool in ("retrieve_memory", "search_archive"):
+                if mem_tool in native_defs and mem_tool not in priority_tools:
+                    priority_tools.append(mem_tool)
+            if self._live_data_forced_tool not in priority_tools:
+                if self._live_data_forced_tool in native_defs or self._live_data_forced_tool in mcp_defs:
+                    priority_tools.append(self._live_data_forced_tool)
+
         if forced_tool and (forced_tool in native_defs or forced_tool in mcp_defs):
             if forced_tool not in priority_tools:
                 priority_tools.insert(0, forced_tool)
@@ -2789,6 +2869,7 @@ class LLMBridge:
 
         workflow_plan: Dict[str, Any] = self._consume_request_workflow_hint(context)
         workflow_suggested_chain: List[str] = list(workflow_plan.get("tool_chain", []) or [])
+        failure_learning_plan: Dict[str, Any] = {}
         if self._is_acknowledgement_turn(context or ""):
             workflow_plan = {}
             workflow_suggested_chain = []
@@ -2829,6 +2910,15 @@ class LLMBridge:
                     self._trace_workflow("suggest_chain_error")
                     workflow_plan = {}
                     workflow_suggested_chain = []
+        if context and not self._is_acknowledgement_turn(context or ""):
+            failure_learning_plan = self._load_failure_learning_plan(str(context or ""))
+            if failure_learning_plan:
+                self._trace_workflow(
+                    "failure_plan_loaded tag=%s avoid=%s recovery=%s",
+                    str(failure_learning_plan.get("source_failure_tag", "")),
+                    list(failure_learning_plan.get("avoid_tools", []) or []),
+                    list(failure_learning_plan.get("suggested_recovery_chain", []) or []),
+                )
         if workflow_suggested_chain:
             chain_ok, chain_reason = self._should_accept_workflow_chain(
                 context=str(context or ""),
@@ -2836,6 +2926,7 @@ class LLMBridge:
                 workflow_chain=workflow_suggested_chain,
                 explicit_tools=list(explicit_tools),
                 forced_tool=forced_tool,
+                avoid_tools=list(failure_learning_plan.get("avoid_tools", []) or []),
             )
             if not chain_ok:
                 self._trace_workflow(
@@ -2874,16 +2965,6 @@ class LLMBridge:
                     forced_prefix = [forced_tool]
                 priority_tools = forced_prefix + promoted_chain + existing
 
-        failure_learning_plan: Dict[str, Any] = {}
-        if context and not self._is_acknowledgement_turn(context or ""):
-            failure_learning_plan = self._load_failure_learning_plan(str(context or ""))
-            if failure_learning_plan:
-                self._trace_workflow(
-                    "failure_plan_loaded tag=%s avoid=%s recovery=%s",
-                    str(failure_learning_plan.get("source_failure_tag", "")),
-                    list(failure_learning_plan.get("avoid_tools", []) or []),
-                    list(failure_learning_plan.get("suggested_recovery_chain", []) or []),
-                )
         if failure_learning_plan:
             allowed_names = list(native_defs.keys()) + list(mcp_defs.keys())
             priority_tools = self._apply_failure_plan_to_priority(
@@ -3750,10 +3831,41 @@ class LLMBridge:
 
         cleaned = "\n".join(filtered_lines).strip()
         cleaned = re.sub(r"\bno dice\b", "I can't complete that step", cleaned, flags=re.IGNORECASE)
-        advisory = (
-            "I can send an immediate native push now. "
-            "For scheduled reminder delivery, share your Google email and timezone so I can create the calendar event."
-        )
+        workspace_email = ""
+        workspace_authenticated = False
+        vera_ref = getattr(self, "vera", None)
+        if vera_ref:
+            auth_context_resolver = getattr(vera_ref, "_resolve_workspace_google_auth_context", None)
+            if callable(auth_context_resolver):
+                try:
+                    resolved_email, resolved_auth = auth_context_resolver()
+                    workspace_email = str(resolved_email or "").strip().lower()
+                    workspace_authenticated = bool(resolved_auth)
+                except Exception:
+                    logger.debug("Suppressed Exception in llm_bridge")
+            if not workspace_email:
+                email_resolver = getattr(vera_ref, "_resolve_workspace_user_email", None)
+                if callable(email_resolver):
+                    try:
+                        workspace_email = str(email_resolver() or "").strip().lower()
+                    except Exception:
+                        logger.debug("Suppressed Exception in llm_bridge")
+
+        if workspace_email and workspace_authenticated:
+            advisory = (
+                "I can send an immediate native push now. "
+                "For scheduled reminder delivery, I'll use your onboarded Google Workspace account automatically."
+            )
+        elif workspace_email:
+            advisory = (
+                "I can send an immediate native push now. "
+                "For scheduled reminder delivery, I'll reuse your onboarded Google account and continue auth if needed."
+            )
+        else:
+            advisory = (
+                "I can send an immediate native push now. "
+                "For scheduled reminder delivery, share your Google email and timezone so I can create the calendar event."
+            )
         if not cleaned:
             return advisory
         if "immediate native push" not in cleaned.lower():
@@ -4680,6 +4792,15 @@ class LLMBridge:
                         workflow_plan["active"] = False
                         if not workflow_plan.get("abandon_reason"):
                             workflow_plan["abandon_reason"] = f"confirmation_required:{tool_name}"
+                elif exec_status == "ok" and self._tool_result_indicates_failure(tool_result):
+                    exec_status = "error"
+                    if not workflow_error:
+                        workflow_error = self._classify_tool_result_failure(tool_name, tool_result)
+                    workflow_failed = True
+                    if workflow_plan and workflow_plan.get("active"):
+                        workflow_plan["active"] = False
+                        if not workflow_plan.get("abandon_reason"):
+                            workflow_plan["abandon_reason"] = f"tool_execution_error:{tool_name}"
 
                 exec_entry = {
                     "tool_name": tool_name,
@@ -4704,11 +4825,13 @@ class LLMBridge:
                         if str(name).strip()
                     }
                     tools_failed.update(normalized_failed_names)
+                    non_retryable_failure = self._is_non_retryable_tool_failure(workflow_error)
+                    effective_retry_limit = 1 if non_retryable_failure else tool_failure_retry_limit
                     newly_disabled: List[str] = []
                     for failed_name in normalized_failed_names:
                         failure_count = int(failed_tool_counts.get(failed_name, 0)) + 1
                         failed_tool_counts[failed_name] = failure_count
-                        if failure_count >= tool_failure_retry_limit and failed_name not in disabled_tool_names:
+                        if failure_count >= effective_retry_limit and failed_name not in disabled_tool_names:
                             disabled_tool_names.add(failed_name)
                             newly_disabled.append(failed_name)
                     if newly_disabled:
@@ -4722,8 +4845,9 @@ class LLMBridge:
                         if forced_name and forced_name in disabled_tool_names:
                             current_tool_choice = None
                         logger.warning(
-                            "Disabled tools for current request after repeated failures: %s",
+                            "Disabled tools for current request after failures: %s (non_retryable=%s)",
                             disabled_text,
+                            non_retryable_failure,
                         )
                 self.tool_execution_history.append(exec_entry)
                 if len(self.tool_execution_history) > 100:
@@ -4780,6 +4904,13 @@ class LLMBridge:
                 workflow_plan=workflow_plan,
                 called_tools=called_tools,
                 workflow_failed=workflow_failed,
+            )
+        else:
+            workflow_failed = True
+            workflow_error = self._mark_tool_round_budget_exhausted(workflow_plan, workflow_error)
+            logger.warning(
+                "Tool-call round budget exhausted in respond() (max_rounds=%s)",
+                self.max_tool_rounds,
             )
 
         self.last_tools_used = list(tools_used)
@@ -5218,6 +5349,15 @@ class LLMBridge:
                         workflow_plan["active"] = False
                         if not workflow_plan.get("abandon_reason"):
                             workflow_plan["abandon_reason"] = f"confirmation_required:{tool_name}"
+                elif exec_status == "ok" and self._tool_result_indicates_failure(tool_result):
+                    exec_status = "error"
+                    if not workflow_error:
+                        workflow_error = self._classify_tool_result_failure(tool_name, tool_result)
+                    workflow_failed = True
+                    if workflow_plan and workflow_plan.get("active"):
+                        workflow_plan["active"] = False
+                        if not workflow_plan.get("abandon_reason"):
+                            workflow_plan["abandon_reason"] = f"tool_execution_error:{tool_name}"
 
                 # Record execution in history
                 exec_entry = {
@@ -5243,11 +5383,13 @@ class LLMBridge:
                         if str(name).strip()
                     }
                     tools_failed.update(normalized_failed_names)
+                    non_retryable_failure = self._is_non_retryable_tool_failure(workflow_error)
+                    effective_retry_limit = 1 if non_retryable_failure else tool_failure_retry_limit
                     newly_disabled: List[str] = []
                     for failed_name in normalized_failed_names:
                         failure_count = int(failed_tool_counts.get(failed_name, 0)) + 1
                         failed_tool_counts[failed_name] = failure_count
-                        if failure_count >= tool_failure_retry_limit and failed_name not in disabled_tool_names:
+                        if failure_count >= effective_retry_limit and failed_name not in disabled_tool_names:
                             disabled_tool_names.add(failed_name)
                             newly_disabled.append(failed_name)
                     if newly_disabled:
@@ -5261,8 +5403,9 @@ class LLMBridge:
                         if forced_name and forced_name in disabled_tool_names:
                             current_tool_choice = None
                         logger.warning(
-                            "Disabled tools for current API request after repeated failures: %s",
+                            "Disabled tools for current API request after failures: %s (non_retryable=%s)",
                             disabled_text,
+                            non_retryable_failure,
                         )
                 self.tool_execution_history.append(exec_entry)
                 # Cap at 100 entries
@@ -5320,6 +5463,14 @@ class LLMBridge:
                 workflow_plan=workflow_plan,
                 called_tools=called_tools,
                 workflow_failed=workflow_failed,
+            )
+        else:
+            workflow_failed = True
+            workflow_error = self._mark_tool_round_budget_exhausted(workflow_plan, workflow_error)
+            logger.warning(
+                "Tool-call round budget exhausted in respond_messages() (max_rounds=%s conversation_id=%s)",
+                self.max_tool_rounds,
+                conversation_id or "default",
             )
 
         if persist_history:

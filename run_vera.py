@@ -166,8 +166,25 @@ For more configuration options, see src/core/runtime/config.py
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("--dev", action="store_true", help="Enable max logging and preflight checks")
     parser.add_argument("--logging", action="store_true", help="Enable max logging and preflight checks")
+    parser.add_argument(
+        "--memory-footprint-mb",
+        type=float,
+        default=None,
+        help=(
+            "Max persistent memory footprint budget in MB "
+            "(sets VERA_MEMORY_MAX_FOOTPRINT_MB, default: 1024). "
+            "Set 0 to disable budget checks."
+        ),
+    )
 
     args = parser.parse_args()
+
+    if args.memory_footprint_mb is not None:
+        if args.memory_footprint_mb < 0:
+            parser.error("--memory-footprint-mb must be >= 0")
+        os.environ["VERA_MEMORY_MAX_FOOTPRINT_MB"] = f"{args.memory_footprint_mb:g}"
+    elif not os.getenv("VERA_MEMORY_MAX_FOOTPRINT_MB", "").strip():
+        os.environ["VERA_MEMORY_MAX_FOOTPRINT_MB"] = "1024"
 
     if args.dev or args.logging:
         os.environ["VERA_PREFLIGHT"] = "1"

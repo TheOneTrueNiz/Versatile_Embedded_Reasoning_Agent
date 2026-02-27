@@ -21,6 +21,7 @@ import os
 import re
 import time
 import sys
+import heapq
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
@@ -73,6 +74,7 @@ class VERAMemoryService:
     def __init__(self, config: VERAConfig) -> None:
         self.config = config
         memory_dir = getattr(config, 'memory_dir', Path.cwd() / 'vera_memory')
+        self.memory_dir = Path(memory_dir)
 
         # Week 2: Memory foundation (Ingestion)
         self.fast_network = FastNetwork(
@@ -143,6 +145,12 @@ class VERAMemoryService:
             "memvid_hits": 0,
             "total_latency_ms": 0.0,
         }
+        self._disk_scan_interval_seconds = int(os.getenv("VERA_MEMORY_DISK_SCAN_INTERVAL_SECONDS", "30") or "30")
+        self._disk_scan_interval_seconds = max(5, self._disk_scan_interval_seconds)
+        self._disk_scan_top_files = int(os.getenv("VERA_MEMORY_DISK_TOP_FILES", "8") or "8")
+        self._disk_scan_top_files = max(1, min(self._disk_scan_top_files, 50))
+        self._disk_snapshot_cached_at = 0.0
+        self._disk_snapshot_cache: Dict[str, Any] = {}
         self._poison_patterns = [
             re.compile(r"(?i)ignore (all|previous|prior) instructions"),
             re.compile(r"(?i)system prompt"),
@@ -745,6 +753,110 @@ class VERAMemoryService:
         """Get all memory topics"""
         return self.graph_rag.get_topics()
 
+    @staticmethod
+    def _safe_env_float(name: str, fallback: float, minimum: float = 0.0) -> float:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return fallback
+        try:
+            value = float(raw)
+        except Exception:
+            return fallback
+        return max(minimum, value)
+
+    def _compute_disk_usage_snapshot(self) -> Dict[str, Any]:
+        total_bytes = 0
+        per_dir: Dict[str, int] = {}
+        top_heap: List[Tuple[int, str]] = []
+        root = self.memory_dir
+
+        if not root.exists():
+            return {
+                "path": str(root),
+                "exists": False,
+                "total_bytes": 0,
+                "total_mb": 0.0,
+                "budget_mb": 0.0,
+                "budget_bytes": 0,
+                "utilization": 0.0,
+                "pressure": "none",
+                "over_budget": False,
+                "top_files": [],
+                "by_top_level_dir": {},
+                "scanned_at_utc": datetime.utcnow().isoformat() + "Z",
+            }
+
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            total_bytes += size
+
+            try:
+                rel = path.relative_to(root)
+                top_level = rel.parts[0] if rel.parts else "."
+            except Exception:
+                top_level = "."
+            per_dir[top_level] = per_dir.get(top_level, 0) + size
+
+            item = (size, str(path))
+            if len(top_heap) < self._disk_scan_top_files:
+                heapq.heappush(top_heap, item)
+            elif size > top_heap[0][0]:
+                heapq.heapreplace(top_heap, item)
+
+        budget_mb = self._safe_env_float("VERA_MEMORY_MAX_FOOTPRINT_MB", 1024.0, minimum=0.0)
+        budget_bytes = int(budget_mb * 1024 * 1024) if budget_mb > 0 else 0
+        utilization = (total_bytes / budget_bytes) if budget_bytes > 0 else 0.0
+        if budget_bytes <= 0:
+            pressure = "unbounded"
+        elif utilization >= 0.95:
+            pressure = "critical"
+        elif utilization >= 0.85:
+            pressure = "high"
+        elif utilization >= 0.70:
+            pressure = "moderate"
+        else:
+            pressure = "low"
+
+        top_files = [
+            {"path": path, "bytes": int(size), "mb": round(size / (1024 * 1024), 3)}
+            for size, path in sorted(top_heap, reverse=True)
+        ]
+        by_dir = {
+            key: {"bytes": int(val), "mb": round(val / (1024 * 1024), 3)}
+            for key, val in sorted(per_dir.items(), key=lambda item: item[1], reverse=True)
+        }
+        return {
+            "path": str(root),
+            "exists": True,
+            "total_bytes": int(total_bytes),
+            "total_mb": round(total_bytes / (1024 * 1024), 3),
+            "budget_mb": float(budget_mb),
+            "budget_bytes": int(budget_bytes),
+            "utilization": round(utilization, 4) if budget_bytes > 0 else 0.0,
+            "pressure": pressure,
+            "over_budget": bool(budget_bytes > 0 and total_bytes > budget_bytes),
+            "top_files": top_files,
+            "by_top_level_dir": by_dir,
+            "scanned_at_utc": datetime.utcnow().isoformat() + "Z",
+        }
+
+    def _get_disk_usage_snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        if (
+            self._disk_snapshot_cache
+            and (now - self._disk_snapshot_cached_at) < self._disk_scan_interval_seconds
+        ):
+            return dict(self._disk_snapshot_cache)
+        snapshot = self._compute_disk_usage_snapshot()
+        self._disk_snapshot_cache = dict(snapshot)
+        self._disk_snapshot_cached_at = now
+        return snapshot
+
     def get_stats(self) -> Dict[str, Any]:
         """Get memory system statistics"""
         return {
@@ -764,4 +876,5 @@ class VERAMemoryService:
                 "quarantine": len(self.slow_network.quarantined_events),
             },
             "retrieval": self._retrieval_stats.copy(),
+            "disk_usage": self._get_disk_usage_snapshot(),
         }

@@ -113,6 +113,22 @@ def test_should_accept_workflow_chain_rejects_budget_overflow() -> None:
     assert reason == "chain_exceeds_budget:5>4"
 
 
+def test_should_accept_workflow_chain_rejects_avoid_tools_overlap() -> None:
+    bridge = _make_bridge(max_tool_rounds=6)
+
+    accepted, reason = bridge._should_accept_workflow_chain(
+        context="execute the task",
+        workflow_plan={"source": "direct"},
+        workflow_chain=["search_web", "create_event", "send_mobile_push"],
+        explicit_tools=[],
+        forced_tool=None,
+        avoid_tools=["create_event"],
+    )
+
+    assert accepted is False
+    assert reason.startswith("avoid_tools_overlap:")
+
+
 def test_resolve_runtime_plan_skips_over_budget_chain() -> None:
     bridge = _make_bridge(max_tool_rounds=5)
     bridge.last_tool_payload = {
@@ -234,6 +250,69 @@ def test_final_failure_response_maps_timeout_errors() -> None:
     )
     assert LLMBridge._final_failure_response("no_progress_tool_loop:repeat_rounds=3") == (
         "Tool loop made no progress; aborted safely. Please rephrase or narrow the request."
+    )
+    assert LLMBridge._final_failure_response("tool_auth_required:create_event") == (
+        "Tool authorization is required before continuing. Re-authorize and retry."
+    )
+    assert LLMBridge._final_failure_response("tool_rate_limited:send_mobile_push") == (
+        "Tool calls were rate-limited; please retry in a moment."
+    )
+    assert LLMBridge._final_failure_response("tool_quota_exceeded:generate_video") == (
+        "Tool quota was exceeded; retry later or adjust limits."
+    )
+    assert LLMBridge._final_failure_response("tool_execution_error:list_tasks") == (
+        "Tool execution failed; recovered safely. Please retry or narrow the request."
+    )
+
+
+def test_non_retryable_tool_failure_classifier() -> None:
+    assert LLMBridge._is_non_retryable_tool_failure("confirmation_required:send_gmail_message")
+    assert LLMBridge._is_non_retryable_tool_failure("tool_auth_required:create_event")
+    assert LLMBridge._is_non_retryable_tool_failure("tool_rate_limited:send_mobile_push")
+    assert LLMBridge._is_non_retryable_tool_failure("tool_quota_exceeded:generate_video")
+    assert LLMBridge._is_non_retryable_tool_failure("tool_execution_error:list_tasks")
+    assert LLMBridge._is_non_retryable_tool_failure("Tool execution unavailable for: create_event")
+    assert not LLMBridge._is_non_retryable_tool_failure("tool_timeout:create_event")
+    assert not LLMBridge._is_non_retryable_tool_failure("no_progress_tool_loop:repeat_rounds=3")
+
+
+def test_mark_tool_round_budget_exhausted_sets_classified_error_and_abandon_reason() -> None:
+    plan = {"active": True, "forced_steps": 2}
+    error = LLMBridge._mark_tool_round_budget_exhausted(plan, "")
+    assert error == "tool_call_limit_reached"
+    assert plan["active"] is False
+    assert plan["abandon_reason"] == "tool_call_limit_reached"
+
+
+def test_mark_tool_round_budget_exhausted_preserves_existing_error() -> None:
+    plan = {"active": True}
+    error = LLMBridge._mark_tool_round_budget_exhausted(plan, "tool_timeout:search_web")
+    assert error == "tool_timeout:search_web"
+    assert plan["active"] is False
+    assert plan["abandon_reason"] == "tool_call_limit_reached"
+
+
+def test_tool_result_indicates_failure_and_classification() -> None:
+    assert LLMBridge._tool_result_indicates_failure("Error: missing token")
+    assert LLMBridge._tool_result_indicates_failure(
+        "**ACTION REQUIRED: Google Authentication Needed for Google Calendar**"
+    )
+    assert LLMBridge._tool_result_indicates_failure("⚠️ Tool quota exceeded for google-workspace")
+    assert not LLMBridge._tool_result_indicates_failure("All good. Created 3 events.")
+
+    assert (
+        LLMBridge._classify_tool_result_failure(
+            "create_event",
+            "**ACTION REQUIRED: Google Authentication Needed for Google Calendar**",
+        )
+        == "tool_auth_required:create_event"
+    )
+    assert (
+        LLMBridge._classify_tool_result_failure(
+            "send_mobile_push",
+            "Rate limit exceeded. Retry in 10s.",
+        )
+        == "tool_rate_limited:send_mobile_push"
     )
 
 
@@ -419,3 +498,41 @@ def test_tool_limit_fallback_completion_handles_call_errors() -> None:
 
     assert text == ""
     assert len(history) == 1
+
+
+def test_sanitize_push_manual_fallback_uses_onboarded_workspace_identity() -> None:
+    class _FakeVera:
+        @staticmethod
+        def _resolve_workspace_google_auth_context():
+            return "owner@example.com", True
+
+    bridge = _make_bridge(max_tool_rounds=5)
+    bridge.vera = _FakeVera()
+    bridge.last_tool_payload = {"tool_names": ["send_native_push"]}
+
+    sanitized = bridge._sanitize_push_manual_fallback(
+        "Manual fix: set it manually in the Clock app."
+    )
+
+    lowered = sanitized.lower()
+    assert "immediate native push" in lowered
+    assert "onboarded google workspace account automatically" in lowered
+    assert "share your google email" not in lowered
+
+
+def test_sanitize_push_manual_fallback_requests_email_only_when_unknown() -> None:
+    class _FakeVera:
+        @staticmethod
+        def _resolve_workspace_google_auth_context():
+            return "", False
+
+    bridge = _make_bridge(max_tool_rounds=5)
+    bridge.vera = _FakeVera()
+    bridge.last_tool_payload = {"tool_names": ["send_native_push"]}
+
+    sanitized = bridge._sanitize_push_manual_fallback(
+        "Manual fix: copy-paste into Google Calendar app."
+    )
+
+    lowered = sanitized.lower()
+    assert "share your google email and timezone" in lowered

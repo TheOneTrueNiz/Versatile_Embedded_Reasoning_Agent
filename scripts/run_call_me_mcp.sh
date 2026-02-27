@@ -6,10 +6,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="${ROOT_DIR}/mcp_server_and_tools/call-me/server"
 CALLME_PROFILE="${CALLME_PROFILE:-carol-prod}"
 CALLME_PROFILE_FILE="${ROOT_DIR}/config/callme_profiles/${CALLME_PROFILE}.env"
+CALLME_PROFILE_EXAMPLE_FILE="${ROOT_DIR}/config/callme_profiles/${CALLME_PROFILE}.example.env"
 
 if [ -f "${CALLME_PROFILE_FILE}" ]; then
   # shellcheck disable=SC1090
   source "${CALLME_PROFILE_FILE}"
+elif [ -f "${CALLME_PROFILE_EXAMPLE_FILE}" ]; then
+  # shellcheck disable=SC1090
+  source "${CALLME_PROFILE_EXAMPLE_FILE}"
+  echo "Info: using call-me example profile '${CALLME_PROFILE_EXAMPLE_FILE}'" >&2
 else
   echo "Warning: call-me profile '${CALLME_PROFILE}' not found at ${CALLME_PROFILE_FILE}" >&2
 fi

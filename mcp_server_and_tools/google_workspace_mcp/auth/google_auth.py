@@ -252,6 +252,72 @@ def load_client_secrets(client_secrets_path: str) -> Dict[str, Any]:
         raise
 
 
+def _hydrate_credentials_for_refresh(
+    credentials: Credentials, user_google_email: Optional[str] = None
+) -> Credentials:
+    """
+    Ensure refresh prerequisites exist on credentials.
+
+    Google refresh requires refresh_token, token_uri, client_id, and client_secret.
+    Some session/file update paths can hold partial credential objects, so we
+    backfill missing fields from stored credentials and environment config.
+    """
+    if not credentials:
+        return credentials
+
+    token_uri = credentials.token_uri or "https://oauth2.googleapis.com/token"
+    refresh_token = credentials.refresh_token
+    client_id = credentials.client_id
+    client_secret = credentials.client_secret
+
+    # First preference: reuse persisted user credentials when available.
+    if user_google_email:
+        try:
+            stored = get_credential_store().get_credential(user_google_email)
+            if stored:
+                if not refresh_token and stored.refresh_token:
+                    refresh_token = stored.refresh_token
+                if not token_uri and stored.token_uri:
+                    token_uri = stored.token_uri
+                if not client_id and stored.client_id:
+                    client_id = stored.client_id
+                if not client_secret and stored.client_secret:
+                    client_secret = stored.client_secret
+        except Exception as exc:
+            logger.debug(
+                f"[get_credentials] Could not backfill refresh fields from credential store: {exc}"
+            )
+
+    # Second preference: environment/client-secrets defaults.
+    env_config = load_client_secrets_from_env()
+    web_config = env_config.get("web", {}) if env_config else {}
+    token_uri = token_uri or web_config.get(
+        "token_uri", "https://oauth2.googleapis.com/token"
+    )
+    client_id = client_id or web_config.get("client_id")
+    client_secret = client_secret or web_config.get("client_secret")
+
+    hydrated = Credentials(
+        token=credentials.token,
+        refresh_token=refresh_token,
+        token_uri=token_uri,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=credentials.scopes,
+        expiry=credentials.expiry,
+    )
+
+    # Preserve ID token when present so downstream identity lookups still work.
+    if getattr(credentials, "id_token", None):
+        setattr(hydrated, "_id_token", credentials.id_token)
+    if getattr(credentials, "rapt_token", None):
+        setattr(hydrated, "_rapt_token", credentials.rapt_token)
+    if getattr(credentials, "quota_project_id", None):
+        setattr(hydrated, "_quota_project_id", credentials.quota_project_id)
+
+    return hydrated
+
+
 def check_client_secrets() -> Optional[str]:
     """
     Checks for the presence of OAuth client secrets, either as environment
@@ -357,7 +423,11 @@ async def start_auth_flow(
             state=oauth_state,
         )
 
-        auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            include_granted_scopes="true",
+        )
 
         session_id = None
         try:
@@ -544,6 +614,9 @@ def get_credentials(
     Returns:
         Valid Credentials object or None.
     """
+    oauth21_refresh_failed = False
+    mapped_user_email: Optional[str] = None
+
     # First, try OAuth 2.1 session store if we have a session_id (FastMCP session)
     if session_id:
         try:
@@ -554,6 +627,14 @@ def get_credentials(
             if credentials:
                 logger.info(
                     f"[get_credentials] Found OAuth 2.1 credentials for MCP session {session_id}"
+                )
+                user_email = store.get_user_by_mcp_session(session_id)
+                if user_email:
+                    mapped_user_email = user_email
+                    if not user_google_email:
+                        user_google_email = user_email
+                credentials = _hydrate_credentials_for_refresh(
+                    credentials, user_google_email=user_email
                 )
 
                 # Check scopes
@@ -574,22 +655,28 @@ def get_credentials(
                             f"[get_credentials] Refreshed OAuth 2.1 credentials for session {session_id}"
                         )
                         # Update stored credentials
-                        user_email = store.get_user_by_mcp_session(session_id)
                         if user_email:
                             store.store_session(
                                 user_email=user_email,
                                 access_token=credentials.token,
                                 refresh_token=credentials.refresh_token,
+                                token_uri=credentials.token_uri,
+                                client_id=credentials.client_id,
+                                client_secret=credentials.client_secret,
                                 scopes=credentials.scopes,
                                 expiry=credentials.expiry,
                                 mcp_session_id=session_id,
+                                issuer="https://accounts.google.com",
                             )
                         return credentials
                     except Exception as e:
                         logger.error(
                             f"[get_credentials] Failed to refresh OAuth 2.1 credentials: {e}"
                         )
-                        return None
+                        oauth21_refresh_failed = True
+                        logger.info(
+                            "[get_credentials] Falling back to credential store after OAuth 2.1 refresh failure"
+                        )
         except ImportError:
             pass  # OAuth 2.1 store not available
         except Exception as e:
@@ -632,12 +719,15 @@ def get_credentials(
             f"[get_credentials] Called for user_google_email: '{user_google_email}', session_id: '{session_id}', required_scopes: {required_scopes}"
         )
 
-        if session_id:
+        if session_id and not oauth21_refresh_failed:
             credentials = load_credentials_from_session(session_id)
             if credentials:
                 logger.debug(
                     f"[get_credentials] Loaded credentials from session for session_id '{session_id}'."
                 )
+
+        if not user_google_email and mapped_user_email:
+            user_google_email = mapped_user_email
 
         if not credentials and user_google_email:
             if not is_stateless_mode():
@@ -667,6 +757,9 @@ def get_credentials(
 
     logger.debug(
         f"[get_credentials] Credentials found. Scopes: {credentials.scopes}, Valid: {credentials.valid}, Expired: {credentials.expired}"
+    )
+    credentials = _hydrate_credentials_for_refresh(
+        credentials, user_google_email=user_google_email
     )
 
     if not all(scope in credentials.scopes for scope in required_scopes):

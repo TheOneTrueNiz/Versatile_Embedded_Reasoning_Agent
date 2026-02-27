@@ -279,6 +279,26 @@ class ProactiveManager:
                 "VERA_INITIATIVE_PARTNER_RECENT_ACTIVITY_GATE_MINUTES",
                 2,
             ),
+            "type_base_cooldown_seconds": _env_int(
+                "VERA_INITIATIVE_TYPE_BASE_COOLDOWN_SECONDS",
+                300,
+            ),
+            "type_max_cooldown_seconds": _env_int(
+                "VERA_INITIATIVE_TYPE_MAX_COOLDOWN_SECONDS",
+                14400,
+            ),
+            "type_backoff_factor": _env_float(
+                "VERA_INITIATIVE_TYPE_BACKOFF_FACTOR",
+                2.0,
+            ),
+            "type_feedback_penalty_floor": _env_int(
+                "VERA_INITIATIVE_TYPE_FEEDBACK_PENALTY_FLOOR",
+                3,
+            ),
+            "type_noop_streak_threshold": _env_int(
+                "VERA_INITIATIVE_TYPE_NOOP_STREAK_THRESHOLD",
+                5,
+            ),
         }
         try:
             genome_path = Path(os.getenv("VERA_GENOME_CONFIG_PATH", "config/vera_genome.json"))
@@ -358,6 +378,21 @@ class ProactiveManager:
             2,
             0,
         )
+        config["type_base_cooldown_seconds"] = _coerce_int(
+            config.get("type_base_cooldown_seconds"), 300, 10,
+        )
+        config["type_max_cooldown_seconds"] = _coerce_int(
+            config.get("type_max_cooldown_seconds"), 14400, 60,
+        )
+        config["type_backoff_factor"] = min(
+            10.0, max(1.1, _coerce_float(config.get("type_backoff_factor"), 2.0))
+        )
+        config["type_feedback_penalty_floor"] = _coerce_int(
+            config.get("type_feedback_penalty_floor"), 3, 1,
+        )
+        config["type_noop_streak_threshold"] = _coerce_int(
+            config.get("type_noop_streak_threshold"), 5, 2,
+        )
         return config
 
     @staticmethod
@@ -392,7 +427,7 @@ class ProactiveManager:
         cfg = self._local_attr(self, "_initiative_config", {}) or {}
         initial_score = float(cfg.get("initial_score", 0.55) or 0.55)
         return {
-            "version": 1,
+            "version": 2,
             "initiative_score": initial_score,
             "last_update_utc": _utc_iso(),
             "last_signal": {},
@@ -402,6 +437,20 @@ class ProactiveManager:
             "action_failure_count": 0,
             "suppressed_count": 0,
             "recent_actions": [],
+            "action_type_stats": {},
+        }
+
+    @staticmethod
+    def _default_action_type_stat() -> Dict[str, Any]:
+        return {
+            "consecutive_failures": 0,
+            "consecutive_noops": 0,
+            "cooldown_until_utc": None,
+            "total_successes": 0,
+            "total_failures": 0,
+            "total_noops": 0,
+            "last_attempt_utc": None,
+            "last_outcome": None,
         }
 
     def _load_initiative_state(self) -> Dict[str, Any]:
@@ -420,6 +469,29 @@ class ProactiveManager:
         baseline["initiative_score"] = self._clamp_initiative_score(baseline.get("initiative_score"))
         if not isinstance(baseline.get("recent_actions"), list):
             baseline["recent_actions"] = []
+        # v1 → v2 migration: bootstrap action_type_stats from recent_actions
+        if "action_type_stats" not in payload:
+            baseline["action_type_stats"] = {}
+            for row in baseline.get("recent_actions", []):
+                if not isinstance(row, dict):
+                    continue
+                atype = str(row.get("action_type") or "").strip()
+                if not atype:
+                    continue
+                if atype not in baseline["action_type_stats"]:
+                    baseline["action_type_stats"][atype] = self._default_action_type_stat()
+                stat = baseline["action_type_stats"][atype]
+                was_success = bool(row.get("success"))
+                stat["last_attempt_utc"] = str(row.get("ts_utc") or "")
+                stat["last_outcome"] = "success" if was_success else "failure"
+                if was_success:
+                    stat["total_successes"] = int(stat.get("total_successes", 0)) + 1
+                    stat["consecutive_failures"] = 0
+                    stat["consecutive_noops"] = 0
+                else:
+                    stat["total_failures"] = int(stat.get("total_failures", 0)) + 1
+                    stat["consecutive_failures"] = int(stat.get("consecutive_failures", 0)) + 1
+            baseline["version"] = 2
         return baseline
 
     def _save_initiative_state(self, state: Dict[str, Any]) -> None:
@@ -485,6 +557,61 @@ class ProactiveManager:
             return -0.03
         return 0.0
 
+    def _compute_type_cooldown_seconds(self, consecutive_failures: int) -> float:
+        """Compute exponential backoff cooldown for a given failure count."""
+        if consecutive_failures <= 0:
+            return 0.0
+        base = float(self._initiative_config.get("type_base_cooldown_seconds", 300))
+        factor = float(self._initiative_config.get("type_backoff_factor", 2.0))
+        cap = float(self._initiative_config.get("type_max_cooldown_seconds", 14400))
+        raw = base * (factor ** (consecutive_failures - 1))
+        return min(raw, cap)
+
+    @staticmethod
+    def _cooldown_multiplier_for_mood(mood: str) -> float:
+        """Convert mood into a cooldown duration multiplier.
+
+        Anxious/strained moods make cooldowns longer (more cautious).
+        Energized/warm moods shorten cooldowns (more willing to try).
+        """
+        lowered = str(mood or "").strip().lower()
+        if lowered == "strained":
+            return 1.50
+        if lowered == "cautious":
+            return 1.35
+        if lowered == "attentive":
+            return 1.15
+        if lowered == "focused":
+            return 1.05
+        if lowered == "energized":
+            return 0.75
+        if lowered in {"encouraged", "warm"}:
+            return 0.85
+        return 1.0
+
+    def _is_action_type_on_cooldown(self, action_type: str) -> Tuple[bool, str]:
+        """Check if a specific action type is currently on cooldown."""
+        state = self._ensure_initiative_runtime()
+        stats = state.get("action_type_stats", {})
+        type_stat = stats.get(action_type)
+        if not isinstance(type_stat, dict):
+            return False, ""
+        cooldown_until = _parse_iso_utc(str(type_stat.get("cooldown_until_utc") or ""))
+        if cooldown_until is None:
+            return False, ""
+        now = _utc_now()
+        if now >= cooldown_until:
+            return False, ""
+        remaining = (cooldown_until - now).total_seconds()
+        return True, (
+            f"action_type_cooldown:{action_type};"
+            f"remaining={int(remaining)}s;"
+            f"until={type_stat['cooldown_until_utc']}"
+        )
+
+    def _is_internal_cadence_action(self, action_type: str) -> bool:
+        return str(action_type or "").strip() in self.INTERNAL_DND_BYPASS_ACTIONS
+
     def _should_execute_recommendation(self, recommendation: RecommendedAction) -> Tuple[bool, str]:
         state = self._ensure_initiative_runtime()
         if not bool(self._initiative_config.get("enabled", True)):
@@ -492,38 +619,46 @@ class ProactiveManager:
         if recommendation.priority in {ActionPriority.HIGH, ActionPriority.URGENT}:
             return True, "priority_override"
 
+        action_type = str(recommendation.action_type or "").strip()
+        if self._is_internal_cadence_action(action_type):
+            return True, "internal_cadence_bypass"
+
+        # Per-type cooldown gate (replaces global score gate)
+        on_cooldown, cooldown_reason = self._is_action_type_on_cooldown(action_type)
+        if on_cooldown:
+            return False, cooldown_reason
+
+        # Global score: computed for observability, no longer gates execution
         score = self._clamp_initiative_score(state.get("initiative_score"))
-        required = self._required_score_for_priority(recommendation.priority)
         mood = self._current_mood()
         mood_delta = self._initiative_threshold_delta_for_mood(mood)
-        adjusted_required = min(1.0, max(0.0, required + mood_delta))
-        if score >= adjusted_required:
-            threshold_reason = (
-                f"initiative_score_ok:{score:.3f}>={adjusted_required:.3f}"
-                f";mood={mood};delta={mood_delta:+.3f}"
-            )
-            partner_activity_gate_minutes = int(self._initiative_config.get("partner_recent_activity_gate_minutes", 0))
-            if (
-                recommendation.priority in {ActionPriority.BACKGROUND, ActionPriority.LOW}
-                and partner_activity_gate_minutes > 0
-            ):
-                minutes_since_activity = self._minutes_since_last_partner_activity()
-                if (
-                    minutes_since_activity is not None
-                    and minutes_since_activity < float(partner_activity_gate_minutes)
-                ):
-                    return False, (
-                        f"partner_recently_active:{minutes_since_activity:.1f}m<"
-                        f"{partner_activity_gate_minutes}m"
-                    )
-            duplicated, duplicate_reason = self._is_duplicate_recent_action(recommendation)
-            if duplicated:
-                return False, duplicate_reason
-            return True, threshold_reason
-        return False, (
-            f"initiative_score_below_threshold:{score:.3f}<{adjusted_required:.3f}"
+        score_info = (
+            f"initiative_score_observed:{score:.3f}"
             f";mood={mood};delta={mood_delta:+.3f}"
         )
+
+        # Partner activity gate (unchanged)
+        partner_activity_gate_minutes = int(self._initiative_config.get("partner_recent_activity_gate_minutes", 0))
+        if (
+            recommendation.priority in {ActionPriority.BACKGROUND, ActionPriority.LOW}
+            and partner_activity_gate_minutes > 0
+        ):
+            minutes_since_activity = self._minutes_since_last_partner_activity()
+            if (
+                minutes_since_activity is not None
+                and minutes_since_activity < float(partner_activity_gate_minutes)
+            ):
+                return False, (
+                    f"partner_recently_active:{minutes_since_activity:.1f}m<"
+                    f"{partner_activity_gate_minutes}m"
+                )
+
+        # Duplicate action cooldown (unchanged)
+        duplicated, duplicate_reason = self._is_duplicate_recent_action(recommendation)
+        if duplicated:
+            return False, duplicate_reason
+
+        return True, f"allowed;{score_info}"
 
     def _minutes_since_last_partner_activity(self) -> Optional[float]:
         session_store = self._local_attr(self, "session_store", None)
@@ -583,6 +718,8 @@ class ProactiveManager:
         action_type = str(recommendation.action_type or "").strip()
         trigger_id = str(recommendation.trigger_id or "").strip()
         if not action_type:
+            return False, ""
+        if self._is_internal_cadence_action(action_type):
             return False, ""
 
         for row in reversed(recent):
@@ -701,6 +838,96 @@ class ProactiveManager:
             "conversation_id": conversation_id,
         })
 
+    def _update_action_type_stats(
+        self,
+        action_type: str,
+        outcome: str,
+        mood: Optional[str] = None,
+    ) -> None:
+        """Update per-type stats and compute cooldown after action execution."""
+        state = self._ensure_initiative_runtime()
+        stats = state.get("action_type_stats")
+        if not isinstance(stats, dict):
+            stats = {}
+            state["action_type_stats"] = stats
+
+        atype = str(action_type or "").strip()
+        if not atype:
+            return
+
+        if atype not in stats:
+            stats[atype] = self._default_action_type_stat()
+        ts = stats[atype]
+
+        ts["last_attempt_utc"] = _utc_iso()
+        ts["last_outcome"] = outcome
+
+        # Internal cadence actions (for example autonomy_cycle) must run on
+        # schedule and should never self-throttle via initiative cooldown gates.
+        if self._is_internal_cadence_action(atype):
+            if outcome == "action_failure":
+                ts["total_failures"] = int(ts.get("total_failures", 0)) + 1
+            elif outcome == "action_success":
+                ts["total_successes"] = int(ts.get("total_successes", 0)) + 1
+            elif outcome in ("action_success_noop", "action_success_skipped", "action_success_not_due"):
+                ts["total_noops"] = int(ts.get("total_noops", 0)) + 1
+            ts["consecutive_failures"] = 0
+            ts["consecutive_noops"] = 0
+            ts["cooldown_until_utc"] = None
+            self._save_initiative_state(state)
+            self._append_initiative_event({
+                "type": "action_type_stats_updated",
+                "action_type": atype,
+                "outcome": outcome,
+                "consecutive_failures": ts["consecutive_failures"],
+                "consecutive_noops": ts["consecutive_noops"],
+                "cooldown_until_utc": ts.get("cooldown_until_utc"),
+                "cooldown_bypassed": True,
+            })
+            return
+
+        if outcome == "action_success":
+            ts["consecutive_failures"] = 0
+            ts["consecutive_noops"] = 0
+            ts["cooldown_until_utc"] = None
+            ts["total_successes"] = int(ts.get("total_successes", 0)) + 1
+
+        elif outcome == "action_failure":
+            ts["consecutive_failures"] = int(ts.get("consecutive_failures", 0)) + 1
+            ts["total_failures"] = int(ts.get("total_failures", 0)) + 1
+            cooldown_secs = self._compute_type_cooldown_seconds(ts["consecutive_failures"])
+            if mood is None:
+                mood = self._current_mood()
+            multiplier = self._cooldown_multiplier_for_mood(mood)
+            effective_secs = cooldown_secs * multiplier
+            ts["cooldown_until_utc"] = (
+                _utc_now() + timedelta(seconds=effective_secs)
+            ).isoformat().replace("+00:00", "Z")
+
+        elif outcome in ("action_success_noop", "action_success_skipped", "action_success_not_due"):
+            ts["consecutive_noops"] = int(ts.get("consecutive_noops", 0)) + 1
+            ts["total_noops"] = int(ts.get("total_noops", 0)) + 1
+            noop_threshold = int(self._initiative_config.get("type_noop_streak_threshold", 5))
+            if ts["consecutive_noops"] >= noop_threshold:
+                base = float(self._initiative_config.get("type_base_cooldown_seconds", 300))
+                if mood is None:
+                    mood = self._current_mood()
+                multiplier = self._cooldown_multiplier_for_mood(mood)
+                ts["cooldown_until_utc"] = (
+                    _utc_now() + timedelta(seconds=base * multiplier)
+                ).isoformat().replace("+00:00", "Z")
+                ts["consecutive_noops"] = 0
+
+        self._save_initiative_state(state)
+        self._append_initiative_event({
+            "type": "action_type_stats_updated",
+            "action_type": atype,
+            "outcome": outcome,
+            "consecutive_failures": ts["consecutive_failures"],
+            "consecutive_noops": ts["consecutive_noops"],
+            "cooldown_until_utc": ts.get("cooldown_until_utc"),
+        })
+
     def _is_feedback_linked_to_recent_action(
         self,
         conversation_id: str,
@@ -767,6 +994,51 @@ class ProactiveManager:
                 "related_action_type": action_row.get("action_type", ""),
             },
         )
+
+        # Per-type cooldown effects from feedback
+        related_action_type = str(action_row.get("action_type") or "").strip()
+        if related_action_type:
+            stats = state.get("action_type_stats")
+            if not isinstance(stats, dict):
+                stats = {}
+                state["action_type_stats"] = stats
+            if related_action_type not in stats:
+                stats[related_action_type] = self._default_action_type_stat()
+
+            if numeric_score > 0:
+                # Positive feedback: clear cooldowns for ALL action types
+                for atype_stat in stats.values():
+                    atype_stat["cooldown_until_utc"] = None
+                    atype_stat["consecutive_failures"] = 0
+                    atype_stat["consecutive_noops"] = 0
+                self._save_initiative_state(state)
+                self._append_initiative_event({
+                    "type": "feedback_cleared_all_cooldowns",
+                    "trigger_action_type": related_action_type,
+                })
+            elif numeric_score < 0:
+                # Negative feedback: penalize THIS action type only
+                ts = stats[related_action_type]
+                penalty_floor = int(self._initiative_config.get("type_feedback_penalty_floor", 3))
+                ts["consecutive_failures"] = max(
+                    int(ts.get("consecutive_failures", 0)),
+                    penalty_floor,
+                )
+                cooldown_secs = self._compute_type_cooldown_seconds(ts["consecutive_failures"])
+                mood = self._current_mood()
+                multiplier = self._cooldown_multiplier_for_mood(mood)
+                effective_secs = cooldown_secs * multiplier
+                ts["cooldown_until_utc"] = (
+                    _utc_now() + timedelta(seconds=effective_secs)
+                ).isoformat().replace("+00:00", "Z")
+                self._save_initiative_state(state)
+                self._append_initiative_event({
+                    "type": "feedback_penalized_action_type",
+                    "action_type": related_action_type,
+                    "consecutive_failures": ts["consecutive_failures"],
+                    "cooldown_until_utc": ts["cooldown_until_utc"],
+                })
+
         return {
             "applied": True,
             "signal": signal,
@@ -812,6 +1084,7 @@ class ProactiveManager:
             "action_failure_count": int(state.get("action_failure_count", 0)),
             "suppressed_count": int(state.get("suppressed_count", 0)),
             "recent_actions": list(state.get("recent_actions", [])[-10:]),
+            "action_type_stats": dict(state.get("action_type_stats", {})),
         }
 
     def _compute_cadence_phase(self, state: Dict[str, Any]) -> Tuple[str, int, int]:
@@ -1057,10 +1330,15 @@ class ProactiveManager:
         # Filesystem (read-only)
         "list_allowed_directories", "read_file",
     })
+    # Internal cadence/maintenance actions should continue even during DND.
+    INTERNAL_DND_BYPASS_ACTIONS = frozenset({
+        "autonomy_cycle",
+    })
 
     async def _check_calendar_proactive(self) -> Optional[Dict[str, Any]]:
         """Poll Google Calendar for upcoming events and alert if near."""
-        if os.getenv("VERA_CALENDAR_PROACTIVE", "0") != "1":
+        # Default-on for out-of-box proactive reliability; operators can disable with VERA_CALENDAR_PROACTIVE=0.
+        if os.getenv("VERA_CALENDAR_PROACTIVE", "1") != "1":
             return None
 
         # Rate limit: skip if polled < 30 min ago
@@ -1171,7 +1449,8 @@ class ProactiveManager:
 
     async def _process_sentinel_recommendations(self) -> Optional[Dict[str, Any]]:
         """Check sentinel for pending recommendations and execute high-priority safe ones."""
-        if os.getenv("VERA_PROACTIVE_EXECUTION", "0") != "1":
+        # Default-on for out-of-box proactive reliability; operators can disable with VERA_PROACTIVE_EXECUTION=0.
+        if os.getenv("VERA_PROACTIVE_EXECUTION", "1") != "1":
             return None
 
         # Respect DND
@@ -1722,6 +2001,13 @@ class ProactiveManager:
                 logger.debug("[DEBUG] Proactive action suppressed: %s (%s)", recommendation.description, gate_reason)
             return
 
+        action_type = str(getattr(recommendation, "action_type", "") or "")
+        if action_type in self.INTERNAL_DND_BYPASS_ACTIONS:
+            self.execute_proactive_action(recommendation)
+            if self.config.debug:
+                logger.debug("[DEBUG] Internal proactive action bypassed DND: %s", recommendation.description)
+            return
+
         priority_to_urgency = {
             ActionPriority.BACKGROUND: InterruptUrgency.ROUTINE,
             ActionPriority.LOW: InterruptUrgency.LOW,
@@ -1736,16 +2022,43 @@ class ProactiveManager:
             return
 
         self._pending_proactive_actions.append(recommendation)
+        action_id = str(getattr(recommendation, "action_id", "") or "")
+
+        def _drain_and_execute(_message: str) -> None:
+            self._drain_pending_recommendation(action_id)
+            self.execute_proactive_action(recommendation)
+
         self.dnd.queue_interrupt(
             message=recommendation.description,
             urgency=urgency,
-            callback=lambda msg: self.execute_proactive_action(recommendation),
+            callback=_drain_and_execute,
         )
         if self.config.debug:
             logger.debug("[DEBUG] Proactive action queued (DND active): %s", recommendation.description)
 
+    def _drain_pending_recommendation(self, action_id: str) -> int:
+        target = str(action_id or "").strip()
+        if not target:
+            return 0
+        pending = getattr(self, "_pending_proactive_actions", None)
+        if not isinstance(pending, list) or not pending:
+            return 0
+
+        kept: List[RecommendedAction] = []
+        removed = 0
+        for row in pending:
+            row_action_id = str(getattr(row, "action_id", "") or "").strip()
+            if row_action_id == target:
+                removed += 1
+                continue
+            kept.append(row)
+        if removed:
+            self._pending_proactive_actions[:] = kept
+        return removed
+
     def execute_proactive_action(self, recommendation: RecommendedAction):
         """Execute a proactive action recommendation."""
+        self._drain_pending_recommendation(str(getattr(recommendation, "action_id", "") or ""))
         success, result = self.sentinel.execute_recommendation(recommendation.action_id)
         self._record_recent_proactive_action(recommendation, success=bool(success), result=result)
         delta, signal = self._evaluate_action_reward_signal(recommendation, success=bool(success), result=result)
@@ -1759,6 +2072,12 @@ class ProactiveManager:
                     "action_id": recommendation.action_id,
                 },
             )
+
+        # Update per-type adaptive cooldowns
+        self._update_action_type_stats(
+            action_type=recommendation.action_type,
+            outcome=signal,
+        )
 
         if success:
             if recommendation.action_type == "check_tasks":

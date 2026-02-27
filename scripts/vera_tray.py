@@ -105,6 +105,10 @@ AUTO_RESTART_COOLDOWN = max(
     5,
     int(os.getenv("VERA_TRAY_RESTART_COOLDOWN", "20")),
 )
+FORCE_RECYCLE_GRACE_SECONDS = max(
+    0,
+    int(os.getenv("VERA_TRAY_FORCE_RECYCLE_GRACE_SECONDS", "45")),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +150,7 @@ class VERATray:
         self._browser_opened = False
         self._startup_deadline = 0.0
         self._next_restart_at = 0.0
+        self._error_since = 0.0
 
     # -- Logging -----------------------------------------------------------
     def _setup_logging(self):
@@ -248,14 +253,35 @@ class VERATray:
     def _set_restart_cooldown(self):
         self._next_restart_at = time.monotonic() + AUTO_RESTART_COOLDOWN
 
+    def _mark_error_state(self):
+        if self.state != State.ERROR:
+            self._error_since = time.monotonic()
+        self.state = State.ERROR
+
     def _maybe_auto_restart(self, reason: str):
         if self._is_halted():
-            return
-        if self.process and self.process.poll() is None:
             return
         if not self._restart_due():
             return
         self._set_restart_cooldown()
+        # If process is still alive but health endpoint is down, recycle it.
+        # This avoids a wedged half-alive backend that never triggers
+        # process-exit based recovery.
+        if self.process and self.process.poll() is None:
+            if FORCE_RECYCLE_GRACE_SECONDS > 0 and self.state == State.ERROR and self._error_since:
+                unhealthy_for = time.monotonic() - self._error_since
+                if unhealthy_for < FORCE_RECYCLE_GRACE_SECONDS:
+                    self.log.info(
+                        "Deferring forced recycle (unhealthy_for=%.1fs < grace=%ss): %s",
+                        unhealthy_for,
+                        FORCE_RECYCLE_GRACE_SECONDS,
+                        reason,
+                    )
+                    return
+            self.log.warning("Attempting forced recycle: %s", reason)
+            self._restart_vera()
+            return
+
         self.log.warning("Attempting recovery: %s", reason)
         self._start_vera()
 
@@ -287,7 +313,7 @@ class VERATray:
                             daemon=True,
                         ).start()
                 elif time.monotonic() > self._startup_deadline:
-                    self.state = State.ERROR
+                    self._mark_error_state()
                     self._clear_startup_deadline()
                     self._update_icon()
                     self._notify("VERA", "Startup timed out.")
@@ -299,7 +325,7 @@ class VERATray:
                 else:
                     consecutive_failures += 1
                     if consecutive_failures >= HEALTH_FAIL_THRESHOLD:
-                        self.state = State.ERROR
+                        self._mark_error_state()
                         self._update_icon()
                         self._notify("VERA", "VERA has stopped responding.")
                         self.log.error("Health failures. State -> ERROR")
@@ -307,6 +333,7 @@ class VERATray:
             elif self.state == State.ERROR:
                 if healthy:
                     self.state = State.RUNNING
+                    self._error_since = 0.0
                     consecutive_failures = 0
                     self._update_icon()
                     self._notify("VERA", "VERA has recovered.")
@@ -319,6 +346,7 @@ class VERATray:
                 # Promote STOPPED -> RUNNING once health endpoint responds again.
                 if healthy and not self._is_halted():
                     self.state = State.RUNNING
+                    self._error_since = 0.0
                     consecutive_failures = 0
                     self._update_icon()
                     self._notify("VERA", "VERA is running.")

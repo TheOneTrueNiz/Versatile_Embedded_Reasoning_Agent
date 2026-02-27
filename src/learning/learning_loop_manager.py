@@ -232,7 +232,8 @@ class LearningLoopManager:
                 "VERA_WORKFLOW_QUARANTINE_TAGS",
                 (
                     "tool_call_limit_reached,tool_timeout,llm_timeout,"
-                    "confirmation_required,cached_chain_not_completed,chain_mismatch"
+                    "confirmation_required,cached_chain_not_completed,chain_mismatch,"
+                    "tool_execution_error"
                 ),
             )
             or ""
@@ -250,6 +251,7 @@ class LearningLoopManager:
                 "confirmation_required",
                 "cached_chain_not_completed",
                 "chain_mismatch",
+                "tool_execution_error",
             ]
         self.workflow_quarantine_tags = sorted(set(quarantine_tags))
         self.reward_auto_train_enabled = self._read_bool_env("VERA_REWARD_AUTO_TRAIN", True)
@@ -661,6 +663,7 @@ class LearningLoopManager:
             loop = asyncio.get_running_loop()
             due_details = self._daily_due_details(now=datetime.now())
             self._task = loop.create_task(self._daily_loop())
+            self._task.add_done_callback(self._on_daily_loop_done)
             self._diag["start_successes"] = int(self._diag.get("start_successes", 0) or 0) + 1
             self._diag["last_start_error"] = ""
             self._diag["last_start_due_now"] = bool(due_details.get("due_now", False))
@@ -691,6 +694,41 @@ class LearningLoopManager:
                 self.poll_seconds,
                 self.daily_hour,
             )
+
+    def _on_daily_loop_done(self, task: asyncio.Task) -> None:
+        """Restart the loop if it exits unexpectedly while manager is still running."""
+        if task is not self._task:
+            return
+        self._cycle_running = False
+        if not self._running:
+            return
+
+        if task.cancelled():
+            reason = "daily_loop_cancelled_unexpectedly"
+            logger.warning("Learning loop task was cancelled unexpectedly; restarting.")
+        else:
+            exc = task.exception()
+            if exc is not None:
+                reason = self._short_text(exc, 240)
+                logger.warning("Learning loop task crashed; restarting: %s", exc)
+            else:
+                reason = "daily_loop_exited_unexpectedly"
+                logger.warning("Learning loop task exited unexpectedly; restarting.")
+        self._diag["last_start_error"] = reason
+
+        try:
+            loop = asyncio.get_running_loop()
+            self._task = loop.create_task(self._daily_loop())
+            self._task.add_done_callback(self._on_daily_loop_done)
+            self._diag["start_successes"] = int(self._diag.get("start_successes", 0) or 0) + 1
+            self._diag["last_start_at"] = datetime.now().isoformat()
+            self._trace_learning("daily_loop_restarted")
+        except RuntimeError:
+            self._running = False
+            self._task = None
+            self._diag["start_failures"] = int(self._diag.get("start_failures", 0) or 0) + 1
+            self._diag["last_start_error"] = "daily_loop_restart_missing_event_loop"
+            logger.warning("Learning loop restart failed: no running asyncio loop.")
 
     def stop(self) -> None:
         self._running = False
@@ -1784,6 +1822,8 @@ class LearningLoopManager:
             return "tool_call_limit_reached"
         if "tool_timeout" in lowered or "tool execution timeout" in lowered:
             return "tool_timeout"
+        if "tool execution error" in lowered or "tool_execution_error" in lowered:
+            return "tool_execution_error"
         if "llm_timeout" in lowered or "llm request timed out" in lowered:
             return "llm_timeout"
         if (

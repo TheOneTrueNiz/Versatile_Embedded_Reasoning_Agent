@@ -20,13 +20,14 @@ def _make_rec(
     action_id: str = "a1",
     priority: ActionPriority = ActionPriority.HIGH,
     description: str = "Search Wikipedia for recent AI developments",
+    action_type: str = "proactive_check",
 ) -> RecommendedAction:
     return RecommendedAction(
         action_id=action_id,
         trigger_id="test_trigger",
         description=description,
         priority=priority,
-        action_type="proactive_check",
+        action_type=action_type,
         payload={},
         triggering_events=[],
     )
@@ -218,6 +219,71 @@ def test_proactive_execution_no_pending(tmp_path: Path) -> None:
     assert result is not None
     assert result.get("processed") == 0
     assert result.get("pending") == 0
+
+
+def test_handle_recommendation_autonomy_cycle_bypasses_dnd(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, pending_recs=[])
+    manager.config = MagicMock(debug=False)
+    manager._pending_proactive_actions = []
+    manager.execute_proactive_action = MagicMock()
+    manager._should_execute_recommendation = MagicMock(return_value=(True, "allowed"))
+    manager.dnd.can_interrupt = MagicMock(return_value=False)
+
+    rec = _make_rec(action_id="aut1", priority=ActionPriority.BACKGROUND, action_type="autonomy_cycle")
+    manager.handle_proactive_recommendation(rec)
+
+    manager.execute_proactive_action.assert_called_once_with(rec)
+    manager.dnd.queue_interrupt.assert_not_called()
+    assert manager._pending_proactive_actions == []
+
+
+def test_handle_recommendation_non_internal_still_respects_dnd(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, pending_recs=[])
+    manager.config = MagicMock(debug=False)
+    manager._pending_proactive_actions = []
+    manager.execute_proactive_action = MagicMock()
+    manager._should_execute_recommendation = MagicMock(return_value=(True, "allowed"))
+    manager.dnd.can_interrupt = MagicMock(return_value=False)
+
+    rec = _make_rec(action_id="norm1", priority=ActionPriority.NORMAL, action_type="proactive_check")
+    manager.handle_proactive_recommendation(rec)
+
+    manager.execute_proactive_action.assert_not_called()
+    manager.dnd.queue_interrupt.assert_called_once()
+    assert len(manager._pending_proactive_actions) == 1
+
+
+def test_queued_callback_drains_pending_recommendation(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, pending_recs=[])
+    manager.config = MagicMock(debug=False)
+    manager._pending_proactive_actions = []
+    manager.execute_proactive_action = MagicMock()
+    manager._should_execute_recommendation = MagicMock(return_value=(True, "allowed"))
+    manager.dnd.can_interrupt = MagicMock(return_value=False)
+
+    rec = _make_rec(action_id="queued1", priority=ActionPriority.NORMAL, action_type="proactive_check")
+    manager.handle_proactive_recommendation(rec)
+
+    assert len(manager._pending_proactive_actions) == 1
+    callback = manager.dnd.queue_interrupt.call_args.kwargs["callback"]
+    callback("deliver")
+
+    assert len(manager._pending_proactive_actions) == 0
+    manager.execute_proactive_action.assert_called_once_with(rec)
+
+
+def test_drain_pending_recommendation_removes_matching_action_id(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, pending_recs=[])
+    manager._pending_proactive_actions = [
+        _make_rec(action_id="a1", priority=ActionPriority.LOW, action_type="proactive_check"),
+        _make_rec(action_id="a2", priority=ActionPriority.LOW, action_type="proactive_check"),
+        _make_rec(action_id="a1", priority=ActionPriority.LOW, action_type="proactive_check"),
+    ]
+
+    removed = manager._drain_pending_recommendation("a1")
+
+    assert removed == 2
+    assert [rec.action_id for rec in manager._pending_proactive_actions] == ["a2"]
 
 
 def test_proactive_execution_sets_tool_whitelist(tmp_path: Path) -> None:

@@ -151,14 +151,41 @@ class LocalDirectoryCredentialStore(CredentialStore):
         """Store credentials to local JSON file."""
         creds_path = self._get_credential_path(user_email)
 
+        existing_credentials = self.get_credential(user_email)
+        merged_token = credentials.token or (
+            existing_credentials.token if existing_credentials else None
+        )
+        merged_refresh_token = credentials.refresh_token or (
+            existing_credentials.refresh_token if existing_credentials else None
+        )
+        merged_token_uri = credentials.token_uri or (
+            existing_credentials.token_uri if existing_credentials else None
+        )
+        merged_client_id = credentials.client_id or (
+            existing_credentials.client_id if existing_credentials else None
+        )
+        merged_client_secret = credentials.client_secret or (
+            existing_credentials.client_secret if existing_credentials else None
+        )
+        merged_scopes = (
+            credentials.scopes
+            if credentials.scopes is not None
+            else (existing_credentials.scopes if existing_credentials else None)
+        )
+        merged_expiry = (
+            credentials.expiry
+            if credentials.expiry is not None
+            else (existing_credentials.expiry if existing_credentials else None)
+        )
+
         creds_data = {
-            "token": credentials.token,
-            "refresh_token": credentials.refresh_token,
-            "token_uri": credentials.token_uri,
-            "client_id": credentials.client_id,
-            "client_secret": credentials.client_secret,
-            "scopes": credentials.scopes,
-            "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+            "token": merged_token,
+            "refresh_token": merged_refresh_token,
+            "token_uri": merged_token_uri or "https://oauth2.googleapis.com/token",
+            "client_id": merged_client_id,
+            "client_secret": merged_client_secret,
+            "scopes": merged_scopes,
+            "expiry": merged_expiry.isoformat() if merged_expiry else None,
         }
 
         try:

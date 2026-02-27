@@ -176,6 +176,12 @@ class SelfImprovementBudget:
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_json_write(self.storage_path, state)
 
+    def _refresh_config(self) -> None:
+        """Reload budget config from file/env so live API updates take effect."""
+        config, source = load_budget_config(self.config_path)
+        self.config = config
+        self.config_source = source
+
     def check(
         self,
         *,
@@ -184,6 +190,7 @@ class SelfImprovementBudget:
         estimated_cost: float,
         calls: int = 1
     ) -> Tuple[bool, str]:
+        self._refresh_config()
         if not self.config.enabled:
             return True, "budget_disabled"
 

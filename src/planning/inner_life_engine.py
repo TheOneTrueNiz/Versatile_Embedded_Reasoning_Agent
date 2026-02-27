@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import re
+import time as time_module
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
@@ -688,6 +689,7 @@ class InnerLifeEngine:
             self._recent_monologue
         )
         self._reflection_running = False
+        self._reflection_started_monotonic: Optional[float] = None
         self._cognitive_health = None  # Bound externally or created on demand
         self._sentiment_analyzer = None
         self._seed_identity_compass = ""
@@ -2165,10 +2167,29 @@ Reflection #{self.personality.total_reflections + 1}
         )
 
         if self._reflection_running:
-            result.outcome = "skipped_already_running"
-            return result
+            stale_after_seconds = max(
+                30.0,
+                float(os.getenv("VERA_REFLECTION_STALE_SECONDS", "240") or 240.0),
+            )
+            running_age = None
+            if self._reflection_started_monotonic is not None:
+                running_age = max(0.0, time_module.monotonic() - self._reflection_started_monotonic)
+            if running_age is not None and running_age >= stale_after_seconds:
+                logger.warning(
+                    "Detected stale inner-life reflection lock (age=%.1fs >= %.1fs). Resetting lock.",
+                    running_age,
+                    stale_after_seconds,
+                )
+                self._reflection_running = False
+                self._reflection_started_monotonic = None
+            else:
+                result.outcome = "skipped_already_running"
+                if running_age is not None:
+                    result.error = f"reflection_running_for={running_age:.1f}s"
+                return result
 
         self._reflection_running = True
+        self._reflection_started_monotonic = time_module.monotonic()
         try:
             # Check active hours
             if not force and not self.is_within_active_hours():
@@ -2191,16 +2212,41 @@ Reflection #{self.personality.total_reflections + 1}
             # Pull emotional carryover from recent interactions before reflecting.
             self._update_mood_from_recent_interactions()
 
-            # Run the reflection chain
+            # Run the reflection chain with explicit execution guards so a
+            # stalled turn cannot wedge reflection forever.
+            per_turn_timeout_seconds = max(
+                5.0,
+                float(os.getenv("VERA_REFLECTION_TURN_TIMEOUT_SECONDS", "75") or 75.0),
+            )
+            cycle_timeout_seconds = max(
+                per_turn_timeout_seconds,
+                float(os.getenv("VERA_REFLECTION_CYCLE_TIMEOUT_SECONDS", "180") or 180.0),
+            )
+            cycle_deadline = time_module.monotonic() + cycle_timeout_seconds
             chain_depth = 0
             current_trigger = trigger
 
             while chain_depth <= self.config.max_chain_depth:
-                entry = await self._execute_single_turn(
-                    run_id=run_id,
-                    trigger=current_trigger,
-                    chain_depth=chain_depth,
-                )
+                remaining_seconds = cycle_deadline - time_module.monotonic()
+                if remaining_seconds <= 0:
+                    result.outcome = "error"
+                    result.error = f"reflection_cycle_timeout:{int(cycle_timeout_seconds)}s"
+                    break
+                turn_timeout_seconds = min(per_turn_timeout_seconds, max(1.0, remaining_seconds))
+                try:
+                    entry = await asyncio.wait_for(
+                        self._execute_single_turn(
+                            run_id=run_id,
+                            trigger=current_trigger,
+                            chain_depth=chain_depth,
+                        ),
+                        timeout=turn_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    result.outcome = "error"
+                    result.error = f"reflection_turn_timeout:{int(turn_timeout_seconds)}s"
+                    break
+
                 result.entries.append(entry)
                 self._persist_monologue_entry(entry)
 
@@ -2211,6 +2257,11 @@ Reflection #{self.personality.total_reflections + 1}
                     break
 
             result.total_chain_depth = chain_depth
+            if result.outcome == "error":
+                return result
+            if not result.entries:
+                result.outcome = "internal"
+                return result
 
             # Determine overall outcome from the last meaningful entry
             last_entry = result.entries[-1]
@@ -2273,6 +2324,7 @@ Reflection #{self.personality.total_reflections + 1}
             logger.error(f"Reflection cycle failed: {e}", exc_info=True)
         finally:
             self._reflection_running = False
+            self._reflection_started_monotonic = None
             elapsed_ms = (datetime.now() - start_time).total_seconds() * 1000
             result.duration_ms = elapsed_ms
             self._publish_event(f"innerlife.{result.outcome}", result.to_dict())
@@ -2660,6 +2712,12 @@ If no traits shifted, respond with: {{}}
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get engine statistics for status display."""
+        running_seconds: Optional[float] = None
+        if self._reflection_running and self._reflection_started_monotonic is not None:
+            running_seconds = max(
+                0.0,
+                time_module.monotonic() - self._reflection_started_monotonic,
+            )
         return {
             "enabled": self.config.enabled,
             "interval_seconds": self.config.reflection_interval_seconds,
@@ -2673,6 +2731,8 @@ If no traits shifted, respond with: {{}}
             "delivery_channels": self.config.delivery_channels,
             "last_reflection": self._last_reflection_at.isoformat() if self._last_reflection_at else "never",
             "model_override": self.config.model_override,
+            "reflection_running": bool(self._reflection_running),
+            "reflection_running_seconds": round(running_seconds, 3) if running_seconds is not None else None,
         }
 
     def format_journal(self, n: int = 10) -> str:

@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -119,6 +119,63 @@ def _default_server_concurrency() -> Dict[str, int]:
 
 def _readiness_max_wait_seconds() -> float:
     return _parse_float_env("VERA_STARTUP_CRITICAL_MAX_WAIT_SECONDS", 180.0, minimum=5.0)
+
+
+def _csv_values(raw: str) -> List[str]:
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
+def _extract_tool_choice_name(tool_choice: Any) -> str:
+    if isinstance(tool_choice, str):
+        cleaned = tool_choice.strip()
+        if cleaned and cleaned.lower() != "auto":
+            return cleaned
+        return ""
+    if not isinstance(tool_choice, dict):
+        return ""
+    function_obj = tool_choice.get("function")
+    if isinstance(function_obj, dict):
+        name = function_obj.get("name")
+        if isinstance(name, str):
+            return name.strip()
+    name = tool_choice.get("name")
+    if isinstance(name, str):
+        return name.strip()
+    return ""
+
+
+def _allow_loading_bypass_for_tool(readiness: Dict[str, Any], tool_choice: Any) -> bool:
+    enabled = str(os.getenv("VERA_READINESS_LOADING_TOOL_BYPASS", "1")).strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False
+
+    phase = str(readiness.get("phase") or "").strip().lower()
+    if phase != "loading":
+        return False
+
+    blocked = readiness.get("blocked_servers") or []
+    missing = readiness.get("missing_servers") or []
+    if blocked or missing:
+        return False
+
+    tool_name = _extract_tool_choice_name(tool_choice).lower()
+    if not tool_name:
+        return False
+
+    allow_tools = {
+        item.lower()
+        for item in _csv_values(os.getenv("VERA_READINESS_LOADING_ALLOW_TOOLS", ""))
+    }
+    if tool_name in allow_tools:
+        return True
+
+    allow_prefixes = [
+        prefix.lower()
+        for prefix in _csv_values(
+            os.getenv("VERA_READINESS_LOADING_ALLOW_PREFIXES", "desktop_,editor_")
+        )
+    ]
+    return any(tool_name.startswith(prefix) for prefix in allow_prefixes if prefix)
 
 
 def _evaluate_tools_readiness(app: web.Application) -> Dict[str, Any]:
@@ -614,15 +671,31 @@ def _normalize_content(content: Any, include_image_placeholder: bool = True) -> 
     return str(content)
 
 
-def _normalize_messages(raw_messages: List[Dict[str, Any]], include_image_placeholder: bool = True) -> Tuple[List[Dict[str, Any]], str]:
+def _normalize_messages(raw_messages: List[Any], include_image_placeholder: bool = True) -> Tuple[List[Dict[str, Any]], str]:
     messages: List[Dict[str, Any]] = []
     system_chunks: List[str] = []
 
     for msg in raw_messages or []:
-        role = msg.get("role")
-        if role not in {"system", "user", "assistant", "tool"}:
+        if isinstance(msg, str):
+            content = msg.strip()
+            if content:
+                messages.append({"role": "user", "content": content})
             continue
-        content = _normalize_content(msg.get("content"), include_image_placeholder=include_image_placeholder)
+        if not isinstance(msg, dict):
+            continue
+
+        role = str(msg.get("role") or "").strip().lower()
+        if role not in {"system", "user", "assistant", "tool"}:
+            # Compatibility path for legacy payloads that omitted `role`.
+            if "content" in msg:
+                role = "user"
+            else:
+                continue
+
+        content = _normalize_content(
+            msg.get("content"),
+            include_image_placeholder=include_image_placeholder,
+        )
         if role == "system":
             if content:
                 system_chunks.append(content)
@@ -631,8 +704,15 @@ def _normalize_messages(raw_messages: List[Dict[str, Any]], include_image_placeh
 
     return messages, "\n".join(system_chunks).strip()
 
-def _get_last_user_text(raw_messages: List[Dict[str, Any]]) -> str:
+def _get_last_user_text(raw_messages: List[Any]) -> str:
     for msg in reversed(raw_messages or []):
+        if isinstance(msg, str):
+            text = msg.strip()
+            if text:
+                return text
+            continue
+        if not isinstance(msg, dict):
+            continue
         if msg.get("role") != "user":
             continue
         content = msg.get("content")
@@ -647,8 +727,82 @@ def _get_last_user_text(raw_messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def _needs_temporal_scheduling_guard(user_text: str) -> bool:
+    text = str(user_text or "").strip().lower()
+    if not text:
+        return False
+
+    has_scheduling_intent = any(
+        token in text
+        for token in (
+            "calendar",
+            "event",
+            "reminder",
+            "schedule",
+            "meeting",
+            "appointment",
+            "task",
+            "to-do",
+            "todo",
+        )
+    )
+    if not has_scheduling_intent:
+        return False
+
+    return bool(
+        re.search(
+            r"\b(today|tonight|tomorrow|next week|next month|this morning|this afternoon|this evening|in \d+ (minute|minutes|hour|hours|day|days|week|weeks))\b",
+            text,
+        )
+    )
+
+
+def _build_temporal_scheduling_directive(now_local: datetime) -> str:
+    anchor = now_local.astimezone().isoformat(timespec="seconds")
+    return (
+        "Temporal Scheduling Directive:\n"
+        f"- Current local datetime anchor: {anchor}\n"
+        "- For this request, resolve all relative time phrases (today/tomorrow/in N hours) against this anchor.\n"
+        "- Convert relative phrases to explicit RFC3339 datetimes with timezone before calling calendar/task tools.\n"
+        "- Do not use historical years unless the partner explicitly requests a past date."
+    )
+
+
+def _resolve_workspace_google_auth_context() -> Tuple[str, bool]:
+    user_email = _resolve_workspace_user_email()
+    if not user_email:
+        return "", False
+    credentials_dir = _get_google_credentials_dir()
+    credentials_file = credentials_dir / f"{user_email}.json"
+    return user_email, credentials_file.exists()
+
+
+def _build_workspace_email_autofill_directive(user_email: str, authenticated: bool) -> str:
+    normalized_email = str(user_email or "").strip().lower()
+    if normalized_email and authenticated:
+        return (
+            "Workspace Identity Directive:\n"
+            f"- Default Google Workspace account is onboarded and authenticated: {normalized_email}.\n"
+            "- For Google Workspace tool calls, do not ask for email; use the onboarded account."
+        )
+    if normalized_email:
+        return (
+            "Workspace Identity Directive:\n"
+            f"- Default Google Workspace account is onboarded: {normalized_email} (auth pending).\n"
+            "- Reuse this email for auth/setup calls.\n"
+            "- Ask for an email only if no onboarded workspace account exists."
+        )
+    return (
+        "Workspace Identity Directive:\n"
+        "- No onboarded Google Workspace account is available.\n"
+        "- Ask for email only when a Google Workspace action requires it."
+    )
+
+
 def _extract_last_image_content(raw_messages: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
     for msg in reversed(raw_messages or []):
+        if not isinstance(msg, dict):
+            continue
         content = msg.get("content")
         if not isinstance(content, list):
             continue
@@ -1194,6 +1348,41 @@ def _check_rate_limit(app, bucket_name, client_ip, max_requests, window_seconds)
 
 
 _RATE_LIMIT_SKIP_PREFIXES = ("/api/health", "/api/readiness")
+_RATE_LIMIT_POLL_PREFIXES = (
+    "/api/editor",
+    "/api/tools",
+    "/api/memory/stats",
+    "/api/session/activity",
+    "/api/confirmations/sync",
+    "/api/innerlife/status",
+)
+
+
+def _resolve_rate_limit_bucket(request: web.Request) -> Tuple[str, int, float]:
+    path = request.path
+    method = (request.method or "GET").upper()
+
+    # Tool execution can be bursty during exams and background checks.
+    if path.startswith("/api/tools/call"):
+        return (
+            "tools_call_rate_limit",
+            _parse_int_env("VERA_RATE_LIMIT_TOOLS_CALL_MAX", 600, minimum=1),
+            _parse_float_env("VERA_RATE_LIMIT_TOOLS_CALL_WINDOW", 60.0, minimum=1.0),
+        )
+
+    # UI polling should not consume the same budget as chat/tool mutations.
+    if method == "GET" and any(path.startswith(prefix) for prefix in _RATE_LIMIT_POLL_PREFIXES):
+        return (
+            "poll_rate_limit",
+            _parse_int_env("VERA_RATE_LIMIT_POLL_MAX", 600, minimum=1),
+            _parse_float_env("VERA_RATE_LIMIT_POLL_WINDOW", 60.0, minimum=1.0),
+        )
+
+    return (
+        "global_rate_limit",
+        _parse_int_env("VERA_RATE_LIMIT_MAX", 60, minimum=1),
+        _parse_float_env("VERA_RATE_LIMIT_WINDOW", 60.0, minimum=1.0),
+    )
 
 
 @web.middleware
@@ -1206,11 +1395,10 @@ async def rate_limit_middleware(request, handler):
             return await handler(request)
     if not path.startswith("/api/") and not path.startswith("/v1/") and not path.startswith("/ws"):
         return await handler(request)
-    max_req = _parse_int_env("VERA_RATE_LIMIT_MAX", 60, minimum=1)
-    window = _parse_float_env("VERA_RATE_LIMIT_WINDOW", 60.0, minimum=1.0)
+    bucket_name, max_req, window = _resolve_rate_limit_bucket(request)
     ip = _client_ip(request)
     allowed, retry_after = _check_rate_limit(
-        request.app, "global_rate_limit", ip, max_req, window
+        request.app, bucket_name, ip, max_req, window
     )
     if not allowed:
         return web.json_response(
@@ -1269,6 +1457,12 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     session_link_id = _extract_session_link_id(payload)
 
     raw_messages = payload.get("messages", [])
+    if isinstance(raw_messages, dict):
+        raw_messages = [raw_messages]
+    elif isinstance(raw_messages, str):
+        raw_messages = [raw_messages]
+    elif not isinstance(raw_messages, list):
+        raw_messages = [str(raw_messages)]
     last_user_text_raw = _get_last_user_text(raw_messages)
     last_user_text = last_user_text_raw.lower()
     model = payload.get("model") or os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
@@ -1281,8 +1475,14 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
 
     readiness_payload = _evaluate_tools_readiness(request.app)
     if not readiness_payload.get("ready"):
-        standby_text = readiness_payload.get("message") or "Stand by while I finish loading my tools."
-        return await _chat_text_response(request, standby_text, model, stream)
+        if not _allow_loading_bypass_for_tool(readiness_payload, tool_choice_override):
+            standby_text = readiness_payload.get("message") or "Stand by while I finish loading my tools."
+            return await _chat_text_response(request, standby_text, model, stream)
+        logger.info(
+            "Readiness loading bypass allowed for tool_choice=%s pending=%s",
+            _extract_tool_choice_name(tool_choice_override),
+            readiness_payload.get("pending_servers") or [],
+        )
 
     image_content = _extract_last_image_content(raw_messages)
     vision_summary = ""
@@ -1340,6 +1540,14 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         system_prompt_addenda.append(f"User System Prompt:\n{system_override}")
     if vision_summary:
         system_prompt_addenda.append(f"Image analysis ({vision_model}):\n{vision_summary}")
+    if _needs_temporal_scheduling_guard(last_user_text_raw):
+        system_prompt_addenda.append(
+            _build_temporal_scheduling_directive(datetime.now().astimezone())
+        )
+    workspace_email, workspace_authenticated = _resolve_workspace_google_auth_context()
+    system_prompt_addenda.append(
+        _build_workspace_email_autofill_directive(workspace_email, workspace_authenticated)
+    )
 
     manual_summary = ""
     manual_quorum = payload.get("vera_quorum")
@@ -3263,6 +3471,80 @@ async def whatsapp_webhook_receive(request: web.Request) -> web.Response:
         return web.json_response({"error": "Webhook handler error"}, status=500)
 
 
+def _get_local_loopback_adapter(vera) -> Optional[Any]:
+    dock = getattr(vera, "channel_dock", None)
+    if not dock:
+        return None
+    adapter = dock.get("local-loopback")
+    if adapter and hasattr(adapter, "inject_inbound") and hasattr(adapter, "outbox_snapshot"):
+        return adapter
+    return None
+
+
+async def local_loopback_inbound(request: web.Request) -> web.Response:
+    vera = request.app.get("vera")
+    adapter = _get_local_loopback_adapter(vera)
+    if not adapter:
+        return web.json_response({"error": "Local loopback adapter not configured"}, status=503)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid or missing JSON body."}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Invalid payload."}, status=400)
+
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return web.json_response({"error": "Field 'text' is required."}, status=400)
+
+    try:
+        result = await adapter.inject_inbound(
+            text=text,
+            sender_id=str(payload.get("sender_id") or "loopback-user").strip() or "loopback-user",
+            sender_name=(str(payload.get("sender_name")).strip() if payload.get("sender_name") is not None else None),
+            conversation_id=(str(payload.get("conversation_id")).strip() if payload.get("conversation_id") is not None else None),
+            session_link_id=(str(payload.get("session_link_id")).strip() if payload.get("session_link_id") is not None else None),
+            chat_type=str(payload.get("chat_type") or "direct").strip().lower() or "direct",
+            thread_id=(str(payload.get("thread_id")).strip() if payload.get("thread_id") is not None else None),
+            reply_to_id=(str(payload.get("reply_to_id")).strip() if payload.get("reply_to_id") is not None else None),
+            raw=payload if isinstance(payload, dict) else {},
+        )
+        return web.json_response({
+            "ok": True,
+            "result": result,
+        })
+    except Exception as exc:
+        logger.warning("Local loopback inbound error: %s", exc)
+        return web.json_response({"error": "Loopback handler error"}, status=500)
+
+
+async def local_loopback_outbox(request: web.Request) -> web.Response:
+    vera = request.app.get("vera")
+    adapter = _get_local_loopback_adapter(vera)
+    if not adapter:
+        return web.json_response({"error": "Local loopback adapter not configured"}, status=503)
+    raw_limit = str(request.query.get("limit") or "20").strip()
+    try:
+        limit = int(raw_limit) if raw_limit else 20
+    except Exception:
+        limit = 20
+    rows = await adapter.outbox_snapshot(limit=limit)
+    return web.json_response({
+        "ok": True,
+        "count": len(rows),
+        "messages": rows,
+    })
+
+
+async def local_loopback_outbox_clear(request: web.Request) -> web.Response:
+    vera = request.app.get("vera")
+    adapter = _get_local_loopback_adapter(vera)
+    if not adapter:
+        return web.json_response({"error": "Local loopback adapter not configured"}, status=503)
+    cleared = await adapter.clear_outbox()
+    return web.json_response({"ok": True, "cleared": int(cleared)})
+
+
 def _get_push_service(request: web.Request) -> Optional[PushNotificationService]:
     service = request.app.get("push_service")
     if isinstance(service, PushNotificationService):
@@ -3275,6 +3557,184 @@ def _get_native_push_service(request: web.Request) -> Optional[NativePushNotific
     if isinstance(service, NativePushNotificationService):
         return service
     return None
+
+
+_PUSH_ACK_ALLOWED_TYPES = {
+    "received",
+    "displayed",
+    "opened",
+    "clicked",
+    "dismissed",
+    "action",
+}
+
+
+def _normalize_push_ack_type(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in _PUSH_ACK_ALLOWED_TYPES:
+        return normalized
+    return "opened"
+
+
+def _push_ack_log_path() -> Path:
+    raw = str(os.getenv("VERA_PUSH_ACK_LOG_PATH", "vera_memory/push_user_ack.jsonl") or "").strip()
+    path = Path(raw).expanduser() if raw else (Path("vera_memory") / "push_user_ack.jsonl")
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _append_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
+def _build_push_ack_row(
+    *,
+    run_id: str,
+    ack_type: str,
+    channel: str,
+    source: str,
+    device_id: str = "",
+    event_type: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "run_id": str(run_id or "").strip()[:128],
+        "ack_type": _normalize_push_ack_type(ack_type),
+        "channel": str(channel or "").strip().lower()[:64] or "unknown",
+        "source": str(source or "").strip().lower()[:64] or "unknown",
+    }
+    if device_id:
+        row["device_id"] = str(device_id).strip()[:256]
+    if event_type:
+        row["event_type"] = str(event_type).strip()[:96]
+    if isinstance(metadata, dict) and metadata:
+        compact: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            skey = str(key).strip()
+            if not skey:
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                compact[skey] = value
+            else:
+                compact[skey] = str(value)
+            if len(compact) >= 32:
+                break
+        if compact:
+            row["metadata"] = compact
+    return row
+
+
+def _append_push_ack(row: Dict[str, Any]) -> Tuple[bool, str]:
+    run_id = str(row.get("run_id") or "").strip()
+    if not run_id:
+        return False, "missing_run_id"
+    path = _push_ack_log_path()
+    try:
+        _append_jsonl_row(path, row)
+    except Exception as exc:
+        logger.warning("Failed to record push ack: %s", exc)
+        return False, "ack_log_write_failed"
+    return True, str(path)
+
+
+def _ack_exists_for_run_id(run_id: str, max_scan_lines: int = 200) -> bool:
+    path = _push_ack_log_path()
+    if not path.exists():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return False
+    for line in reversed(lines[-max_scan_lines:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(row, dict) and str(row.get("run_id") or "").strip() == run_id:
+            return True
+    return False
+
+
+def _parse_utc_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromtimestamp(float(text), tz=timezone.utc)
+    except Exception:
+        pass
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def _maybe_proxy_ack_on_native_register(
+    request: web.Request,
+    payload: Dict[str, Any],
+    token: str,
+) -> Optional[str]:
+    explicit_run_id = str(payload.get("run_id") or payload.get("ack_run_id") or "").strip()[:128]
+    if explicit_run_id:
+        if _ack_exists_for_run_id(explicit_run_id):
+            return explicit_run_id
+        row = _build_push_ack_row(
+            run_id=explicit_run_id,
+            ack_type=str(payload.get("ack_type") or "opened"),
+            channel="fcm",
+            source="native_register_explicit",
+            device_id=token,
+            event_type="innerlife.reached_out",
+            metadata={"path": "native_register"},
+        )
+        ok, _ = _append_push_ack(row)
+        return explicit_run_id if ok else None
+
+    window_seconds = _parse_int_env("VERA_PUSH_REGISTER_ACK_WINDOW_SECONDS", 180, minimum=30)
+    last_reachout = request.app.get("last_reachout_event")
+    if not isinstance(last_reachout, dict):
+        return None
+    run_id = str(last_reachout.get("run_id") or "").strip()[:128]
+    timestamp = _parse_utc_timestamp(str(last_reachout.get("timestamp") or ""))
+    if not run_id or not timestamp:
+        return None
+    age_seconds = (datetime.now(timestamp.tzinfo) - timestamp).total_seconds()
+    if age_seconds < 0 or age_seconds > float(window_seconds):
+        return None
+    if _ack_exists_for_run_id(run_id):
+        return run_id
+    row = _build_push_ack_row(
+        run_id=run_id,
+        ack_type="opened",
+        channel="fcm",
+        source="native_register_proxy",
+        device_id=token,
+        event_type="innerlife.reached_out",
+        metadata={
+            "path": "native_register_proxy",
+            "window_seconds": window_seconds,
+            "age_seconds": round(age_seconds, 3),
+        },
+    )
+    ok, _ = _append_push_ack(row)
+    return run_id if ok else None
 
 
 async def push_vapid(request: web.Request) -> web.Response:
@@ -3357,7 +3817,11 @@ async def push_native_register(request: web.Request) -> web.Response:
     ok, detail = service.register_device(device)
     if not ok:
         return web.json_response({"ok": False, "error": detail}, status=400)
-    return web.json_response({"ok": True, "token": detail})
+    ack_run_id = _maybe_proxy_ack_on_native_register(request, device, detail)
+    response_payload: Dict[str, Any] = {"ok": True, "token": detail}
+    if ack_run_id:
+        response_payload["ack_run_id"] = ack_run_id
+    return web.json_response(response_payload)
 
 
 async def push_native_unregister(request: web.Request) -> web.Response:
@@ -3405,6 +3869,62 @@ async def push_native_test(request: web.Request) -> web.Response:
     if not result.get("ok"):
         return web.json_response(result, status=400)
     return web.json_response(result)
+
+
+async def push_native_ack(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"ok": False, "error": "invalid_payload"}, status=400)
+
+    run_id = str(payload.get("run_id") or "").strip()[:128]
+    if not run_id:
+        return web.json_response({"ok": False, "error": "missing_run_id"}, status=400)
+
+    ack_type = _normalize_push_ack_type(payload.get("ack_type") or payload.get("type") or "opened")
+    channel = str(payload.get("channel") or payload.get("provider") or "").strip().lower()[:64] or "unknown"
+    source = str(payload.get("source") or "").strip().lower()[:64] or "unknown"
+    device_id = str(payload.get("device_id") or payload.get("token") or "").strip()[:256]
+    event_type = str(payload.get("event_type") or "").strip()[:96]
+
+    metadata_raw = payload.get("metadata")
+    if not isinstance(metadata_raw, dict):
+        metadata_raw = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    metadata: Dict[str, Any] = {}
+    for key, value in metadata_raw.items():
+        skey = str(key).strip()
+        if not skey:
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            metadata[skey] = value
+        else:
+            metadata[skey] = str(value)
+        if len(metadata) >= 32:
+            break
+
+    row = _build_push_ack_row(
+        run_id=run_id,
+        ack_type=ack_type,
+        channel=channel,
+        source=source,
+        device_id=device_id,
+        event_type=event_type,
+        metadata=metadata,
+    )
+    ok, path = _append_push_ack(row)
+    if not ok:
+        return web.json_response({"ok": False, "error": path}, status=500)
+
+    return web.json_response(
+        {
+            "ok": True,
+            "run_id": run_id,
+            "ack_type": ack_type,
+            "log_path": path,
+        }
+    )
 
 
 async def push_native_targets(request: web.Request) -> web.Response:
@@ -4040,8 +4560,8 @@ async def innerlife_status(request: web.Request) -> web.Response:
             proactive_status = {
                 "calendar_last_poll": cal_state.get("last_poll_utc"),
                 "calendar_alerts_today": len(cal_state.get("alerted_event_ids", [])),
-                "calendar_enabled": os.getenv("VERA_CALENDAR_PROACTIVE", "0") == "1",
-                "proactive_execution_enabled": os.getenv("VERA_PROACTIVE_EXECUTION", "0") == "1",
+                "calendar_enabled": os.getenv("VERA_CALENDAR_PROACTIVE", "1") == "1",
+                "proactive_execution_enabled": os.getenv("VERA_PROACTIVE_EXECUTION", "1") == "1",
             }
 
         return web.json_response({
@@ -4095,22 +4615,43 @@ async def innerlife_reflect(request: web.Request) -> web.Response:
     wait_for_completion = bool(payload.get("wait", False))
     timeout_seconds = float(payload.get("timeout_seconds", 0) or 0)
     timeout_seconds = max(1.0, min(timeout_seconds, 300.0)) if wait_for_completion else 0.0
+
+    def _consume_reflection_task(task: "asyncio.Task[Any]") -> None:
+        try:
+            task.result()
+        except Exception:
+            logging.getLogger(__name__).exception("Background inner life reflection failed")
+
     try:
         if wait_for_completion:
-            coro = vera._run_reflection_cycle(trigger="manual", force=True)
-            result = await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
+            run_task: "asyncio.Task[Any]" = asyncio.create_task(
+                vera._run_reflection_cycle(trigger="manual", force=True)
+            )
+            run_task.add_done_callback(_consume_reflection_task)
+            result = (
+                await asyncio.wait_for(asyncio.shield(run_task), timeout=timeout_seconds)
+                if timeout_seconds
+                else await run_task
+            )
             result_data = result.to_dict() if hasattr(result, "to_dict") else {}
             return web.json_response({
                 "scheduled": True,
                 "completed": True,
                 "result": result_data,
             })
-        asyncio.create_task(vera._run_reflection_cycle(trigger="manual", force=True))
+        run_task = asyncio.create_task(vera._run_reflection_cycle(trigger="manual", force=True))
+        run_task.add_done_callback(_consume_reflection_task)
         return web.json_response({"scheduled": True})
     except asyncio.TimeoutError:
         return web.json_response(
-            {"scheduled": True, "completed": False, "error": "reflection timed out"},
-            status=504,
+            {
+                "scheduled": True,
+                "completed": False,
+                "in_progress": True,
+                "timeout_seconds": timeout_seconds,
+                "error": "reflection timed out; continuing in background",
+            },
+            status=202,
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to schedule inner life reflection")
@@ -5887,6 +6428,7 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app["self_improvement_runner"] = SelfImprovementRunner(Path("vera_memory") / "flight_recorder")
     app["push_service"] = PushNotificationService()
     app["native_push_service"] = NativePushNotificationService()
+    app["last_reachout_event"] = {}
     app["started_at"] = time.time()
     app["tool_execution_history"] = []  # In-memory ring buffer for tool execution tracking
     app["vera_api_key"] = _get_secret_env("VERA_API_KEY")
@@ -5910,6 +6452,9 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app.router.add_get("/api/channels/status", channels_status)
     app.router.add_get("/api/channels/whatsapp/webhook", whatsapp_webhook_verify)
     app.router.add_post("/api/channels/whatsapp/webhook", whatsapp_webhook_receive)
+    app.router.add_post("/api/channels/local/inbound", local_loopback_inbound)
+    app.router.add_get("/api/channels/local/outbox", local_loopback_outbox)
+    app.router.add_post("/api/channels/local/outbox/clear", local_loopback_outbox_clear)
     app.router.add_get("/api/push/vapid", push_vapid)
     app.router.add_post("/api/push/subscribe", push_subscribe)
     app.router.add_post("/api/push/unsubscribe", push_unsubscribe)
@@ -5918,6 +6463,7 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app.router.add_post("/api/push/native/register", push_native_register)
     app.router.add_post("/api/push/native/unregister", push_native_unregister)
     app.router.add_post("/api/push/native/test", push_native_test)
+    app.router.add_post("/api/push/native/ack", push_native_ack)
     app.router.add_route("*", "/api/push/native/targets", push_native_targets)
     app.router.add_post("/api/anthropic/messages", anthropic_messages_proxy)
     app.router.add_get("/api/google/auth/status", google_auth_status)
@@ -5982,6 +6528,10 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app.router.add_get("/api/preferences/core-identity", core_identity_status)
     app.router.add_post("/api/preferences/core-identity/refresh", core_identity_refresh)
     app.router.add_post("/api/preferences/core-identity/revert", core_identity_revert)
+    # Back-compat aliases retained for older tooling/scripts.
+    app.router.add_get("/api/preferences/identity", core_identity_status)
+    app.router.add_get("/api/preferences/promote", core_identity_status)
+    app.router.add_post("/api/preferences/promote", core_identity_refresh)
 
     # Right-rail drawer endpoints
     app.router.add_get("/api/ping", api_ping)
@@ -6030,6 +6580,29 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
 
     push_service = app.get("push_service")
     event_bus = getattr(vera, "event_bus", None)
+    if event_bus:
+        def _track_innerlife_reachout(event) -> None:
+            if event.event_type != "innerlife.reached_out":
+                return
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            run_id = str(payload.get("run_id") or "").strip()
+            if not run_id:
+                return
+            try:
+                app["last_reachout_event"] = {"run_id": run_id, "timestamp": str(event.timestamp)}
+            except Exception:
+                pass
+
+        try:
+            event_bus.subscribe(
+                "innerlife.reached_out",
+                _track_innerlife_reachout,
+                subscriber_id="reachout-state-tracker",
+            )
+        except Exception:
+            logger.debug("Suppressed Exception in server")
+            pass
+
     if event_bus and isinstance(push_service, PushNotificationService) and push_service.enabled:
         try:
             loop = asyncio.get_running_loop()
@@ -6074,15 +6647,30 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
                 return
             if event.event_type != "innerlife.reached_out":
                 return
+            event_payload = event.payload if isinstance(event.payload, dict) else {}
+            run_id = str(event_payload.get("run_id") or "").strip()
+            if run_id:
+                try:
+                    app["last_reachout_event"] = {"run_id": run_id, "timestamp": str(event.timestamp)}
+                except Exception:
+                    pass
+            push_data: Dict[str, Any] = {
+                "event_type": event.event_type,
+                "timestamp": event.timestamp,
+            }
+            if run_id:
+                push_data["run_id"] = run_id
+                push_data["ack_endpoint"] = "/api/push/native/ack"
+                push_data["ack_type"] = "opened"
+            delivered_to = event_payload.get("delivered_to")
+            if isinstance(delivered_to, list):
+                push_data["delivered_to"] = [str(item) for item in delivered_to if str(item).strip()]
             payload = {
                 "title": "VERA reached out",
                 "body": "VERA has a new update. Tap to open.",
                 "icon": "/assets/icon-192.png",
                 "badge": "/assets/icon-192.png",
-                "data": {
-                    "event_type": event.event_type,
-                    "timestamp": event.timestamp,
-                },
+                "data": push_data,
             }
             try:
                 asyncio.run_coroutine_threadsafe(push_service.broadcast(payload), loop)

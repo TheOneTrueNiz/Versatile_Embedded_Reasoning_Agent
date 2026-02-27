@@ -14,6 +14,8 @@ import json
 import os
 import threading
 import uuid
+import gzip
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +79,15 @@ class FlightRecorder:
 
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.transitions_path = self.base_dir / "transitions.ndjson"
+        self._max_mb = self._safe_env_float("VERA_FLIGHT_RECORDER_MAX_MB", 50.0, minimum=1.0)
+        self._max_backups = self._safe_env_int("VERA_FLIGHT_RECORDER_MAX_BACKUPS", 2, minimum=1)
+        self._compress_backups = os.getenv("VERA_FLIGHT_RECORDER_COMPRESS_BACKUPS", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._compression_level = self._safe_env_int("VERA_FLIGHT_RECORDER_GZIP_LEVEL", 6, minimum=1, maximum=9)
         self._lock = threading.Lock()
         self._last_tool_hash: Dict[str, str] = {}
         self._reward_model_enabled = os.getenv("VERA_REWARD_MODEL_ENABLED", "0") == "1"
@@ -88,11 +99,114 @@ class FlightRecorder:
             except Exception:
                 self._reward_model = None
 
+    @staticmethod
+    def _safe_env_int(name: str, fallback: int, minimum: int = 0, maximum: Optional[int] = None) -> int:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return fallback
+        try:
+            value = int(raw)
+        except Exception:
+            return fallback
+        if maximum is not None:
+            value = min(value, maximum)
+        return max(minimum, value)
+
+    @staticmethod
+    def _safe_env_float(name: str, fallback: float, minimum: float = 0.0) -> float:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return fallback
+        try:
+            value = float(raw)
+        except Exception:
+            return fallback
+        return max(minimum, value)
+
+    def _backup_path(self, index: int, compressed: bool = False) -> Path:
+        base = self.transitions_path.with_suffix(f".ndjson.{max(1, int(index))}")
+        if compressed:
+            return Path(str(base) + ".gz")
+        return base
+
+    def _remove_backup_slot(self, index: int) -> None:
+        plain = self._backup_path(index, compressed=False)
+        compressed = self._backup_path(index, compressed=True)
+        for path in (plain, compressed):
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+
+    def _compress_file(self, src: Path, dst: Path) -> bool:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists():
+                dst.unlink()
+            with src.open("rb") as src_handle:
+                with gzip.open(dst, "wb", compresslevel=self._compression_level) as dst_handle:
+                    shutil.copyfileobj(src_handle, dst_handle)
+            src.unlink()
+            return True
+        except Exception:
+            try:
+                if dst.exists():
+                    dst.unlink()
+            except Exception:
+                pass
+            return False
+
+    def _rotate_backup_slots(self) -> None:
+        # Remove the oldest slot first.
+        self._remove_backup_slot(self._max_backups)
+
+        # Shift existing backups upward.
+        for index in range(self._max_backups - 1, 0, -1):
+            src_plain = self._backup_path(index, compressed=False)
+            src_gz = self._backup_path(index, compressed=True)
+            dst_plain = self._backup_path(index + 1, compressed=False)
+            dst_gz = self._backup_path(index + 1, compressed=True)
+            self._remove_backup_slot(index + 1)
+
+            if src_gz.exists():
+                src_gz.rename(dst_gz)
+                continue
+
+            if not src_plain.exists():
+                continue
+
+            if self._compress_backups:
+                if self._compress_file(src_plain, dst_gz):
+                    continue
+            src_plain.rename(dst_plain)
+
+    def _rotate_if_needed(self) -> None:
+        """Rotate transitions.ndjson when it exceeds the size limit."""
+        try:
+            if not self.transitions_path.exists():
+                return
+            size_mb = self.transitions_path.stat().st_size / (1024 * 1024)
+            if size_mb < self._max_mb:
+                return
+            self._rotate_backup_slots()
+            backup_1_plain = self._backup_path(1, compressed=False)
+            backup_1_gz = self._backup_path(1, compressed=True)
+            self._remove_backup_slot(1)
+            if self._compress_backups:
+                if not self._compress_file(self.transitions_path, backup_1_gz):
+                    self.transitions_path.rename(backup_1_plain)
+            else:
+                self.transitions_path.rename(backup_1_plain)
+        except Exception:
+            pass  # Don't let rotation errors break logging
+
     def _append(self, payload: Dict[str, Any]) -> None:
         if not self.enabled:
             return
         line = _json_dumps(payload)
         with self._lock:
+            self._rotate_if_needed()
             with self.transitions_path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
 
@@ -251,16 +365,35 @@ class FlightRecorder:
 
     def get_stats(self) -> Dict[str, Any]:
         if not self.transitions_path.exists():
-            return {"path": str(self.transitions_path), "entries": 0}
+            return {
+                "path": str(self.transitions_path),
+                "entries": 0,
+                "max_mb": self._max_mb,
+                "max_backups": self._max_backups,
+                "compress_backups": self._compress_backups,
+            }
         try:
             with self.transitions_path.open("r", encoding="utf-8") as handle:
                 count = sum(1 for _ in handle)
         except Exception:
             count = 0
+        backup_sizes = []
+        for index in range(1, self._max_backups + 1):
+            plain = self._backup_path(index, compressed=False)
+            compressed = self._backup_path(index, compressed=True)
+            if plain.exists():
+                backup_sizes.append({"slot": index, "path": str(plain), "bytes": plain.stat().st_size})
+            if compressed.exists():
+                backup_sizes.append({"slot": index, "path": str(compressed), "bytes": compressed.stat().st_size})
         return {
             "path": str(self.transitions_path),
             "entries": count,
             "enabled": self.enabled,
+            "max_mb": self._max_mb,
+            "max_backups": self._max_backups,
+            "compress_backups": self._compress_backups,
+            "current_size_bytes": self.transitions_path.stat().st_size,
+            "backup_files": backup_sizes,
         }
 
     def record_task_feedback(

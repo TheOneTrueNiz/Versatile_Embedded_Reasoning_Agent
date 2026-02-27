@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import importlib
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import sys
@@ -71,10 +72,27 @@ async def main() -> None:
     parser.add_argument("--host", default=os.getenv("VERA_API_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("VERA_API_PORT", "8788")))
     parser.add_argument("--ui-dist", default=os.getenv("VERA_UI_DIST", ""))
+    parser.add_argument(
+        "--memory-footprint-mb",
+        type=float,
+        default=None,
+        help=(
+            "Max persistent memory footprint budget in MB "
+            "(sets VERA_MEMORY_MAX_FOOTPRINT_MB, default: 1024). "
+            "Set 0 to disable budget checks."
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--dev", action="store_true", help="Enable max logging and preflight checks")
     parser.add_argument("--logging", action="store_true", help="Enable max logging and preflight checks")
     args = parser.parse_args()
+
+    if args.memory_footprint_mb is not None:
+        if args.memory_footprint_mb < 0:
+            parser.error("--memory-footprint-mb must be >= 0")
+        os.environ["VERA_MEMORY_MAX_FOOTPRINT_MB"] = f"{args.memory_footprint_mb:g}"
+    elif not os.getenv("VERA_MEMORY_MAX_FOOTPRINT_MB", "").strip():
+        os.environ["VERA_MEMORY_MAX_FOOTPRINT_MB"] = "1024"
 
     if args.dev or args.logging or args.debug:
         os.environ["VERA_PREFLIGHT"] = "1"
@@ -92,7 +110,7 @@ async def main() -> None:
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler(log_file)
+                RotatingFileHandler(log_file, maxBytes=50 * 1024 * 1024, backupCount=3)
             ],
         )
         logging.getLogger("httpx").setLevel(logging.DEBUG)

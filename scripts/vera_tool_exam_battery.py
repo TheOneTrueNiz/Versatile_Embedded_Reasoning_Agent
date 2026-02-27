@@ -52,6 +52,27 @@ MANUAL_CONFIRMATION_TOOLS: Set[str] = {
 }
 
 
+def _tier1_prompt_for_tool(tool_name: str) -> str:
+    if tool_name == "edit_file":
+        probe_path = Path("/tmp/vera_exam_edit_file.txt")
+        probe_path.write_text("vera tool exam seed\n", encoding="utf-8")
+        return (
+            "Direct Tool Exam.\n"
+            f"You MUST call tool `{tool_name}` exactly once in this turn.\n"
+            f"Use this existing file path only: {probe_path}.\n"
+            "Apply one minimal safe edit (for example, append one short line).\n"
+            "If the tool fails due auth/network/remote constraints, report that failure explicitly.\n"
+            "After the tool call, reply with: EXAM_COMPLETE."
+        )
+
+    return (
+        "Direct Tool Exam.\n"
+        f"You MUST call tool `{tool_name}` exactly once in this turn, using safe minimal arguments.\n"
+        "If the tool fails due auth/network/remote constraints, report that failure explicitly.\n"
+        "After the tool call, reply with: EXAM_COMPLETE."
+    )
+
+
 def _utc_ts() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -408,6 +429,89 @@ def _tier1_timeout_for_tool(tool_name: str, default_timeout: float) -> float:
     return max(float(default_timeout), override)
 
 
+def _detect_external_constraint_reason(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return ""
+
+    if any(
+        token in lowered
+        for token in (
+            "quota exceeded",
+            "rate limit",
+            "429",
+            "hourly limit",
+            "too many requests",
+        )
+    ):
+        return "external_quota_or_rate_limit"
+
+    if any(
+        token in lowered
+        for token in (
+            "authentication needed",
+            "authorization",
+            "unauthorized",
+            "invalid_grant",
+            "missing credential",
+            "oauth",
+            "re-authenticate",
+            "not authenticated",
+        )
+    ):
+        return "external_auth_required"
+
+    if any(
+        token in lowered
+        for token in (
+            "service unavailable",
+            "upstream unavailable",
+            "temporarily unavailable",
+            "remote constraint",
+            "connection refused",
+            "dns",
+            "network error",
+            "timeout",
+            "timed out",
+        )
+    ):
+        return "external_service_unavailable"
+
+    return ""
+
+
+def _detect_external_constraint_from_attempts(attempts: List[Dict[str, Any]]) -> str:
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        reason = _detect_external_constraint_reason(str(attempt.get("reply_preview") or ""))
+        if reason:
+            return reason
+    return ""
+
+
+def _detect_tool_runtime_failure_reason(reply_preview: str) -> str:
+    lowered = str(reply_preview or "").strip().lower()
+    if not lowered:
+        return ""
+
+    if "tool failure report" in lowered:
+        return "tool_runtime_failure"
+    if "failed due" in lowered or "failed:" in lowered:
+        return "tool_runtime_failure"
+    if "no such file" in lowered or "enoent" in lowered:
+        return "tool_runtime_failure"
+    if "missing dependencies" in lowered:
+        return "tool_runtime_failure"
+    if "permission denied" in lowered:
+        return "tool_runtime_failure"
+    if "traceback" in lowered or "exception" in lowered:
+        return "tool_runtime_failure"
+    if " tool error" in lowered:
+        return "tool_runtime_failure"
+    return ""
+
+
 def _send_chat(
     *,
     v1_url: str,
@@ -481,6 +585,7 @@ def _run_tier1(
     transition_wait_seconds: float,
     transition_grace_seconds: float,
     session_prefix: str,
+    halt_file: Optional[Path] = None,
 ) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
     passed = 0
@@ -489,6 +594,19 @@ def _run_tier1(
     total = len(tools)
 
     for idx, tool_name in enumerate(tools, start=1):
+        if halt_file is not None and halt_file.exists():
+            for remaining_tool in tools[idx - 1 :]:
+                rows.append(
+                    {
+                        "tool": remaining_tool,
+                        "status": "skipped",
+                        "reason": "manual_halt_active",
+                        "attempts": [],
+                    }
+                )
+            skipped += len(tools[idx - 1 :])
+            break
+
         if not include_side_effects and _looks_side_effect_tool(tool_name):
             rows.append(
                 {
@@ -513,12 +631,7 @@ def _run_tier1(
             attempt_limit = max(attempt_limit, 2)
 
         for attempt in range(1, attempt_limit + 1):
-            prompt = (
-                "Direct Tool Exam.\n"
-                f"You MUST call tool `{tool_name}` exactly once in this turn, using safe minimal arguments.\n"
-                "If the tool fails due auth/network/remote constraints, report that failure explicitly.\n"
-                "After the tool call, reply with: EXAM_COMPLETE."
-            )
+            prompt = _tier1_prompt_for_tool(tool_name)
             start_local = dt.datetime.now()
             code, preview, _ = _send_chat(
                 v1_url=v1_url,
@@ -558,16 +671,30 @@ def _run_tier1(
             if invoked and (code == 200 or timed_out):
                 break
 
-        status = "passed" if invoked else "failed"
-        if status == "passed":
+        reason = _detect_external_constraint_from_attempts(attempts)
+        runtime_failure_reason = _detect_tool_runtime_failure_reason(last_preview)
+        has_runtime_failure = bool(runtime_failure_reason)
+
+        status = "passed"
+        if not invoked or has_runtime_failure:
+            status = "failed"
+
+        if status == "passed" and not reason:
             passed += 1
         else:
-            failed += 1
+            if reason:
+                status = "skipped"
+                skipped += 1
+            else:
+                reason = runtime_failure_reason if has_runtime_failure else ""
+                failed += 1
 
         rows.append(
             {
                 "tool": tool_name,
                 "status": status,
+                "reason": reason,
+                "runtime_failure": has_runtime_failure,
                 "invoked": invoked,
                 "http": last_http,
                 "used_tools": used_union,
@@ -599,6 +726,7 @@ def _run_tier2(
     transition_wait_seconds: float,
     transition_grace_seconds: float,
     session_prefix: str,
+    halt_file: Optional[Path] = None,
 ) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
     passed = 0
@@ -606,6 +734,21 @@ def _run_tier2(
     skipped = 0
 
     for idx, scenario in enumerate(scenarios, start=1):
+        if halt_file is not None and halt_file.exists():
+            for offset, remaining_scenario in enumerate(scenarios[idx - 1 :], start=idx):
+                remaining_sid = str(remaining_scenario.get("id") or f"scenario_{offset}")
+                rows.append(
+                    {
+                        "id": remaining_sid,
+                        "status": "skipped",
+                        "reason": "manual_halt_active",
+                        "expected_tools": [],
+                        "attempts": [],
+                    }
+                )
+            skipped += len(scenarios[idx - 1 :])
+            break
+
         sid = str(scenario.get("id") or f"scenario_{idx}")
         prompt = str(scenario.get("prompt") or "").strip()
         expected_groups = _normalize_expected_groups(scenario)
@@ -781,6 +924,11 @@ def main() -> int:
         default=8.0,
         help="Extra seconds to re-check transitions when first pass sees none.",
     )
+    parser.add_argument(
+        "--run-id",
+        default="",
+        help="Optional stable session prefix for conversation ids (example: tool-exam-20260224T230000Z).",
+    )
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
@@ -794,8 +942,10 @@ def main() -> int:
     model = choose_model(v1, args.model, args.timeout)
     protocol_text = _read_text((root / args.protocol) if not Path(args.protocol).is_absolute() else Path(args.protocol))
     transitions_path = root / "vera_memory" / "flight_recorder" / "transitions.ndjson"
+    halt_file = root / "vera_memory" / "manual_halt"
 
     ts = _utc_ts()
+    session_prefix = str(args.run_id or "").strip() or f"tool-exam-{ts}"
     report: Dict[str, Any] = {
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "base_url": api,
@@ -815,6 +965,7 @@ def main() -> int:
             "ready_streak": int(args.ready_streak),
             "transition_wait_seconds": float(args.transition_wait_seconds),
             "transition_grace_seconds": float(args.transition_grace_seconds),
+            "run_id": session_prefix,
         },
         "discovery": {},
         "tier1": {},
@@ -895,7 +1046,8 @@ def main() -> int:
             include_side_effects=bool(args.include_side_effects),
             transition_wait_seconds=max(0.5, float(args.transition_wait_seconds)),
             transition_grace_seconds=max(0.0, float(args.transition_grace_seconds)),
-            session_prefix=f"tool-exam-{ts}",
+            session_prefix=session_prefix,
+            halt_file=halt_file,
         )
         tier1_failed = int(tier1.get("failed") or 0)
         report["tier1"] = tier1
@@ -923,7 +1075,8 @@ def main() -> int:
             timeout=float(args.timeout),
             transition_wait_seconds=max(0.5, float(args.transition_wait_seconds)),
             transition_grace_seconds=max(0.0, float(args.transition_grace_seconds)),
-            session_prefix=f"tool-exam-{ts}",
+            session_prefix=session_prefix,
+            halt_file=halt_file,
         )
         tier2_failed = int(tier2.get("failed") or 0)
         report["tier2"] = tier2

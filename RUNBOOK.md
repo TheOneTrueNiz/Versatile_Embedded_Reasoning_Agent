@@ -62,6 +62,12 @@ Local release gate (writes manifest/logs under `tmp/release_gate/<timestamp>/`):
 ./scripts/vera_release_gate_local.py
 ```
 
+Alive protocol gate (writes JSON/MD under `tmp/audits/<timestamp>/`):
+
+```bash
+.venv/bin/python scripts/vera_alive_protocol_gate.py
+```
+
 ## 5) API + UI + MCP Stack
 
 Primary stack launcher:
@@ -130,3 +136,82 @@ Retention controls:
 - Disable keychain autoload with `VERA_KEYCHAIN_LOAD=0`.
 - `~/Documents/creds` remains as compatibility fallback.
 - Preferred production pattern is environment/secret-manager injection.
+
+## 10) Memory Footprint Budget
+
+- Default persistent memory budget is **1024 MB** via `VERA_MEMORY_MAX_FOOTPRINT_MB=1024` when unset.
+- Override via env:
+
+```bash
+export VERA_MEMORY_MAX_FOOTPRINT_MB=1536
+```
+
+- Override via CLI:
+  - `./scripts/run_vera.sh --memory-footprint-mb 1536`
+  - `.venv/bin/python run_vera_api.py --memory-footprint-mb 1536`
+  - `python3 run_vera_monolithic.py --memory-footprint-mb 1536`
+  - `./scripts/run_vera_full.sh --memory-footprint-mb 1536`
+
+- Disable budget checks with `VERA_MEMORY_MAX_FOOTPRINT_MB=0`.
+- Runtime telemetry is exposed at `/api/memory/stats` under `disk_usage`.
+
+## 11) Proactive + Continuity Defaults
+
+- Proactive execution defaults to enabled unless explicitly disabled:
+  - `VERA_PROACTIVE_EXECUTION=1` (default)
+  - `VERA_CALENDAR_PROACTIVE=1` (default)
+- `scripts/run_vera_full.sh` auto-seeds `VERA_DEFAULT_SESSION_LINK_ID` from onboarded workspace email when unset (single-owner continuity default).
+
+Override examples:
+
+```bash
+export VERA_PROACTIVE_EXECUTION=0
+export VERA_CALENDAR_PROACTIVE=0
+export VERA_DEFAULT_SESSION_LINK_ID="my-link-id"
+```
+
+Cross-channel continuity default:
+- `config/channels.json` enables two channels out of the box:
+  - `api`
+  - `local-loopback` (deterministic local channel used for continuity validation)
+- Loopback endpoints:
+  - `POST /api/channels/local/inbound`
+  - `GET /api/channels/local/outbox`
+  - `POST /api/channels/local/outbox/clear`
+- Note: tray-managed runtime must be cycled once after updates for channel config/code changes to take effect.
+
+## 12) Preferences API Endpoints
+
+Primary:
+- `GET /api/preferences/core-identity`
+- `POST /api/preferences/core-identity/refresh`
+- `POST /api/preferences/core-identity/revert`
+- `GET /api/preferences/partner-model`
+
+Compatibility aliases:
+- `GET /api/preferences/identity`
+- `GET /api/preferences/promote`
+- `POST /api/preferences/promote`
+
+## 13) Push Reach-Out Acknowledgement (Tier-3)
+
+- Ack ingest endpoint: `POST /api/push/native/ack`
+- Required payload field: `run_id`
+- Optional fields: `ack_type`, `channel`, `source`, `event_type`, `device_id`, `metadata`
+- Default ack log path: `vera_memory/push_user_ack.jsonl`
+  - Override with `VERA_PUSH_ACK_LOG_PATH=/path/to/file.jsonl`
+- Native register proxy ack:
+  - When a device re-registers shortly after a reach-out, server can infer a proxy ack.
+  - Window env: `VERA_PUSH_REGISTER_ACK_WINDOW_SECONDS` (default `180`)
+  - Sources written: `native_register_explicit` (if run_id passed), `native_register_proxy` (time-window inference)
+
+Strict proactive soak (tier-3 required) reads the ack log by default:
+
+```bash
+.venv/bin/python scripts/vera_proactive_soak_runner.py \
+  --base-url http://127.0.0.1:8788 \
+  --duration-minutes 120 \
+  --require-user-ack
+```
+
+For browser push, the service worker posts click/open acknowledgements automatically when push payload includes `run_id`.

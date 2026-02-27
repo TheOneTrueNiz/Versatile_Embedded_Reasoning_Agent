@@ -30,7 +30,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Callable
+from typing import Dict, Any, Optional, List, Callable, Tuple
 
 import httpx
 
@@ -851,6 +851,24 @@ class VERA:
         if creds_root:
             return Path(creds_root).expanduser()
         return Path.home() / "Documents" / "creds"
+
+    def _get_google_workspace_credentials_dir(self) -> Path:
+        env_dir = os.getenv("GOOGLE_MCP_CREDENTIALS_DIR") or os.getenv("CREDENTIALS_DIR")
+        if env_dir:
+            return Path(env_dir).expanduser()
+        creds_dir = self._get_creds_dir() / "google" / "credentials"
+        if creds_dir.exists():
+            return creds_dir
+        repo_root = Path(__file__).resolve().parents[3]
+        return repo_root / "vera_memory" / "google_workspace" / "credentials"
+
+    def _resolve_workspace_google_auth_context(self) -> Tuple[str, bool]:
+        user_email = self._resolve_workspace_user_email()
+        if not user_email:
+            return "", False
+        credentials_dir = self._get_google_workspace_credentials_dir()
+        credentials_file = credentials_dir / f"{user_email}.json"
+        return user_email, credentials_file.exists()
 
     def _quorum_settings_path(self) -> Path:
         return self._get_creds_dir() / "vera_quorum_settings.json"
@@ -2801,10 +2819,19 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
         except Exception:
             logger.debug("Suppressed Exception in vera")
             return messages
-        if len(full_history) < 50:
+        try:
+            summary_trigger = int(os.getenv("VERA_CONTEXT_SUMMARY_TRIGGER_MESSAGES", "50"))
+        except (TypeError, ValueError):
+            summary_trigger = 50
+        summary_trigger = max(10, summary_trigger)
+        if len(full_history) < summary_trigger:
             return messages
 
-        keep_recent = 15
+        try:
+            keep_recent = int(os.getenv("VERA_CONTEXT_SUMMARY_KEEP_RECENT", "15"))
+        except (TypeError, ValueError):
+            keep_recent = 15
+        keep_recent = max(5, min(keep_recent, max(5, summary_trigger - 1)))
         older_messages = full_history[:-keep_recent]
         if not older_messages:
             return messages
@@ -2965,6 +2992,12 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
 
         # --- 1. Time-of-day awareness ---
         now = datetime.now()
+        now_local_iso = now.astimezone().isoformat(timespec="seconds")
+        current_datetime_line = (
+            f"Current local datetime anchor: {now_local_iso}. "
+            "Interpret relative time words (today, tomorrow, next week) using this anchor "
+            "unless the partner gives an explicit date."
+        )
         hour = now.hour
         if 5 <= hour < 12:
             time_of_day_line = (
@@ -3300,6 +3333,28 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
                     tool_lines.append(f"  - {server_name}: {', '.join(tools)}")
         tools_block = "\n".join(tool_lines) if tool_lines else "  (none)"
 
+        workspace_email, workspace_authenticated = self._resolve_workspace_google_auth_context()
+        if workspace_email:
+            workspace_auth_line = (
+                f"Workspace Google account: {workspace_email} "
+                f"({'authenticated' if workspace_authenticated else 'auth pending'})."
+            )
+            if workspace_authenticated:
+                workspace_email_guidance_line = (
+                    "For Google Workspace tools, use this onboarded email automatically "
+                    "and do not ask the partner to restate it."
+                )
+            else:
+                workspace_email_guidance_line = (
+                    "The onboarding email is known; reuse it for Google auth/setup flows. "
+                    "Ask for email only if no workspace account is known."
+                )
+        else:
+            workspace_auth_line = "Workspace Google account: unavailable."
+            workspace_email_guidance_line = (
+                "Ask for Google email only when no onboarded workspace account is known."
+            )
+
         session_context = f"""
 I've been active for {uptime_str}. {health_str}
 {task_str} I've processed {events_total} events this session.
@@ -3312,7 +3367,10 @@ I've logged {decision_stats['total_decisions']} decisions and learned {pref_stat
 {mood_line}
 {mood_guidance_line}
 {emotional_memory_line}
+{current_datetime_line}
 {time_of_day_line}
+{workspace_auth_line}
+{workspace_email_guidance_line}
 {speaker_line}
 {milestone_line}
 {energy_line}
@@ -3372,6 +3430,17 @@ Tools:
                     full_prompt += f"\n\n---\n\n{confidence_block}"
             except Exception:
                 logger.debug("Suppressed tool confidence summary error")
+
+        # Memory-first tool routing guidance
+        full_prompt += (
+            "\n\n---\n\n## Tool Routing Reminder\n"
+            "When a question involves your partner, past conversations, preferences, "
+            "commitments, or your own history, include a memory check "
+            "(retrieve_memory, search_archive, or knowledge graph) alongside "
+            "whatever other tools you use. Memory and web search are complementary "
+            "— don't skip memory just because web search is available, and don't "
+            "skip web search when current information is genuinely needed."
+        )
 
         # Add Vera's active goals
         if getattr(self, "inner_life", None):
@@ -3721,7 +3790,7 @@ Tools:
         available = self.mcp.get_available_tools()
         server_name = self._resolve_mcp_server_for_tool(tool_name, params, available)
         if server_name == "google-workspace":
-            user_email = self._resolve_workspace_user_email()
+            user_email, _workspace_authenticated = self._resolve_workspace_google_auth_context()
             supplied_email = str(params.get("user_google_email", "")).strip().lower()
             invalid_email = (
                 not supplied_email
@@ -3778,11 +3847,24 @@ Tools:
         original_tool: Optional[str] = None,
         skip_safety: bool = False
     ) -> str:
-        # Proactive execution whitelist enforcement
+        # Proactive execution whitelist enforcement (autonomy-only scope).
+        # Keep user-requested tool calls unaffected even while an autonomous
+        # workflow is running in parallel.
         whitelist = getattr(self, "_proactive_tool_whitelist", None)
-        if whitelist is not None and tool_name not in whitelist:
-            logger.info("Proactive tool whitelist blocked: %s", tool_name)
-            return f"Tool '{tool_name}' is not available in proactive mode. Only read-only and notification tools are permitted."
+        conversation_id = ""
+        if isinstance(context, dict):
+            conversation_id = str(context.get("conversation_id") or "").strip()
+        autonomy_context = conversation_id == "autonomy" or conversation_id.startswith("autonomy:")
+        if whitelist is not None and autonomy_context and tool_name not in whitelist:
+            logger.info(
+                "Proactive tool whitelist blocked: tool=%s conversation_id=%s",
+                tool_name,
+                conversation_id or "unknown",
+            )
+            return (
+                f"Tool '{tool_name}' is not available in proactive mode. "
+                "Only read-only and notification tools are permitted."
+            )
         return await self.tool_orchestrator.execute_tool(
             tool_name,
             params,

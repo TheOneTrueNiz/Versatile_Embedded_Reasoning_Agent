@@ -42,9 +42,14 @@ fi
 
 CALLME_PROFILE="${CALLME_PROFILE:-carol-prod}"
 CALLME_PROFILE_FILE="${ROOT_DIR}/config/callme_profiles/${CALLME_PROFILE}.env"
+CALLME_PROFILE_EXAMPLE_FILE="${ROOT_DIR}/config/callme_profiles/${CALLME_PROFILE}.example.env"
 if [ -f "${CALLME_PROFILE_FILE}" ]; then
   # shellcheck disable=SC1090
   source "${CALLME_PROFILE_FILE}"
+elif [ -f "${CALLME_PROFILE_EXAMPLE_FILE}" ]; then
+  # shellcheck disable=SC1090
+  source "${CALLME_PROFILE_EXAMPLE_FILE}"
+  echo "Info: using call-me example profile '${CALLME_PROFILE_EXAMPLE_FILE}'" >&2
 else
   echo "Warning: call-me profile '${CALLME_PROFILE}' not found at ${CALLME_PROFILE_FILE}" >&2
 fi
@@ -73,6 +78,7 @@ CLEANUP=0
 FORCE_CLEANUP=0
 BOOTSTRAP=0
 TRAY_ENABLED="${VERA_TRAY_ENABLED:-auto}"
+MEMORY_FOOTPRINT_MB=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -118,6 +124,14 @@ while [ $# -gt 0 ]; do
     --no-tray)
       TRAY_ENABLED=0
       ;;
+    --memory-footprint-mb)
+      if [ $# -lt 2 ]; then
+        echo "Missing value for --memory-footprint-mb" >&2
+        exit 1
+      fi
+      MEMORY_FOOTPRINT_MB="$2"
+      shift
+      ;;
     *)
       echo "Unknown flag: $1"
       exit 1
@@ -125,6 +139,16 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+if [ -n "${MEMORY_FOOTPRINT_MB}" ]; then
+  if ! [[ "${MEMORY_FOOTPRINT_MB}" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
+    echo "Invalid --memory-footprint-mb value: ${MEMORY_FOOTPRINT_MB}" >&2
+    exit 1
+  fi
+  export VERA_MEMORY_MAX_FOOTPRINT_MB="${MEMORY_FOOTPRINT_MB}"
+elif [ -z "${VERA_MEMORY_MAX_FOOTPRINT_MB:-}" ]; then
+  export VERA_MEMORY_MAX_FOOTPRINT_MB="1024"
+fi
 
 if [ "${TRAY_ENABLED}" = "auto" ]; then
   if [ "${SKIP_UI}" = "1" ]; then
@@ -559,6 +583,10 @@ if [ -d "${CREDS_DIR}" ]; then
   if [ -n "${GOOGLE_WORKSPACE_USER_EMAIL:-}" ] && [ -z "${USER_GOOGLE_EMAIL:-}" ]; then
     export USER_GOOGLE_EMAIL="${GOOGLE_WORKSPACE_USER_EMAIL}"
   fi
+  if [ -z "${VERA_DEFAULT_SESSION_LINK_ID:-}" ] && [ -n "${GOOGLE_WORKSPACE_USER_EMAIL:-}" ]; then
+    # Single-owner default: use known onboarded workspace identity to keep cross-channel continuity.
+    export VERA_DEFAULT_SESSION_LINK_ID="$(printf '%s' "${GOOGLE_WORKSPACE_USER_EMAIL}" | tr '[:upper:]' '[:lower:]')"
+  fi
 
   if [ -z "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ] && [ -f "${CREDS_DIR}/git/git_token" ]; then
     raw_token="$(read_trim "${CREDS_DIR}/git/git_token")"
@@ -911,6 +939,9 @@ fi
 API_ARGS=(--host "${VERA_API_HOST}" --port "${VERA_API_PORT}")
 if [ "${LOGGING}" = "1" ]; then
   API_ARGS+=(--logging)
+fi
+if [ -n "${MEMORY_FOOTPRINT_MB}" ]; then
+  API_ARGS+=(--memory-footprint-mb "${MEMORY_FOOTPRINT_MB}")
 fi
 
 launch_tray() {

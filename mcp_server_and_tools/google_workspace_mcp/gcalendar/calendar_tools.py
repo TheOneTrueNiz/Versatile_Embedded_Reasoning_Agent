@@ -99,6 +99,80 @@ def _parse_reminders_json(
     return validated_reminders
 
 
+def _coalesce_reminders_input(
+    reminders: Optional[Union[str, List[Dict[str, Any]]]],
+    custom_reminders: Optional[Union[str, List[Dict[str, Any]]]],
+    function_name: str,
+) -> Optional[Union[str, List[Dict[str, Any]]]]:
+    """
+    Normalize reminder inputs, preserving backward compatibility for legacy callers.
+
+    Historically some callers used ``custom_reminders`` while the tool contract
+    expects ``reminders``. Prefer ``reminders`` when both are provided.
+    """
+    if reminders is not None:
+        if custom_reminders is not None and custom_reminders != reminders:
+            logger.warning(
+                f"[{function_name}] Both reminders and custom_reminders provided; using reminders and ignoring custom_reminders"
+            )
+        return reminders
+    if custom_reminders is not None:
+        logger.info(
+            f"[{function_name}] Using legacy custom_reminders alias for reminders"
+        )
+    return custom_reminders
+
+
+def _parse_calendar_timestamp_for_validation(
+    value: str, field_name: str, function_name: str
+) -> datetime.datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"[{function_name}] {field_name} is required")
+    try:
+        if "T" in text:
+            parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+        parsed_date = datetime.date.fromisoformat(text)
+        return datetime.datetime.combine(
+            parsed_date, datetime.time.min, tzinfo=datetime.timezone.utc
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"[{function_name}] {field_name} must be RFC3339 datetime or YYYY-MM-DD, got: {value!r}"
+        ) from exc
+
+
+def _guard_event_time_window(
+    start_time: str,
+    end_time: str,
+    function_name: str,
+    allow_past_dates: bool = False,
+) -> None:
+    start_dt = _parse_calendar_timestamp_for_validation(
+        start_time, "start_time", function_name
+    )
+    end_dt = _parse_calendar_timestamp_for_validation(end_time, "end_time", function_name)
+    if end_dt <= start_dt:
+        raise ValueError(
+            f"[{function_name}] end_time must be after start_time. start_time={start_time!r}, end_time={end_time!r}"
+        )
+
+    if allow_past_dates:
+        return
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    distant_past_cutoff = now_utc - datetime.timedelta(days=180)
+    if start_dt < distant_past_cutoff:
+        raise ValueError(
+            f"[{function_name}] start_time {start_time!r} is in the distant past relative to current time. "
+            "Refusing likely-misanchored event creation. "
+            "If intentional, retry with allow_past_dates=true."
+        )
+
+
 def _apply_transparency_if_valid(
     event_body: Dict[str, Any],
     transparency: Optional[str],
@@ -551,9 +625,11 @@ async def create_event(
     attachments: Optional[List[str]] = None,
     add_google_meet: bool = False,
     reminders: Optional[Union[str, List[Dict[str, Any]]]] = None,
+    custom_reminders: Optional[Union[str, List[Dict[str, Any]]]] = None,
     use_default_reminders: bool = True,
     transparency: Optional[str] = None,
     visibility: Optional[str] = None,
+    allow_past_dates: bool = False,
 ) -> str:
     """
     Creates a new event.
@@ -571,9 +647,11 @@ async def create_event(
         attachments (Optional[List[str]]): List of Google Drive file URLs or IDs to attach to the event.
         add_google_meet (bool): Whether to add a Google Meet video conference to the event. Defaults to False.
         reminders (Optional[Union[str, List[Dict[str, Any]]]]): JSON string or list of reminder objects. Each should have 'method' ("popup" or "email") and 'minutes' (0-40320). Max 5 reminders. Example: '[{"method": "popup", "minutes": 15}]' or [{"method": "popup", "minutes": 15}]
+        custom_reminders (Optional[Union[str, List[Dict[str, Any]]]]): Backward-compatible alias for reminders.
         use_default_reminders (bool): Whether to use calendar's default reminders. If False, uses custom reminders. Defaults to True.
         transparency (Optional[str]): Event transparency for busy/free status. "opaque" shows as Busy (default), "transparent" shows as Available/Free. Defaults to None (uses Google Calendar default).
         visibility (Optional[str]): Event visibility. "default" uses calendar default, "public" is visible to all, "private" is visible only to attendees, "confidential" is same as private (legacy). Defaults to None (uses Google Calendar default).
+        allow_past_dates (bool): Allow creating events more than 180 days in the past. Defaults to False.
 
     Returns:
         str: Confirmation message of the successful event creation with event link.
@@ -588,6 +666,12 @@ async def create_event(
         logger.info(
             f"[create_event] Parsed attachments list from string: {attachments}"
         )
+    _guard_event_time_window(
+        start_time=start_time,
+        end_time=end_time,
+        function_name="create_event",
+        allow_past_dates=allow_past_dates,
+    )
     event_body: Dict[str, Any] = {
         "summary": summary,
         "start": (
@@ -608,6 +692,9 @@ async def create_event(
         event_body["attendees"] = [{"email": email} for email in attendees]
 
     # Handle reminders
+    reminders = _coalesce_reminders_input(
+        reminders, custom_reminders, "create_event"
+    )
     if reminders is not None or not use_default_reminders:
         # If custom reminders are provided, automatically disable default reminders
         effective_use_default = use_default_reminders and reminders is None
@@ -725,8 +812,12 @@ async def create_event(
             )
             .execute()
         )
+    created_event_id = created_event.get("id", "unknown")
     link = created_event.get("htmlLink", "No link available")
-    confirmation_message = f"Successfully created event '{created_event.get('summary', summary)}' for {user_google_email}. Link: {link}"
+    confirmation_message = (
+        f"Successfully created event '{created_event.get('summary', summary)}' "
+        f"for {user_google_email}. ID: {created_event_id}. Link: {link}"
+    )
 
     # Add Google Meet information if conference was created
     if add_google_meet and "conferenceData" in created_event:
@@ -791,6 +882,7 @@ async def modify_event(
     timezone: Optional[str] = None,
     add_google_meet: Optional[bool] = None,
     reminders: Optional[Union[str, List[Dict[str, Any]]]] = None,
+    custom_reminders: Optional[Union[str, List[Dict[str, Any]]]] = None,
     use_default_reminders: Optional[bool] = None,
     transparency: Optional[str] = None,
     visibility: Optional[str] = None,
@@ -812,6 +904,7 @@ async def modify_event(
         timezone (Optional[str]): New timezone (e.g., "America/New_York").
         add_google_meet (Optional[bool]): Whether to add or remove Google Meet video conference. If True, adds Google Meet; if False, removes it; if None, leaves unchanged.
         reminders (Optional[Union[str, List[Dict[str, Any]]]]): JSON string or list of reminder objects to replace existing reminders. Each should have 'method' ("popup" or "email") and 'minutes' (0-40320). Max 5 reminders. Example: '[{"method": "popup", "minutes": 15}]' or [{"method": "popup", "minutes": 15}]
+        custom_reminders (Optional[Union[str, List[Dict[str, Any]]]]): Backward-compatible alias for reminders.
         use_default_reminders (Optional[bool]): Whether to use calendar's default reminders. If specified, overrides current reminder settings.
         transparency (Optional[str]): Event transparency for busy/free status. "opaque" shows as Busy, "transparent" shows as Available/Free. If None, preserves existing transparency setting.
         visibility (Optional[str]): Event visibility. "default" uses calendar default, "public" is visible to all, "private" is visible only to attendees, "confidential" is same as private (legacy). If None, preserves existing visibility setting.
@@ -854,6 +947,9 @@ async def modify_event(
         event_body["colorId"] = color_id
 
     # Handle reminders
+    reminders = _coalesce_reminders_input(
+        reminders, custom_reminders, "modify_event"
+    )
     if reminders is not None or use_default_reminders is not None:
         reminder_data = {}
         if use_default_reminders is not None:

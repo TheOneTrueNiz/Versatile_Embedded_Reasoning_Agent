@@ -144,9 +144,18 @@ class SafetyValidator:
         if context is None:
             context = {}
 
+        skip_command_tree = False
+        raw_skip = context.get("skip_command_tree")
+        if isinstance(raw_skip, bool):
+            skip_command_tree = raw_skip
+        elif isinstance(raw_skip, str):
+            skip_command_tree = raw_skip.strip().lower() in {"1", "true", "yes", "on"}
+        elif raw_skip is not None:
+            skip_command_tree = bool(raw_skip)
+
         # Step 0: Command Tree Decomposition (Improvement #2)
         # This catches obfuscated attacks that bypass regex patterns
-        if self.enable_command_tree and self.tree_validator:
+        if self.enable_command_tree and self.tree_validator and not skip_command_tree:
             tree_decision = self._check_command_tree(command)
             if tree_decision:
                 return tree_decision
