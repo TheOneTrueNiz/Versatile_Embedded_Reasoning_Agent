@@ -65,7 +65,9 @@ def _latest_where(pattern: str, predicate) -> Path:
 
 
 def _copy_if_exists(src: Path, dst_dir: Path) -> str:
-    if not src or not src.exists():
+    if not src or str(src) in {"", "."}:
+        return ""
+    if not src.exists() or not src.is_file():
         return ""
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst = dst_dir / src.name
