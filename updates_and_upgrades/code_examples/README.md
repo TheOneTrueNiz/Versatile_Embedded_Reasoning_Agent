@@ -15,6 +15,10 @@ These are integration-oriented examples for planned upgrades. They are not auto-
   - Predictive scoring of candidate tool chains before execution.
 - `06_cross_channel_continuity_check.py`
   - Deterministic continuity probe across channel adapters.
+- `07_autonomy_kernel_orchestrator.py`
+  - Recovery-first autonomy decision and fallback orchestration skeleton.
+- `08_failure_to_recovery_dataset.py`
+  - Build fail->recover training examples from followthrough and action logs.
 
 ## Recommended Landing Paths
 - Checklist probe logic:
@@ -30,3 +34,6 @@ These are integration-oriented examples for planned upgrades. They are not auto-
 - Predictive tool simulation:
   - `src/orchestration/llm_bridge.py`
   - `src/core/runtime/tool_orchestrator.py`
+- Autonomy kernel orchestration:
+  - `src/core/runtime/proactive_manager.py`
+  - `src/planning/sentinel_engine.py`

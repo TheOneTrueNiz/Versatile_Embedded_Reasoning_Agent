@@ -10,8 +10,12 @@ This directory is the execution package built from:
   - Immediate reliability and autonomy hardening for the current runtime.
 - `VERA_3_0_PLUS_ROADMAP.md`
   - Architecture plan for Vera 3.0 and beyond.
+- `V3_0_POST_MIGRATION_BLUEPRINT.md`
+  - Execution blueprint for post-migration build on the dual-4090 host.
 - `RESEARCH_TO_CODE_CROSSWALK.md`
   - Mapping from research themes to exact Vera modules and upgrade hooks.
+- `RESEARCH_PAPER_PLAYBOOK.md`
+  - Specific paper file paths in `Research_Repo` and direct wiring targets.
 - `MILESTONES_AND_RELEASE_GATES.md`
   - Milestone sequence, objective gates, and pass/fail criteria.
 - `V2_PATCH_QUEUE_WITH_FILE_HOOKS.md`
@@ -30,7 +34,9 @@ This directory is the execution package built from:
 1. Execute V2 hardening items first (`VERA_2_0_BOLSTER_PLAN.md`).
 2. Keep 24h soak telemetry as baseline while patching.
 3. After V2 gate pass, stage V3 modules from `VERA_3_0_PLUS_ROADMAP.md`.
-4. Track every completed item against `MILESTONES_AND_RELEASE_GATES.md`.
+4. Execute post-migration build phases from `V3_0_POST_MIGRATION_BLUEPRINT.md`.
+5. Use `RESEARCH_PAPER_PLAYBOOK.md` when converting research into concrete patches.
+6. Track every completed item against `MILESTONES_AND_RELEASE_GATES.md`.
 
 ## Ground Rules
 - No speculative architecture without module-level integration targets.
