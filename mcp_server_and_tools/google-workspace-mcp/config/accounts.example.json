@@ -5,14 +5,14 @@
       "category": "personal",
       "description": "Personal Google Account",
       "auth_status": {
-        "valid": true,
+        "valid": false,
         "token": {
-          "access_token": "YOUR_ACCESS_TOKEN",
-          "refresh_token": "YOUR_REFRESH_TOKEN",
+          "access_token": "REPLACE_WITH_ACCESS_TOKEN",
+          "refresh_token": "REPLACE_WITH_REFRESH_TOKEN",
           "scope": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
           "token_type": "Bearer",
-          "expiry_date": 1737951212015,
-          "last_refresh": 1737947613015
+          "expiry_date": 0,
+          "last_refresh": 0
         }
       }
     },

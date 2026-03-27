@@ -9,6 +9,7 @@ claude.md
 *.egg-info/
 build/
 dist/
+*.dxt
 
 # ---- Environments & tooling -------------------------------------------
 .env
