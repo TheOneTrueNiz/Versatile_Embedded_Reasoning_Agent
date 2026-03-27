@@ -452,11 +452,11 @@ def main() -> int:
     parser.add_argument("--retries", type=int, default=2, help="Additional retries per lesson")
     parser.add_argument(
         "--curriculum",
-        default="config/doctor_professor/vera_guided_learning_curriculum.json",
+        default="config/guided_learning/vera_guided_learning_curriculum.json",
     )
     parser.add_argument(
         "--protocol",
-        default="config/doctor_professor/vera_professor_protocol.md",
+        default="config/guided_learning/vera_guided_learning_protocol.md",
     )
     parser.add_argument(
         "--inventory",

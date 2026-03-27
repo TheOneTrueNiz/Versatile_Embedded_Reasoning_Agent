@@ -2,8 +2,8 @@
 
 This directory is the execution package built from:
 - Current Vera 2.0 codebase (`src/`, `scripts/`)
-- Research corpus in `/home/nizbot-macmini/Desktop/Research_Repo`
-- Primary research index: `/home/nizbot-macmini/Desktop/Research_Repo/INDEX.md`
+- Research corpus in `/path/to/Research_Repo`
+- Primary research index: `/path/to/Research_Repo/INDEX.md`
 
 ## What This Contains
 - `VERA_2_0_BOLSTER_PLAN.md`

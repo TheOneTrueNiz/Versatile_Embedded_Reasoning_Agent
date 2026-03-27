@@ -552,7 +552,7 @@ def main() -> int:
     parser.add_argument("--transitions", default="vera_memory/flight_recorder/transitions.ndjson")
     parser.add_argument(
         "--scenarios-path",
-        default="config/doctor_professor/vera_tool_exam_tier2_scenarios.json",
+        default="config/guided_learning/vera_tool_exam_scenarios.json",
     )
     parser.add_argument("--tier1-total", type=int, default=0, help="Override expected tier1 total (0=discover)")
     parser.add_argument("--report-path", default="", help="Expected final report path")

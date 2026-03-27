@@ -1,6 +1,6 @@
 # Research to Code Crosswalk
 
-Source anchor: `/home/nizbot-macmini/Desktop/Research_Repo/INDEX.md`
+Source anchor: `/path/to/Research_Repo/INDEX.md`
 
 ## Core Mapping
 

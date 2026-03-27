@@ -21,8 +21,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib import error, request
 
 
-DEFAULT_PROTOCOL = "config/doctor_professor/vera_professor_protocol.md"
-DEFAULT_SCENARIOS = "config/doctor_professor/vera_tool_exam_tier2_scenarios.json"
+DEFAULT_PROTOCOL = "config/guided_learning/vera_guided_learning_protocol.md"
+DEFAULT_SCENARIOS = "config/guided_learning/vera_tool_exam_scenarios.json"
 
 # A few MCP tools regularly require longer than the generic chat timeout due to
 # upstream latency or large payload hydration. Keep overrides surgical so the
