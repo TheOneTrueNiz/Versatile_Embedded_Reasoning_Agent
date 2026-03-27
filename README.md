@@ -160,3 +160,31 @@ That research stream informs work on:
 VERA is meant for builders and operators who want a full local-first agent harness they can run, inspect, modify, and extend.
 
 If you want a single repo that includes the harness, UI, orchestration, observability surfaces, and bundled MCP integrations, this is that repo.
+
+<img width="1272" height="1042" alt="Screenshot_20260327_000932" src="https://github.com/user-attachments/assets/b6a979fc-75d0-4b65-acbf-c6166e90ac59" />
+
+<img width="1272" height="1042" alt="Screenshot_20260327_000948" src="https://github.com/user-attachments/assets/afc06a35-08b4-432d-adea-cc1f5fb6a303" />
+
+<img width="1272" height="1042" alt="Screenshot_20260327_001017" src="https://github.com/user-attachments/assets/89dc59e1-8fd4-44b5-bc7b-b7b17e44877d" />
+
+<img width="1272" height="1042" alt="Screenshot_20260327_001101" src="https://github.com/user-attachments/assets/847178a6-1f93-438b-8adf-17fb61166a17" />
+
+<img width="1459" height="1042" alt="Screenshot_20260327_001158" src="https://github.com/user-attachments/assets/9791b958-95bf-4a44-91c9-0149040dfd03" />
+
+<img width="1459" height="1042" alt="Screenshot_20260327_001206" src="https://github.com/user-attachments/assets/c80b0ddf-2b66-4203-a04d-f0dc40b888a1" />
+
+<img width="1459" height="1042" alt="Screenshot_20260327_001214" src="https://github.com/user-attachments/assets/784591a1-6ae3-4693-b0bf-05d9743318f3" />
+
+<img width="1459" height="1042" alt="Screenshot_20260327_001234" src="https://github.com/user-attachments/assets/ead67074-6dba-4009-932a-596c6d8d4f81" />
+
+<img width="1459" height="1042" alt="Screenshot_20260327_001246" src="https://github.com/user-attachments/assets/8f2c711d-e0b1-412d-ad3d-1c4e205e17dc" />
+
+<img width="1459" height="1042" alt="Screenshot_20260327_001254" src="https://github.com/user-attachments/assets/ac358f42-028f-4307-881d-8674295572a9" />
+
+<img width="1459" height="1042" alt="Screenshot_20260327_001310" src="https://github.com/user-attachments/assets/8c0a5c3a-3bd2-460a-bedc-12c58a55fa6a" />
+
+<img width="1459" height="1042" alt="Screenshot_20260327_001317" src="https://github.com/user-attachments/assets/7611798c-1347-40a5-b6cc-e1c53f3ce075" />
+
+<img width="384" height="28" alt="Screenshot_20260327_001356" src="https://github.com/user-attachments/assets/6b164b15-4753-49b1-be35-d4be4a1f77fe" />
+
+
