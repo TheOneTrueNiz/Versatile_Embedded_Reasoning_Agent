@@ -672,7 +672,7 @@ def _handle_request(request: Dict[str, Any]) -> None:
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "serverInfo": {"name": "vera-brave-search", "version": "1.0"},
+                "serverInfo": {"name": "mcp-brave-search-tool", "version": "1.0"},
                 "capabilities": {"tools": {}},
             },
         })

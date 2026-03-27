@@ -1,34 +1,48 @@
 # MCP Repo Split Plan
 
-This repo should only retain the Vera harness and the glue needed to run it.
-First-party MCP tools that are independently reusable should be split into standalone repositories.
+The integrated `Versatile_Embedded_Reasoning_Agent` repo remains the full system of record.
+It should keep the harness, UI, orchestration, observability surfaces, and bundled MCP/tooling surface so one checkout can stand up the full agent stack.
 
-## Immediate Standalone Repo Candidates
+Standalone MCP repos are optional distribution repos for users who want individual tools without the full VERA harness.
 
-These are the cleanest candidates because Vera invokes them from local code paths rather than third-party package names.
+## Current Repo Model
 
-1. `mcp_server_and_tools/call-me`
-2. `mcp_server_and_tools/brave_search`
-3. `mcp_server_and_tools/grokipedia-mcp`
-4. `mcp_server_and_tools/mcp_pdf_reader`
-5. `mcp_server_and_tools/mcp_time`
-6. `mcp_server_and_tools/mcp_calculator`
-7. `mcp_server_and_tools/searxng`
+1. `Versatile_Embedded_Reasoning_Agent`
+   - full integrated VERA system
+   - harness, UI, scripts, runtime, bundled MCP integrations
+2. standalone MCP repos
+   - individually reusable MCP tools
+   - published separately when their boundaries are clean and their public surface is scrubbed
 
-## Split Later, After Additional Scrub
+## Already Published Standalone / Forked Repos
 
-These are locally wired, but they carry more operational or credential complexity and should not be split until their repo boundaries are cleaned.
+Standalone first-party MCP repos:
+
+1. `mcp-time-tool`
+2. `mcp-calculator-tool`
+3. `mcp-grokipedia-tool`
+4. `mcp-brave_search_tool`
+
+Upstream-derived forks refreshed and kept public as their own repos:
+
+1. `mcp_pdf_reader`
+2. `wikipedia-mcp`
+3. `memvid`
+
+## Keep In The Main VERA Repo Only
+
+These remain bundled in the integrated harness and should not be published as standalone repos without additional scrub or architectural separation.
 
 1. `mcp_server_and_tools/google_workspace_mcp`
-2. `mcp_server_and_tools/call-me` companion launcher glue in `scripts/run_call_me_mcp.sh`
-3. `mcp_server_and_tools/stealth-browser-mcp`
-4. `mcp_server_and_tools/memvid`
+2. `mcp_server_and_tools/google-workspace-mcp`
+3. `mcp_server_and_tools/call-me` companion launcher/runtime glue
+4. `mcp_server_and_tools/stealth-browser-mcp`
 5. `mcp_server_and_tools/MARM-Systems/marm-mcp-server`
 6. `mcp_server_and_tools/VoxCPM`
 
 ## Do Not Treat As First-Party Standalone Repos
 
-These are vendor integrations, external packages, or large third-party projects that Vera happens to launch.
+These are vendor integrations, external packages, or large third-party projects that VERA happens to launch or bundle.
 
 1. `@modelcontextprotocol/server-filesystem`
 2. `@modelcontextprotocol/server-github`
@@ -40,29 +54,26 @@ These are vendor integrations, external packages, or large third-party projects 
 8. `mcp_server_and_tools/MultiBot`
 9. `mcp_server_and_tools/mcpcan`
 10. `mcp_server_and_tools/nofx`
-11. `mcp_server_and_tools/wikipedia-mcp`
-12. `mcp_server_and_tools/mcp-server-youtube-transcript`
+11. `mcp_server_and_tools/mcp-server-youtube-transcript`
 
-## Split Sequence
+## Publication Rule
 
-1. Push the cleaned Vera harness baseline first.
-2. Extract the immediate standalone candidates one at a time.
-3. For each extracted tool:
-   - add its own `README.md`
-   - add a minimal `.gitignore`
-   - remove Vera-specific wrapper assumptions
-   - move secrets and machine-local config to examples/templates only
-   - verify it can run outside this monorepo
-4. After extraction, replace monorepo-local paths with:
-   - git submodules, or
-   - external install instructions, or
-   - separate deployment checkouts
+For any MCP repo, do not publish blindly.
 
-## Push Gate For The Vera Repo
+Before public release:
 
-Before pushing the Vera harness repo:
+1. scan for secrets, tokens, credentials, and machine-local paths
+2. remove tracked runtime artifacts, caches, and packaged build junk
+3. move examples to placeholders/templates only
+4. verify the repo can run outside the VERA monorepo
+5. preserve upstream lineage when the tool is a fork rather than first-party code
+
+## Push Gate For The Main VERA Repo
+
+Before pushing the integrated VERA repo:
 
 1. keep `old/local/` ignored
 2. keep runtime state and ledgers ignored
-3. keep doctor/professor harness material out of the tracked push surface
-4. keep MCP split work as later commits, not mixed into the hygiene baseline
+3. keep `my_diary/` out of the tracked push surface
+4. keep doctor/professor harness material out of the tracked push surface
+5. remove packaged local artifacts from bundled MCP subtrees when they are not needed publicly
