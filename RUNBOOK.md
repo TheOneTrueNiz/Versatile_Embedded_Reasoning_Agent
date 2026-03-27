@@ -2,7 +2,25 @@
 
 This is the current operator flow for this repo.
 
-## 1) Online Setup (Optional)
+## 1) Recommended Bring-Up Path
+
+For most operators, the shortest correct path is:
+
+```bash
+./scripts/setup_environment.sh venv
+./scripts/vera_secret_store.sh set XAI_API_KEY "<your_key>"
+VERA_NO_RUN=1 ./scripts/run_vera.sh
+./scripts/run_vera_full.sh --logging
+```
+
+Health checks:
+
+```bash
+curl -s http://127.0.0.1:8788/api/health
+curl -s http://127.0.0.1:8788/api/readiness
+```
+
+## 2) Online Setup (Optional)
 
 Build/refresh a local wheelhouse (and seed archive) when internet is available:
 
@@ -22,7 +40,7 @@ Or migrate a legacy file-based credentials directory:
 ./scripts/vera_secret_store.sh migrate-creds "/path/to/legacy-creds"
 ```
 
-## 2) Offline Bootstrap
+## 3) Offline Bootstrap
 
 Point to a prepared wheelhouse/seed location and run dependency bootstrap without starting VERA:
 
@@ -30,7 +48,9 @@ Point to a prepared wheelhouse/seed location and run dependency bootstrap withou
 export VERA_WHEELHOUSE_DIR=/mnt/storage/vera_wheelhouse && VERA_NO_RUN=1 ./scripts/run_vera.sh
 ```
 
-## 3) Normal Runtime Entry
+## 4) Base Runtime Entry
+
+Base launcher:
 
 ```bash
 ./scripts/run_vera.sh
@@ -42,7 +62,25 @@ Dry-check equivalent (bootstrap only):
 VERA_NO_RUN=1 ./scripts/run_vera.sh
 ```
 
-## 4) API / Monolithic Entrypoints
+## 5) Full Stack Entry
+
+Primary stack launcher:
+
+```bash
+./scripts/run_vera_full.sh --logging
+```
+
+Diagnostics-only launch:
+
+```bash
+./scripts/run_vera_full.sh --diag-only
+```
+
+Notes:
+- `scripts/run_vera_full.sh` is the main integrated launcher for API + UI + MCP + optional SearxNG.
+- `scripts/run_vera.sh` is the lower-level base runtime/bootstrap path.
+
+## 6) API / Monolithic Entrypoints
 
 API check:
 
@@ -68,19 +106,7 @@ Alive protocol gate (writes JSON/MD under `tmp/audits/<timestamp>/`):
 .venv/bin/python scripts/vera_alive_protocol_gate.py
 ```
 
-## 5) API + UI + MCP Stack
-
-Primary stack launcher:
-
-```bash
-./scripts/run_vera_full.sh --diag-only
-```
-
-Notes:
-- `scripts/run_vera_full.sh` is the full-stack orchestrator (API + UI + MCP + optional SearxNG).
-- For live launch, run without `--diag-only`.
-
-## 5.1) Guided Learning
+## 6.1) Guided Learning
 
 Run the Vera-side guided curriculum session:
 
@@ -92,7 +118,7 @@ Curriculum assets:
 - `config/guided_learning/vera_guided_learning_curriculum.json`
 - `config/guided_learning/vera_guided_learning_protocol.md`
 
-## 6) Manual Halt Sentinel
+## 7) Manual Halt Sentinel
 
 - Path: `vera_memory/manual_halt`
 - Behavior: launchers exit intentionally while this file exists (including `./scripts/run_vera_full.sh`).
@@ -104,7 +130,7 @@ rm -f vera_memory/manual_halt
 
 - This is safe/intentional ops control.
 
-## 7) Bootstrap / Restore Behavior
+## 8) Bootstrap / Restore Behavior
 
 `scripts/run_vera.sh` core behavior:
 - Uses `requirements.txt` hash stamping (`.venv/.deps_core_sha256`) to detect drift.
@@ -118,20 +144,20 @@ Retention controls:
 - `VERA_PRESEED_BACKUPS_TO_KEEP` (default `1`)
 - `VERA_KEEP_ALL_PRESEED_BACKUPS=1` (disable pruning)
 
-## 8) Non-Git Runtime/Archive Areas
+## 9) Non-Git Runtime/Archive Areas
 
 - `dev/` (archival only; not current guidance)
 - `.venv/`
 - `wheelhouse/`
 
-## 9) Secrets Runtime Behavior
+## 10) Secrets Runtime Behavior
 
 - `scripts/run_vera.sh` and `scripts/run_vera_full.sh` auto-load secrets from OS keychain by default.
 - Disable keychain autoload with `VERA_KEYCHAIN_LOAD=0`.
 - The legacy `CREDS_DIR` location remains as a compatibility fallback.
 - Preferred production pattern is environment/secret-manager injection.
 
-## 10) Memory Footprint Budget
+## 11) Memory Footprint Budget
 
 - Default persistent memory budget is **1024 MB** via `VERA_MEMORY_MAX_FOOTPRINT_MB=1024` when unset.
 - Override via env:
@@ -149,7 +175,7 @@ export VERA_MEMORY_MAX_FOOTPRINT_MB=1536
 - Disable budget checks with `VERA_MEMORY_MAX_FOOTPRINT_MB=0`.
 - Runtime telemetry is exposed at `/api/memory/stats` under `disk_usage`.
 
-## 11) Proactive + Continuity Defaults
+## 12) Proactive + Continuity Defaults
 
 - Proactive execution defaults to enabled unless explicitly disabled:
   - `VERA_PROACTIVE_EXECUTION=1` (default)
@@ -174,7 +200,7 @@ Cross-channel continuity default:
   - `POST /api/channels/local/outbox/clear`
 - Note: tray-managed runtime must be cycled once after updates for channel config/code changes to take effect.
 
-## 12) Preferences API Endpoints
+## 13) Preferences API Endpoints
 
 Primary:
 - `GET /api/preferences/core-identity`
@@ -187,7 +213,7 @@ Compatibility aliases:
 - `GET /api/preferences/promote`
 - `POST /api/preferences/promote`
 
-## 13) Push Reach-Out Acknowledgement (Tier-3)
+## 14) Push Reach-Out Acknowledgement (Tier-3)
 
 - Ack ingest endpoint: `POST /api/push/native/ack`
 - Required payload field: `run_id`

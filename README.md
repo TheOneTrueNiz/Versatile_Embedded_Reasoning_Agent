@@ -68,6 +68,47 @@ Some first-party MCP tools are also published as standalone repositories for use
 
 The main VERA repo remains the integrated system of record.
 
+## Quick Start
+
+### 1. Create the Python environment
+
+```bash
+./scripts/setup_environment.sh venv
+```
+
+### 2. Configure secrets
+
+Recommended: store model/provider secrets in the OS keychain.
+
+```bash
+./scripts/vera_secret_store.sh set XAI_API_KEY "<your_key>"
+```
+
+Legacy migration path:
+
+```bash
+./scripts/vera_secret_store.sh migrate-creds "/path/to/legacy-creds"
+```
+
+### 3. Bootstrap without launching
+
+```bash
+VERA_NO_RUN=1 ./scripts/run_vera.sh
+```
+
+### 4. Launch the full stack
+
+```bash
+./scripts/run_vera_full.sh --logging
+```
+
+### 5. Verify the runtime
+
+```bash
+curl -s http://127.0.0.1:8788/api/health
+curl -s http://127.0.0.1:8788/api/readiness
+```
+
 ## Primary Entrypoints
 
 - full launcher:
@@ -106,8 +147,10 @@ That research stream informs work on:
 
 ## Docs To Start With
 
-- `RUNBOOK.md`
-- `OFFLINE_BOOTSTRAP.md`
+- quick operator flow:
+  - `RUNBOOK.md`
+- offline/bootstrap path:
+  - `OFFLINE_BOOTSTRAP.md`
 - `docs/SECRETS.md`
 - `docs/PUBLIC_EVAL_SPEC.md`
 - `docs/MCP_REPO_SPLIT_PLAN.md`
