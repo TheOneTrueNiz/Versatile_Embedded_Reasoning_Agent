@@ -1,33 +1,87 @@
-
 <img width="1200" height="400" alt="Vera" src="https://github.com/user-attachments/assets/80e1ed77-f727-4305-9670-71a04a9bd0f0" />
-
 
 # Versatile Embedded Reasoning Agent (VERA)
 
-VERA is a local-first agent harness for building and operating a persistent, tool-using reasoning system on your own hardware.
+VERA is a local-first agent harness for running a persistent, tool-using reasoning system on your own hardware.
 
-This repository is not just an API wrapper or a prompt pack. It is the integrated agent runtime: orchestration, autonomy loop, operator surfaces, UI, local services, and bundled MCP tool servers needed to run a full embedded agent stack.
+This is not a thin chat wrapper. It is the full integrated runtime: model-facing API, autonomy loop, operator surfaces, UI, bundled MCP tooling, local state, audits, and recovery rails needed to run an embedded agent stack end to end.
 
-## What VERA Provides
+## Why This Repo Exists
 
-- OpenAI-compatible HTTP API for model-facing integration
-- MCP orchestration layer for multi-tool routing and tool exposure control
-- proactive autonomy runtime with active/idle cadence, bounded workflow execution, and operator-visible control flow
-- local-first runtime design with on-device state, audits, and recovery tooling
-- operator diagnostics, SLO surfaces, runplane telemetry, and readiness/health reporting
-- optional UI and service components for interactive operation
-- bundled MCP servers and local tool integrations so one repo can bring up the full harness
+Most "agent" projects stop at one of these layers:
+- a prompt
+- a chat UI
+- a stateless API wrapper
+- a tool-calling demo
 
-## What Makes This Different
+VERA is trying to solve the harder systems problem: how to run an agent continuously on real hardware without losing track of state, flooding the user with noise, or letting finished work silently drift out of sync with the rest of the system.
 
-VERA is designed as an embedded agent system, not a stateless chat shell.
-
-The system includes:
-- a persistent runtime rather than one-shot request handling
-- autonomy rails with bounded execution and recovery behavior
+That means VERA focuses on runtime engineering, not just prompting:
+- persistent local runtime instead of one-shot request handling
+- bounded autonomy with active/idle cadence and workflow caps
 - tool routing that constrains and shortlists MCP surfaces instead of exposing everything blindly
-- verifier and state-sync mechanisms so finished work and surfaced state do not silently drift apart
-- observability that distinguishes current operator health from polluted lifetime history
+- verifier and state-sync rails so task state, surfaced state, and archive state stay aligned
+- operator-visible diagnostics so current health is separated from stale historical baggage
+- local auditability, restart hygiene, and recovery tooling
+
+## What Is Working Today
+
+VERA is already a serious local harness, not a concept stub.
+
+Working on the current baseline:
+- OpenAI-compatible HTTP API for model-facing integration
+- integrated MCP orchestration across bundled servers and local tool wrappers
+- bounded autonomy runtime with active/idle windows, workflow caps, and direct-workflow rails for explicit queued work
+- operator surfaces for readiness, health, tool payload inspection, autonomy SLO, and operator baseline
+- state-sync verifier that catches and repairs post-completion drift
+- hash-chained flight ledger for append-only runtime auditability
+- deterministic restart/cleanup path for bringing the stack back to a known-good state
+- standalone publication of selected first-party MCP tools while keeping this monorepo as the integrated system of record
+
+## Current Development State
+
+Current status: **controlled live-testing baseline**.
+
+That means:
+- the runtime is stable enough for real local testing on your own hardware
+- recent rolling windows are being used as the primary operator health view
+- autonomy is no longer blocked on the major reliability issues that previously caused repeated false failures or surface churn
+
+Recent completed runtime work includes:
+- truthful autonomy SLO and operator-baseline surfaces
+- elimination of stale workflow debris from the actionable surface
+- direct execution path for explicit queued autonomy work without reflection dependence
+- TaskStateSyncMonitor for recurring post-completion drift
+- Week1 CSV-only public bootstrap path instead of private-docx dependency
+- Week1 validation monitor rail driven by recent executor evidence and ACK data
+- MCP shortlist control improvements for calendar, local-memory, and web-research routing
+
+## What Still Needs Work
+
+VERA is not being presented as finished or production-hardened for every environment.
+
+Still in active development:
+- broader deterministic actionable surfaces beyond Week1 and manually queued work
+- more live proofs for newly added monitor rails as they roll into the runtime
+- continued tool-routing quality improvements across broader query families
+- stronger first-clone onboarding and platform-specific bootstrap hardening
+- ongoing curation of bundled MCP servers and standalone MCP repo boundaries
+
+High-risk or credential-heavy components remain intentionally conservative:
+- Google Workspace MCPs stay integrated here, not published as separate standalone repos
+- local secrets, memory, ledgers, audits, and runtime state are kept out of the public push surface
+
+## What Makes VERA Different
+
+If you want a full local agent harness rather than a demo shell, these are the parts that matter.
+
+VERA includes:
+- autonomy rails with bounded execution and cooldown logic
+- workflow-cap and reserve logic so the runtime does not burn itself down in one window
+- improvement archive and work-jar primitives for iterative, research-backed runtime growth
+- state-sync verification and monitor rails for recurring mismatch detection
+- operator telemetry that distinguishes clean current behavior from polluted lifetime history
+- bundled tool surface plus standalone MCP repos for users who want individual tools without the full harness
 
 ## System Components
 
@@ -57,7 +111,7 @@ Included here are:
 - local wrappers around selected tools and services
 - upstream-derived forks that remain part of the integrated harness
 
-Some first-party MCP tools are also published as standalone repositories for users who want the tool without the full VERA harness:
+Selected MCP tools are also published as standalone repos for users who want the tool without the full VERA harness:
 - [`mcp-time-tool`](https://github.com/TheOneTrueNiz/mcp-time-tool)
 - [`mcp-calculator-tool`](https://github.com/TheOneTrueNiz/mcp-calculator-tool)
 - [`mcp-grokipedia-tool`](https://github.com/TheOneTrueNiz/mcp-grokipedia-tool)
@@ -124,7 +178,7 @@ curl -s http://127.0.0.1:8788/api/readiness
   - `/api/readiness`
 - health:
   - `/api/health`
-- autonomy SLO / operator baseline:
+- autonomy SLO and operator baseline:
   - `/api/autonomy/slo`
 - tool diagnostics:
   - `/api/tools/last_payload`
@@ -141,7 +195,7 @@ That research stream informs work on:
 - autonomy architecture
 - bounded self-improvement and improvement archives
 - tool-routing and shortlist control
-- latency/budget control
+- latency and budget control
 - runtime verification and auditability
 - long-horizon agent operation on local hardware
 
@@ -151,15 +205,24 @@ That research stream informs work on:
   - `RUNBOOK.md`
 - offline/bootstrap path:
   - `OFFLINE_BOOTSTRAP.md`
-- `docs/SECRETS.md`
-- `docs/PUBLIC_EVAL_SPEC.md`
-- `docs/MCP_REPO_SPLIT_PLAN.md`
+- secrets/runtime notes:
+  - `docs/SECRETS.md`
+- public evaluation scope:
+  - `docs/PUBLIC_EVAL_SPEC.md`
+- MCP publication strategy:
+  - `docs/MCP_REPO_SPLIT_PLAN.md`
 
-## Current Positioning
+## Attribution
 
-VERA is meant for builders and operators who want a full local-first agent harness they can run, inspect, modify, and extend.
+Primary builder:
+- [TheOneTrueNiz](https://github.com/TheOneTrueNiz)
 
-If you want a single repo that includes the harness, UI, orchestration, observability surfaces, and bundled MCP integrations, this is that repo.
+Engineering collaboration and implementation support:
+- OpenAI Codex
+
+GitHub's contributor graph reflects git authorship. This section is the explicit project-level attribution for collaborative engineering work on the harness.
+
+## Screenshots
 
 <img width="1272" height="1042" alt="Screenshot_20260327_000932" src="https://github.com/user-attachments/assets/b6a979fc-75d0-4b65-acbf-c6166e90ac59" />
 
@@ -181,13 +244,8 @@ If you want a single repo that includes the harness, UI, orchestration, observab
 
 <img width="1459" height="1042" alt="Screenshot_20260327_001254" src="https://github.com/user-attachments/assets/ac358f42-028f-4307-881d-8674295572a9" />
 
-
-
-
 <img width="1459" height="1042" alt="Screenshot_20260327_001310" src="https://github.com/user-attachments/assets/8c0a5c3a-3bd2-460a-bedc-12c58a55fa6a" />
 
 <img width="1459" height="1042" alt="Screenshot_20260327_001317" src="https://github.com/user-attachments/assets/7611798c-1347-40a5-b6cc-e1c53f3ce075" />
 
 <img width="384" height="28" alt="Screenshot_20260327_001356" src="https://github.com/user-attachments/assets/6b164b15-4753-49b1-be35-d4be4a1f77fe" />
-
-
