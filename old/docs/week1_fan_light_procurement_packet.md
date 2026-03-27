@@ -1,6 +1,6 @@
 **Week 1: Fan & Light Upgrade Procurement Packet**
 
-**Primary Target:** Replace/upgrade fans and light fixtures 
+**Primary Target:** Replace/upgrade fans and light fixtures
 
 **Most Concrete Safe Next Step:** Finalize supplier outreach using this packet for quotes on shortlisted ceiling fans and LED light fixtures. Avoid further inventory loops.
 

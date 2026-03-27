@@ -3,7 +3,7 @@
 **Primary Target:** [P2] Replace/upgrade fans and light fixtures (inventory + shortlist)
 
 ## Selected Next Step
-The most concrete safe next step is to **finalize and document a specific shortlist of replacement fans and LED light fixtures**, then prepare a procurement packet with at least 2 supplier options. 
+The most concrete safe next step is to **finalize and document a specific shortlist of replacement fans and LED light fixtures**, then prepare a procurement packet with at least 2 supplier options.
 
 This is bounded, produces an artifact, and avoids further generic inspection loops. It directly advances the inventory/shortlist phase without requiring contractor calls or exterior work first.
 
@@ -14,7 +14,7 @@ This is bounded, produces an artifact, and avoids further generic inspection loo
 
 ## Bounded Action Items
 1. List current fixtures: 4x ceiling fans, 12x light fixtures (assume standard sizes).
-2. Shortlist options: 
+2. Shortlist options:
    - Ceiling fans: Hunter or Minka Aire models (~$120-180, energy efficient).
    - Lights: LED recessed or flush mount, 2700K-5000K.
 3. Next: Obtain quotes (Home Depot, Lighting Direct, or local supplier).
