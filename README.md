@@ -181,6 +181,9 @@ If you want a single repo that includes the harness, UI, orchestration, observab
 
 <img width="1459" height="1042" alt="Screenshot_20260327_001254" src="https://github.com/user-attachments/assets/ac358f42-028f-4307-881d-8674295572a9" />
 
+
+
+
 <img width="1459" height="1042" alt="Screenshot_20260327_001310" src="https://github.com/user-attachments/assets/8c0a5c3a-3bd2-460a-bedc-12c58a55fa6a" />
 
 <img width="1459" height="1042" alt="Screenshot_20260327_001317" src="https://github.com/user-attachments/assets/7611798c-1347-40a5-b6cc-e1c53f3ce075" />
