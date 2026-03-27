@@ -63,7 +63,9 @@ DEFAULT_SECRET_ENV_VARS: Tuple[str, ...] = (
     "VERA_API_KEY",
 )
 
-DEFAULT_CREDS_DIR = Path(os.getenv("VERA_CREDS_DIR", "~/Documents/creds")).expanduser()
+DEFAULT_CREDS_DIR = Path(
+    os.getenv("VERA_CREDS_DIR") or os.getenv("CREDS_DIR") or "~/.config/vera/creds"
+).expanduser()
 CREDS_FALLBACK_PATHS: Dict[str, str] = {
     "XAI_VIDEO_API_KEY": "xai/xai_video_api",
     "XAI_IMAGE_API_KEY": "xai/xai_image_api",

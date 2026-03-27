@@ -41,7 +41,7 @@ echo "📍 Working directory: $(pwd)"
 if [ "$WSL_MODE" = true ]; then
     if [[ "$(pwd)" == /mnt/* ]]; then
         echo "⚠️  You're in Windows filesystem (/mnt/c/...)"
-        echo "   For better performance, consider moving to WSL filesystem (/home/user/...)"
+        echo "   For better performance, consider moving to a Linux filesystem path (/path/to/linux/...)"
     else
         echo "✅ You're in WSL filesystem (optimal for performance)"
     fi
@@ -121,7 +121,7 @@ echo "WSL Performance Notes:"
 if [ "$WSL_MODE" = true ]; then
     echo "   📈 Performance tips for WSL:"
     echo "   • Use WSL 2 for better Docker performance"
-    echo "   • Store large datasets in WSL filesystem (/home/user/...)"
+    echo "   • Store large datasets in a Linux filesystem path (/path/to/linux/...)"
     echo "   • For large encoding jobs, run: make encode-large INPUT=... OUTPUT=..."
     echo "   • Monitor WSL memory usage: make wsl-info"
 fi

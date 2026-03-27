@@ -47,8 +47,8 @@ make wsl-info
 
 2. **Store files in WSL filesystem**:
    ```bash
-   # Good: /home/user/projects/memvid
-   # Bad:  /mnt/c/Users/user/projects/memvid
+   # Good: /path/to/linux/projects/memvid
+   # Bad:  /mnt/c/path/to/projects/memvid
    
    # Move your project if needed:
    cp -r /mnt/c/path/to/memvid ~/memvid
@@ -116,7 +116,7 @@ make wsl-info
 1. **Always use forward slashes** in WSL:
    ```bash
    # Good
-   /home/user/memvid/data/input/file.json
+   /path/to/linux/memvid/data/input/file.json
    
    # Bad  
    C:\Users\user\memvid\data\input\file.json
@@ -207,6 +207,6 @@ If you're still having issues:
 
 1. **Use Windows Terminal** for better WSL experience
 2. **Install Docker Desktop with WSL 2 backend**
-3. **Keep projects in WSL filesystem** (`/home/user/...`)
+3. **Keep projects in WSL filesystem** (`/path/to/linux/...`)
 4. **Use VSCode with WSL extension** for seamless development
 5. **Monitor Windows Task Manager** to see Docker Desktop resource usage

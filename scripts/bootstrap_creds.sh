@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CREDS_DIR="${HOME}/Documents/creds"
+CREDS_DIR="${CREDS_DIR:-${VERA_CREDS_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/vera/creds}}"
 ENV_FILE="${ROOT_DIR}/scripts/vera_env.local"
 export CREDS_DIR
 DEFAULT_REDIRECT_URI="${GOOGLE_OAUTH_REDIRECT_URI:-http://127.0.0.1:8080/oauth2callback}"
@@ -346,7 +346,7 @@ write_secret "${CREDS_DIR}/searxng/searxng_url" "${SEARXNG_BASE_URL}"
 
 OBSIDIAN_VAULT_PATH="${OBSIDIAN_VAULT_PATH:-}"
 if [ "${ENABLE_OBSIDIAN}" = "1" ] && [ -z "${OBSIDIAN_VAULT_PATH}" ]; then
-  OBSIDIAN_VAULT_PATH="$(prompt_value "OBSIDIAN_VAULT_PATH (e.g., /home/you/Documents/VeraVault)")"
+  OBSIDIAN_VAULT_PATH="$(prompt_value "OBSIDIAN_VAULT_PATH (e.g., /path/to/ObsidianVault)")"
 fi
 write_secret "${CREDS_DIR}/obsidian/vault_path" "${OBSIDIAN_VAULT_PATH}"
 if [ -n "${OBSIDIAN_VAULT_PATH}" ]; then

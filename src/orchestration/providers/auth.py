@@ -7,7 +7,7 @@ ported from Moltbot's auth-profiles pattern:
 
     1. Config file credentials (vera_config.yaml)
     2. Environment variables (XAI_API_KEY, ANTHROPIC_API_KEY, etc.)
-    3. Credentials directory files (~/Documents/creds/)
+    3. Credentials directory files (configured `CREDS_DIR`, default `~/.config/vera/creds`)
 
 Supports credential rotation and last-good tracking.
 """
@@ -179,14 +179,19 @@ def resolve_credential(
     Args:
         provider_id: Provider to resolve for ('grok', 'claude', 'gemini', 'openai')
         config_credentials: Credentials from config file (optional)
-        creds_dir: Credentials directory path (defaults to ~/Documents/creds)
+        creds_dir: Credentials directory path (defaults to ~/.config/vera/creds)
         store: AuthProfileStore for tracking which credential was used
 
     Returns:
         ProviderCredential if found, None otherwise
     """
     if creds_dir is None:
-        creds_dir = Path(os.getenv("CREDS_DIR", "~/Documents/creds")).expanduser()
+        creds_dir = Path(
+            os.getenv(
+                "CREDS_DIR",
+                os.getenv("VERA_CREDS_DIR", "~/.config/vera/creds"),
+            )
+        ).expanduser()
 
     base_url_env = os.getenv("VERA_LLM_BASE_URL", "").strip()
     default_url = PROVIDER_BASE_URLS.get(provider_id, "https://api.x.ai/v1")

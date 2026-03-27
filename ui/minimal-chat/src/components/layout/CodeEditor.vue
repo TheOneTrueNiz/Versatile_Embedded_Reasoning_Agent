@@ -207,7 +207,7 @@ function openPathPrompt(mode) {
   pathPromptError.value = '';
   const baseDir = workingDirectory.value
     ? `${workingDirectory.value.replace(/\/+$/, '')}/`
-    : '/home/';
+    : '/';
   pathPromptValue.value = currentFilePath.value || baseDir;
   showPathPrompt.value = true;
   nextTick(() => {
@@ -388,7 +388,7 @@ onBeforeUnmount(() => {
 
 // Open file dialog
 async function openFileDialog() {
-  const path = prompt('Enter file path to open:', currentFilePath.value || '/home/');
+  const path = prompt('Enter file path to open:', currentFilePath.value || '/');
   if (!path) return;
   await openFile(path);
 }

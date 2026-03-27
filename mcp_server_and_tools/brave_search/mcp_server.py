@@ -283,7 +283,7 @@ def _request_json(endpoint: str, params: Optional[Any] = None,
         status = response.status_code
         body = response.text[:200]
         hint = {
-            401: "Invalid or expired BRAVE_API_KEY. Check ~/Documents/creds/brave/brave_api.",
+            401: "Invalid or expired BRAVE_API_KEY. Check your environment or configured credentials store.",
             403: "API key lacks permission for this endpoint. Verify subscription tier.",
             429: "Rate limited. Wait 10-30s and retry, or switch to searxng_search.",
             500: "Brave API internal error. Retry once, then fall back to searxng_search.",

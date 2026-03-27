@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${ROOT_DIR}/.venv"
 UI_DIR="${ROOT_DIR}/ui/minimal-chat"
-CREDS_DIR="${HOME}/Documents/creds"
+CREDS_DIR="${CREDS_DIR:-${VERA_CREDS_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/vera/creds}}"
 ENV_FILE="${ROOT_DIR}/scripts/vera_env.local"
 KEYCHAIN_SCRIPT="${ROOT_DIR}/scripts/vera_secret_store.sh"
 PYTHON_CMD="$(command -v python3 || command -v python || true)"

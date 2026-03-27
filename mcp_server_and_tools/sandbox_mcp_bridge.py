@@ -12,6 +12,7 @@ Jupyter/Python execution, Node.js execution — all sandboxed.
 
 import json
 import os
+import os
 import sys
 import logging
 from typing import Any, Dict
@@ -160,7 +161,7 @@ try:
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Search pattern"},
-                        "path": {"type": "string", "description": "Directory to search in", "default": "/home/gem"},
+                        "path": {"type": "string", "description": "Directory to search in", "default": os.path.expanduser("~")},
                     },
                     "required": ["pattern"],
                 },
@@ -194,7 +195,7 @@ try:
             elif name == "sandbox_file_search":
                 result = _post("file/search", {
                     "pattern": arguments["pattern"],
-                    "path": arguments.get("path", "/home/gem"),
+                    "path": arguments.get("path", os.path.expanduser("~")),
                 })
             else:
                 result = {"error": f"Unknown tool: {name}"}

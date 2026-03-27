@@ -153,8 +153,8 @@ class ToolResultCache:
         produce the same hash even if parameter order or formatting differs.
 
         Examples:
-            {"path": "/home/user", "limit": 10}
-            {"limit": 10, "path": "/home/user"}
+            {"path": "/path/to/workspace", "limit": 10}
+            {"limit": 10, "path": "/path/to/workspace"}
             -> Same hash
         """
         # Sort keys alphabetically

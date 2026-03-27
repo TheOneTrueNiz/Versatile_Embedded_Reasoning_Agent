@@ -1181,7 +1181,7 @@ uv run mcp install server.py
 uv run mcp install server.py --name "My Analytics Server"
 
 # Environment variables
-uv run mcp install server.py -v API_KEY=abc123 -v DB_URL=postgres://...
+uv run mcp install server.py -v API_KEY=<api-key> -v DB_URL=<database-url>
 uv run mcp install server.py -f .env
 ```
 

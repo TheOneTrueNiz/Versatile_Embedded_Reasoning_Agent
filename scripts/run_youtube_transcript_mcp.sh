@@ -4,17 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="${ROOT_DIR}/mcp_server_and_tools/mcp-server-youtube-transcript"
 DIST_PATH="${SERVER_DIR}/dist/index.js"
+CREDS_ROOT="${CREDS_DIR:-${VERA_CREDS_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/vera/creds}}"
 
 if [ -z "${YOUTUBE_API_KEY:-}" ]; then
-  KEY_PATH="${YOUTUBE_API_KEY_PATH:-${HOME}/Documents/creds/google/youtube_api_key}"
+  KEY_PATH="${YOUTUBE_API_KEY_PATH:-${CREDS_ROOT}/google/youtube_api_key}"
   if [ -d "${KEY_PATH}" ]; then
     if [ -f "${KEY_PATH}/YOUTUBE_API_KEY" ]; then
       KEY_PATH="${KEY_PATH}/YOUTUBE_API_KEY"
     elif [ -f "${KEY_PATH}/youtube_api_key" ]; then
       KEY_PATH="${KEY_PATH}/youtube_api_key"
     fi
-  elif [ ! -f "${KEY_PATH}" ] && [ -f "${HOME}/Documents/creds/google/YOUTUBE_API_KEY" ]; then
-    KEY_PATH="${HOME}/Documents/creds/google/YOUTUBE_API_KEY"
+  elif [ ! -f "${KEY_PATH}" ] && [ -f "${CREDS_ROOT}/google/YOUTUBE_API_KEY" ]; then
+    KEY_PATH="${CREDS_ROOT}/google/YOUTUBE_API_KEY"
   fi
 
   if [ -f "${KEY_PATH}" ]; then

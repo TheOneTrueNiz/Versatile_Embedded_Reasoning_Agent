@@ -1054,7 +1054,7 @@ async def demo():
     print("\n=== Test 1: Safety Quorum (Dangerous Task) ===")
     result = await executor.execute(
         SAFETY_QUORUM,
-        "Delete all files in /home using rm -rf /home/*",
+        "Delete all files in /workspace using rm -rf /workspace/*",
         context="User requested cleanup"
     )
 

@@ -29,10 +29,10 @@ Primary module targets:
 - `src/orchestration/llm_bridge.py`
 
 Research anchors:
-- `/path/to/Research_Repo/02_Agentic_Frameworks/2602.00307_ADP_MA.pdf`
-- `/path/to/Research_Repo/02_Agentic_Frameworks/2511.02424_ReAcTree.pdf`
-- `/path/to/Research_Repo/09_Tool_Usage_and_Error_Analysis/2601.05930_ForeAgent.pdf`
-- `/path/to/Research_Repo/21_State_Machines_and_Reliable_Control_Flow/2411.15100_XGrammar_Structured_Generation.pdf`
+- `/path/to/research-corpus/02_Agentic_Frameworks/2602.00307_ADP_MA.pdf`
+- `/path/to/research-corpus/02_Agentic_Frameworks/2511.02424_ReAcTree.pdf`
+- `/path/to/research-corpus/09_Tool_Usage_and_Error_Analysis/2601.05930_ForeAgent.pdf`
+- `/path/to/research-corpus/21_State_Machines_and_Reliable_Control_Flow/2411.15100_XGrammar_Structured_Generation.pdf`
 
 Implementation sequence:
 1. Add an autonomy decision kernel that consumes budget, cooldown, and recent failure state.
@@ -54,10 +54,10 @@ Primary module targets:
 - `src/core/runtime/tool_orchestrator.py`
 
 Research anchors:
-- `/path/to/Research_Repo/02_Agentic_Frameworks/2509.18847_failure_makes_agent_stronger_tool_reflection.pdf`
-- `/path/to/Research_Repo/09_Tool_Usage_and_Error_Analysis/2601.12658_Trajectory_Error_Recovery.pdf`
-- `/path/to/Research_Repo/11_Continual_Learning_and_RL/2305.18290_DPO_Direct_Preference_Optimization.pdf`
-- `/path/to/Research_Repo/17_Data_Engineering_and_Datasets/2212.10560_Self_Instruct_Aligning_LM.pdf`
+- `/path/to/research-corpus/02_Agentic_Frameworks/2509.18847_failure_makes_agent_stronger_tool_reflection.pdf`
+- `/path/to/research-corpus/09_Tool_Usage_and_Error_Analysis/2601.12658_Trajectory_Error_Recovery.pdf`
+- `/path/to/research-corpus/11_Continual_Learning_and_RL/2305.18290_DPO_Direct_Preference_Optimization.pdf`
+- `/path/to/research-corpus/17_Data_Engineering_and_Datasets/2212.10560_Self_Instruct_Aligning_LM.pdf`
 
 Implementation sequence:
 1. Build fail->recover example extraction from followthrough + flight recorder logs.
@@ -79,12 +79,12 @@ Primary module targets:
 - `src/planning/inner_life_engine.py`
 
 Research anchors:
-- `/path/to/Research_Repo/01_Memory_Systems/2501.00663_TITANS_Neural_Memory.pdf`
-- `/path/to/Research_Repo/01_Memory_Systems/2601.07372_Engram_Conditional_Memory.pdf`
-- `/path/to/Research_Repo/01_Memory_Systems/2601.12658_AMem_Zettelkasten.pdf`
-- `/path/to/Research_Repo/01_Memory_Systems/2404.16130_GraphRAG_Local_to_Global.pdf`
-- `/path/to/Research_Repo/01_Memory_Systems/2502.06472_KARMA_MultiAgent_KG_Enrichment.pdf`
-- `/path/to/Research_Repo/01_Memory_Systems/2510.22590_ATOM_Dynamic_Temporal_KG.pdf`
+- `/path/to/research-corpus/01_Memory_Systems/2501.00663_TITANS_Neural_Memory.pdf`
+- `/path/to/research-corpus/01_Memory_Systems/2601.07372_Engram_Conditional_Memory.pdf`
+- `/path/to/research-corpus/01_Memory_Systems/2601.12658_AMem_Zettelkasten.pdf`
+- `/path/to/research-corpus/01_Memory_Systems/2404.16130_GraphRAG_Local_to_Global.pdf`
+- `/path/to/research-corpus/01_Memory_Systems/2502.06472_KARMA_MultiAgent_KG_Enrichment.pdf`
+- `/path/to/research-corpus/01_Memory_Systems/2510.22590_ATOM_Dynamic_Temporal_KG.pdf`
 
 Implementation sequence:
 1. Keep 1GB default budget (`VERA_MEMORY_MAX_FOOTPRINT_MB`) with pressure telemetry.
@@ -106,10 +106,10 @@ Primary module targets:
 - `src/core/runtime/vera.py`
 
 Research anchors:
-- `/path/to/Research_Repo/09_Tool_Usage_and_Error_Analysis/2505.03275_RAG_MCP_Tool_Prompt_Bloat.pdf`
-- `/path/to/Research_Repo/09_Tool_Usage_and_Error_Analysis/2602.20426_Rewrite_Tool_Descriptions.pdf`
-- `/path/to/Research_Repo/24_Prompt_Engineering_and_Optimization/2310.03714_DSPy_Declarative_LM_Pipelines.pdf`
-- `/path/to/Research_Repo/12_Evaluation_and_Benchmarks/2509.24002_MCPMark.pdf`
+- `/path/to/research-corpus/09_Tool_Usage_and_Error_Analysis/2505.03275_RAG_MCP_Tool_Prompt_Bloat.pdf`
+- `/path/to/research-corpus/09_Tool_Usage_and_Error_Analysis/2602.20426_Rewrite_Tool_Descriptions.pdf`
+- `/path/to/research-corpus/24_Prompt_Engineering_and_Optimization/2310.03714_DSPy_Declarative_LM_Pipelines.pdf`
+- `/path/to/research-corpus/12_Evaluation_and_Benchmarks/2509.24002_MCPMark.pdf`
 
 Implementation sequence:
 1. Tool retrieval pre-filter (top-k candidates) before full prompt assembly.
@@ -132,9 +132,9 @@ Primary module targets:
 - `scripts/install_lora_cadence_timer.sh`
 
 Research anchors:
-- `/path/to/Research_Repo/15_Optimization_and_Training_Dynamics/2106.09685_LoRA_Low_Rank_Adaptation.pdf`
-- `/path/to/Research_Repo/07_Efficiency_and_Quantization/2305.14314_QLoRA_Efficient_Finetuning.pdf`
-- `/path/to/Research_Repo/11_Continual_Learning_and_RL/2305.18290_DPO_Direct_Preference_Optimization.pdf`
+- `/path/to/research-corpus/15_Optimization_and_Training_Dynamics/2106.09685_LoRA_Low_Rank_Adaptation.pdf`
+- `/path/to/research-corpus/07_Efficiency_and_Quantization/2305.14314_QLoRA_Efficient_Finetuning.pdf`
+- `/path/to/research-corpus/11_Continual_Learning_and_RL/2305.18290_DPO_Direct_Preference_Optimization.pdf`
 
 Implementation sequence:
 1. Verify CUDA stack + PEFT/datasets and trainer dry-run.
@@ -170,7 +170,7 @@ Required before declaring 3.0 readiness:
 
 ## 4) Immediate Next Steps (Post-Migration Day 0/1)
 
-1. Mirror this repo + `Research_Repo` on dual-4090 host.
+1. Mirror this repo plus the research corpus on the dual-4090 host.
 2. Run environment bootstrap and GPU verification.
 3. Start Track E setup while keeping Track A/B hardening active on this host.
 4. Keep `my_diary` entries per major patch/gate event to preserve project grounding.

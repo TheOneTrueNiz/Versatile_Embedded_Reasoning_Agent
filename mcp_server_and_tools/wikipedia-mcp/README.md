@@ -695,7 +695,7 @@ When contributing new features:
    {
      "mcpServers": {
        "wikipedia": {
-         "command": "/home/username/.local/bin/wikipedia-mcp"
+        "command": "/path/to/wikipedia-mcp"
        }
      }
    }

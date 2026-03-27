@@ -2,8 +2,8 @@
 
 This directory is the execution package built from:
 - Current Vera 2.0 codebase (`src/`, `scripts/`)
-- Research corpus in `/path/to/Research_Repo`
-- Primary research index: `/path/to/Research_Repo/INDEX.md`
+- Research corpus in `/path/to/research-corpus`
+- Primary research index: `/path/to/research-corpus/INDEX.md`
 
 ## What This Contains
 - `VERA_2_0_BOLSTER_PLAN.md`
@@ -15,7 +15,7 @@ This directory is the execution package built from:
 - `RESEARCH_TO_CODE_CROSSWALK.md`
   - Mapping from research themes to exact Vera modules and upgrade hooks.
 - `RESEARCH_PAPER_PLAYBOOK.md`
-  - Specific paper file paths in `Research_Repo` and direct wiring targets.
+  - Specific paper file paths in the research corpus and direct wiring targets.
 - `MILESTONES_AND_RELEASE_GATES.md`
   - Milestone sequence, objective gates, and pass/fail criteria.
 - `V2_PATCH_QUEUE_WITH_FILE_HOOKS.md`

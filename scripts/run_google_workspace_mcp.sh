@@ -5,7 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_SCRIPT="${ROOT_DIR}/mcp_server_and_tools/google_workspace_mcp/main.py"
 PYTHON_CMD="$(command -v python3 || command -v python || true)"
 
-CRED_DIR="${GOOGLE_WORKSPACE_CRED_DIR:-${HOME}/Documents/creds/google}"
+CREDS_ROOT="${CREDS_DIR:-${VERA_CREDS_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/vera/creds}}"
+CRED_DIR="${GOOGLE_WORKSPACE_CRED_DIR:-${CREDS_ROOT}/google}"
 CLIENT_SECRET_PATH="${GOOGLE_CLIENT_SECRET_PATH:-}"
 DEFAULT_CREDS_DIR="${CRED_DIR}/credentials"
 

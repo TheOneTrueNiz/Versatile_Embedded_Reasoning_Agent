@@ -3,6 +3,7 @@ set -euo pipefail
 
 SERVICE_NAME="${VERA_KEYCHAIN_SERVICE:-vera.dev}"
 BACKEND_PREFERENCE="${VERA_KEYCHAIN_BACKEND:-auto}"
+DEFAULT_CREDS_DIR="${CREDS_DIR:-${VERA_CREDS_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/vera/creds}}"
 
 declare -a DEFAULT_VARS=(
   XAI_API_KEY
@@ -369,7 +370,7 @@ cmd_status() {
 }
 
 cmd_migrate_creds() {
-  local creds_dir="${1:-${CREDS_DIR:-${HOME}/Documents/creds}}"
+  local creds_dir="${1:-${DEFAULT_CREDS_DIR}}"
   local name value imported=0 missing=0 failed=0
   require_backend
 

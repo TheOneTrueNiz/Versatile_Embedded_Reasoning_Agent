@@ -491,7 +491,7 @@ if __name__ == "__main__":
     print("\n=== Test 1: File Stamp ===")
     file_stamp = tracker.stamp_file(
         content="Meeting with Bob at 2pm",
-        file_path="/home/user/calendar.txt",
+        file_path="/path/to/calendar.txt",
         line_number=42
     )
     print(f"   Stamp ID: {file_stamp.stamp_id}")

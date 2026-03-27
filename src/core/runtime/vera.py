@@ -3886,11 +3886,11 @@ Tools:
         if workspace_email:
             email_status = workspace_email
         else:
-            email_status = "MISSING (set GOOGLE_WORKSPACE_USER_EMAIL or ~/Documents/creds/google/user_email)"
+            email_status = "MISSING (set GOOGLE_WORKSPACE_USER_EMAIL or provide it in the configured credentials directory)"
         print(f"Workspace user_google_email: {email_status}")
         if not workspace_email:
             raise RuntimeError(
-                "Missing GOOGLE_WORKSPACE_USER_EMAIL (set env var or ~/Documents/creds/google/user_email)."
+                "Missing GOOGLE_WORKSPACE_USER_EMAIL (set env var or provide it in the configured credentials directory)."
             )
         print(f"Observability: {'Enabled' if self.config.observability else 'Disabled'}")
         print(f"Fault Tolerance: {'Enabled' if self.config.fault_tolerance else 'Disabled'}")

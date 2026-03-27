@@ -471,7 +471,7 @@ def _looks_like_placeholder(field: str, value: Any) -> bool:
             return True
         if is_id_field and ("/" in stripped or stripped.startswith("http://") or stripped.startswith("https://")):
             return True
-        if is_id_field and stripped.startswith("/home/"):
+        if is_id_field and Path(stripped).is_absolute():
             return True
     if isinstance(value, list) and not value:
         return True
