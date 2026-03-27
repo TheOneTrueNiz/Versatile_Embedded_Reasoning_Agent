@@ -12,10 +12,10 @@ Keep secrets out of repo files while preserving simple startup UX.
 ./scripts/vera_secret_store.sh set XAI_API_KEY "<your_key>"
 ```
 
-2. Optional migration from legacy file-based creds:
+2. Optional migration from a legacy file-based credentials directory:
 
 ```bash
-./scripts/vera_secret_store.sh migrate-creds "${HOME}/Documents/creds"
+./scripts/vera_secret_store.sh migrate-creds "/path/to/legacy-creds"
 ```
 
 3. Check secret presence (values are never printed):
@@ -31,7 +31,7 @@ Keep secrets out of repo files while preserving simple startup UX.
   - `run_vera.py`
   - `run_vera_api.py`
   - `run_vera_monolithic.py`
-- Compatibility fallback to `~/Documents/creds` is still present.
+- Compatibility fallback to the legacy `CREDS_DIR` location is still present.
 
 Disable keychain autoload:
 

@@ -123,7 +123,7 @@ npm run format     # Prettier
 # Core
 VERA_API_HOST=127.0.0.1
 VERA_API_PORT=8788
-CREDS_DIR=~/Documents/creds  # Credentials directory
+CREDS_DIR=/path/to/creds  # Credentials directory
 
 # Auth & rate limiting
 VERA_API_KEY=             # Bearer token for API auth (unset = auth disabled). Keyring → creds file → env var.
@@ -166,10 +166,10 @@ VERA_LOGGING=1
 
 ## Credentials Layout
 
-Credentials are stored in `~/Documents/creds/` (override with `CREDS_DIR`). First-run wizard auto-launches when sentinel is missing:
+Credentials are stored in the configured `CREDS_DIR` location. First-run wizard auto-launches when sentinel is missing:
 
 ```
-~/Documents/creds/
+/path/to/creds/
   xai/xai_api                 # xAI API key (required)
   brave/brave_api             # Brave Search API key
   git/git_token               # GitHub PAT

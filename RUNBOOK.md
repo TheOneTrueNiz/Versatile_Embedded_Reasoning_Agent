@@ -16,10 +16,10 @@ Configure dev secrets in OS keychain (recommended):
 ./scripts/vera_secret_store.sh set XAI_API_KEY "<your_key>"
 ```
 
-Or migrate file-based credentials:
+Or migrate a legacy file-based credentials directory:
 
 ```bash
-./scripts/vera_secret_store.sh migrate-creds "${HOME}/Documents/creds"
+./scripts/vera_secret_store.sh migrate-creds "/path/to/legacy-creds"
 ```
 
 ## 2) Offline Bootstrap
@@ -128,7 +128,7 @@ Retention controls:
 
 - `scripts/run_vera.sh` and `scripts/run_vera_full.sh` auto-load secrets from OS keychain by default.
 - Disable keychain autoload with `VERA_KEYCHAIN_LOAD=0`.
-- `~/Documents/creds` remains as compatibility fallback.
+- The legacy `CREDS_DIR` location remains as a compatibility fallback.
 - Preferred production pattern is environment/secret-manager injection.
 
 ## 10) Memory Footprint Budget
