@@ -17,6 +17,8 @@ from typing import Dict, List, Sequence, Tuple
 
 import httpx
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+TMP_DIR = ROOT_DIR / "tmp"
 
 @dataclass
 class PromptCase:
@@ -151,8 +153,8 @@ def _default_cases() -> List[PromptCase]:
             expected_tool="memvid_encode_text",
             prompt=(
                 "Use `memvid_encode_text` with text 'tool sweep diagnostic', "
-                "output_video '/home/nizbot-macmini/projects/Vera_2.0/tmp/tool_sweep_memvid.mp4', "
-                "output_index '/home/nizbot-macmini/projects/Vera_2.0/tmp/tool_sweep_memvid.index', "
+                f"output_video '{(TMP_DIR / 'tool_sweep_memvid.mp4').as_posix()}', "
+                f"output_index '{(TMP_DIR / 'tool_sweep_memvid.index').as_posix()}', "
                 "chunk_size 200 and overlap 20. Return success status."
             ),
             timeout=120.0,
@@ -248,7 +250,7 @@ def main() -> int:
 
         for idx, case in enumerate(cases, start=1):
             payload = {
-                "model": "grok-4-1-fast-reasoning",
+                "model": "grok-4.20-experimental-beta-0304-reasoning",
                 "vera_conversation_id": f"tool-sweep-{case.case_id}-{idx}",
                 "messages": [{"role": "user", "content": case.prompt}],
             }

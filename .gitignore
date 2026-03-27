@@ -32,6 +32,7 @@ research/
 src/agent_lightning_traces/
 *.log
 wheelhouse/
+old/local/
 
 .env
 .env.*
@@ -64,12 +65,30 @@ mcp_server_and_tools/x-twitter-mcp-server/
 vera_theming_tmp/
 dev/
 *.backup
+__pycache__/
+old/**/__pycache__/
 
 # Stray build/scratch artifacts
 index.faiss
 index.json
 output.mp4
 test.txt
+tool_exam.txt
+
+# Local service/MCP build residue
+services/**/node_modules/
+services/**/.venv/
+services/**/venv/
+services/**/__pycache__/
+mcp_server_and_tools/**/node_modules/
+mcp_server_and_tools/**/.venv/
+mcp_server_and_tools/**/venv/
+mcp_server_and_tools/**/__pycache__/
+mcp_server_and_tools/**/dist/
+mcp_server_and_tools/**/build/
+mcp_server_and_tools/**/*.egg-info/
+mcp_server_and_tools/**/mcp_server_debug.log
+mcp_server_and_tools/**/.pytest_cache/
 
 # OS / IDE
 .DS_Store

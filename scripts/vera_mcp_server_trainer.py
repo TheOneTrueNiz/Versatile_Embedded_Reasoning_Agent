@@ -30,8 +30,10 @@ TRAINING_TEXT_PATH = TRAINING_TMP_DIR / "tool_training.txt"
 TRAINING_IMAGE_PATH = TRAINING_TMP_DIR / "tool_training.png"
 TRAINING_MEMVID_VIDEO_PATH = TRAINING_TMP_DIR / "tool_training_memvid.mp4"
 TRAINING_MEMVID_INDEX_PATH = TRAINING_TMP_DIR / "tool_training_memvid.index"
-DEFAULT_OBSIDIAN_VAULT_PATH = Path(
-    os.getenv("OBSIDIAN_VAULT_PATH", "/home/nizbot-macmini/Documents/Veras_Vault")
+DEFAULT_OBSIDIAN_VAULT_PATH = (
+    Path(os.getenv("OBSIDIAN_VAULT_PATH")).expanduser()
+    if os.getenv("OBSIDIAN_VAULT_PATH")
+    else (Path.home() / "Documents" / "Veras_Vault")
 )
 _TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX8QAAAAASUVORK5CYII="
 
@@ -845,7 +847,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run MCP server-by-server training drills")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
-    parser.add_argument("--model", default="grok-4-1-fast-reasoning")
+    parser.add_argument("--model", default="grok-4.20-experimental-beta-0304-reasoning")
     parser.add_argument("--server", action="append", default=[], help="Optional server filter (repeatable)")
     parser.add_argument("--max-tools-per-server", type=int, default=0, help="0 means no limit")
     parser.add_argument("--include-side-effects", action="store_true", help="Execute side-effect tools")

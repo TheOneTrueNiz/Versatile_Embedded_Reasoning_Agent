@@ -25,7 +25,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 COMMITMENT_RE = re.compile(
-    r"\b(plan set:|autonomy engaged|multitasking enabled:|adjusted:\s*now|block queued|summary post-run|queued for)\b",
+    r"\b(plan set:|autonomy engaged|multitasking enabled:|adjusted:\s*now|block queued|summary post-run|queued for|queued:|nudges queued|armed(?:\s+post-bootstrap)?|wake nudge)\b",
+    re.IGNORECASE,
+)
+FUTURE_COMMITMENT_RE = re.compile(
+    r"\b(?:i(?:'ll| will)\s+(?:follow up|check back|reach out|send|ping|queue|schedule|nudge|remind|circle back|update)|stand by)\b",
     re.IGNORECASE,
 )
 WINDOW_24H_LOCAL_RE = re.compile(r"\b(\d{1,2}):(\d{2})\s*[\-\u2013]\s*(\d{1,2}):(\d{2})\s*local\b", re.IGNORECASE)
@@ -117,6 +121,18 @@ def _utc_ts() -> str:
     return _utc_now().strftime("%Y%m%dT%H%M%SZ")
 
 
+def _resolve_local_now(now_override: str) -> dt.datetime:
+    raw = str(now_override or "").strip()
+    if not raw:
+        return dt.datetime.now()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        return parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
 def _default_vera_root() -> Path:
     env_root = os.getenv("VERA_ROOT", "").strip()
     if env_root:
@@ -124,8 +140,21 @@ def _default_vera_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _default_harness_root(vera_root: Path) -> Path:
-    return vera_root.parent / "Doctor_Codex"
+def _default_harness_root() -> Path | None:
+    env_root = os.getenv("VERA_EXTERNAL_HARNESS_ROOT", "").strip()
+    if not env_root:
+        return None
+    return Path(env_root).expanduser()
+
+
+def _default_external_ci_gate(vera_root: Path) -> Path | None:
+    env_path = os.getenv("VERA_EXTERNAL_CI_GATE", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    candidate = vera_root / "scripts" / "vera_external_ci_gate.py"
+    if candidate.exists():
+        return candidate
+    return None
 
 
 def _safe_jsonl_iter(path: Path):
@@ -718,8 +747,8 @@ def _infer_workflow_name(content: str) -> str:
     return "autonomy_followthrough"
 
 
-def _scan_commitments(transcripts_dir: Path, lookback_hours: float) -> List[Dict[str, Any]]:
-    now_local = dt.datetime.now()
+def _scan_commitments(transcripts_dir: Path, lookback_hours: float, now_local: Optional[dt.datetime] = None) -> List[Dict[str, Any]]:
+    now_local = now_local or dt.datetime.now()
     cutoff = now_local - dt.timedelta(hours=max(0.0, float(lookback_hours)))
     out: List[Dict[str, Any]] = []
     for path in sorted(transcripts_dir.glob("*.jsonl")):
@@ -728,7 +757,9 @@ def _scan_commitments(transcripts_dir: Path, lookback_hours: float) -> List[Dict
             if payload.get("role") != "assistant":
                 continue
             content = payload.get("content")
-            if not isinstance(content, str) or not COMMITMENT_RE.search(content):
+            if not isinstance(content, str):
+                continue
+            if not COMMITMENT_RE.search(content) and not FUTURE_COMMITMENT_RE.search(content):
                 continue
             ts_raw = payload.get("timestamp")
             try:
@@ -758,6 +789,116 @@ def _scan_commitments(transcripts_dir: Path, lookback_hours: float) -> List[Dict
             )
     out.sort(key=lambda item: float(item["ts_epoch"]))
     return out
+
+
+def _reconstruct_commitment_from_rows(
+    commitment_id: str,
+    *,
+    action: Optional[Dict[str, Any]],
+    entry: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    action = action if isinstance(action, dict) else {}
+    entry = entry if isinstance(entry, dict) else {}
+    at_local_raw = (
+        str(action.get("commitment_at_local") or "").strip()
+        or str(entry.get("commitment_at_local") or "").strip()
+    )
+    at_local = _parse_local_iso(at_local_raw)
+    if at_local is None:
+        ts_epoch = entry.get("commitment_ts_epoch")
+        try:
+            at_local = dt.datetime.fromtimestamp(float(ts_epoch))
+        except Exception:
+            return {}
+    conversation_id = (
+        str(action.get("conversation_id") or "").strip()
+        or str(entry.get("conversation_id") or "").strip()
+    )
+    content_excerpt = (
+        str(action.get("content_excerpt") or "").strip()
+        or str(entry.get("content_excerpt") or "").strip()
+    )
+    return {
+        "commitment_id": commitment_id,
+        "conversation_id": conversation_id or commitment_id.split(":", 1)[0],
+        "ts_epoch": float(entry.get("commitment_ts_epoch") or at_local.timestamp()),
+        "at_local": at_local,
+        "at_local_iso": at_local.isoformat(timespec="seconds"),
+        "source": (
+            str(action.get("source") or "").strip()
+            or str(entry.get("source") or "").strip()
+            or f"followthrough:{commitment_id}"
+        ),
+        "content": content_excerpt,
+        "content_excerpt": content_excerpt[:220],
+        "workflow_name": str(action.get("workflow_name") or "autonomy_followthrough"),
+        "schedule_start_local": str(action.get("schedule_start_local") or "").strip(),
+        "schedule_end_local": str(action.get("schedule_end_local") or "").strip(),
+        "schedule_parse": str(action.get("schedule_parse") or "").strip(),
+    }
+
+
+def _augment_commitments_with_open_actions(
+    commitments: List[Dict[str, Any]],
+    *,
+    ledger: Dict[str, Any],
+    actions: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    out = list(commitments)
+    seen = {str(item.get("commitment_id") or "") for item in commitments}
+    all_ids = set(seen) | {str(key) for key in ledger.keys()} | {str(key) for key in actions.keys()}
+    for commitment_id in sorted(all_ids):
+        if not commitment_id or commitment_id in seen:
+            continue
+        entry = ledger.get(commitment_id)
+        action = actions.get(commitment_id)
+        entry_status = str(entry.get("status") or "") if isinstance(entry, dict) else ""
+        action_status = str(action.get("status") or "") if isinstance(action, dict) else ""
+        if entry_status in TERMINAL_ACTION_STATES:
+            continue
+        if entry_status == "completed":
+            continue
+        if action_status in TERMINAL_ACTION_STATES:
+            continue
+        reconstructed = _reconstruct_commitment_from_rows(commitment_id, action=action, entry=entry)
+        if reconstructed:
+            out.append(reconstructed)
+            seen.add(commitment_id)
+    out.sort(key=lambda item: float(item["ts_epoch"]))
+    return out
+
+
+def _reconcile_action_terminal_statuses(
+    *,
+    actions: Dict[str, Any],
+    ledger: Dict[str, Any],
+    action_events_path: Optional[Path],
+) -> None:
+    for commitment_id, action in actions.items():
+        if not isinstance(action, dict):
+            continue
+        entry = ledger.get(str(commitment_id))
+        if not isinstance(entry, dict):
+            continue
+        entry_status = str(entry.get("status") or "")
+        action_status = str(action.get("status") or "")
+        if entry_status == "completed" and action_status != "completed":
+            last_result = entry.get("last_attempt_result")
+            verified = isinstance(last_result, dict) and bool(last_result.get("manifest_overall_ok") is True)
+            reason = "ledger_completed_verified" if verified else "legacy_completed_without_verification"
+            if action_events_path is not None:
+                _set_action_status(action=action, new_status="completed", reason=reason, action_events_path=action_events_path)
+            else:
+                action["status"] = "completed"
+                action["status_reason"] = reason
+                action["updated_at_utc"] = _utc_iso()
+        elif entry_status == "failed" and action_status not in {"failed", "completed"}:
+            if action_events_path is not None:
+                _set_action_status(action=action, new_status="failed", reason="executor_failed", action_events_path=action_events_path)
+            else:
+                action["status"] = "failed"
+                action["status_reason"] = "executor_failed"
+                action["updated_at_utc"] = _utc_iso()
 
 
 def _sanitize_for_path(value: str) -> str:
@@ -924,15 +1065,20 @@ def _write_scaffold_note(
 def _run_executor_bundle(
     *,
     vera_root: Path,
-    harness_root: Path,
+    harness_root: Path | None,
+    external_ci_gate: Path | None,
     base_url: str,
     run_dir: Path,
     timeout_s: float,
 ) -> Tuple[int, str, str, Path | None, Dict[str, Any]]:
     ci_logs = run_dir / "ci"
+    if not external_ci_gate or not external_ci_gate.exists():
+        return 0, "", "", None, {"overall_ok": True, "skipped": True, "reason": "external_ci_gate_unconfigured"}
+    if not harness_root or not harness_root.exists():
+        return 0, "", "", None, {"overall_ok": True, "skipped": True, "reason": "external_harness_unconfigured"}
     cmd = [
         sys.executable,
-        str(vera_root / "scripts" / "vera_doctor_professor_ci_gate.py"),
+        str(external_ci_gate),
         "--base-url",
         base_url.rstrip("/"),
         "--logs-dir",
@@ -1107,12 +1253,251 @@ def _sync_action_step_statuses(
         action["updated_at_utc"] = _utc_iso()
 
 
+def _update_action_runtime_state(
+    *,
+    commitment: Dict[str, Any],
+    entry: Dict[str, Any],
+    action: Dict[str, Any],
+    now_local: dt.datetime,
+    grace_cutoff: dt.datetime,
+    action_events_path: Optional[Path],
+    tool_calls_by_conversation: Dict[str, List[Dict[str, Any]]],
+    decisions_by_conversation: Dict[str, List[Dict[str, Any]]],
+    workflow_specs: Dict[str, Dict[str, Any]],
+    fallback_window_hours: float,
+) -> Dict[str, Any]:
+    evidence = _count_window_evidence(
+        commitment=commitment,
+        tool_calls_by_conversation=tool_calls_by_conversation,
+        decisions_by_conversation=decisions_by_conversation,
+        default_window_hours=_workflow_effective_window_hours(
+            action=action,
+            workflow_specs=workflow_specs,
+            fallback_hours=fallback_window_hours,
+        ),
+    )
+    action["evidence"] = {**evidence, "last_checked_local": now_local.isoformat(timespec="seconds")}
+
+    required_tools = action.get("workflow_required_tools")
+    if isinstance(required_tools, list) and required_tools:
+        observed_tools = set()
+        for row in tool_calls_by_conversation.get(str(action.get("conversation_id") or ""), []):
+            if isinstance(row, dict):
+                observed_tools.add(str(row.get("tool_name") or ""))
+        missing_required = [tool for tool in required_tools if tool not in observed_tools]
+    else:
+        missing_required = []
+    action["missing_required_tools"] = missing_required
+
+    schedule_start = _parse_local_iso(str(action.get("schedule_start_local") or ""))
+    schedule_end = _parse_local_iso(str(action.get("schedule_end_local") or ""))
+    has_schedule = schedule_start is not None and schedule_end is not None and schedule_end > schedule_start
+    legacy_completed_verified = False
+    if str(entry.get("status") or "") == "completed":
+        last_result = entry.get("last_attempt_result")
+        if isinstance(last_result, dict) and bool(last_result.get("manifest_overall_ok") is True):
+            legacy_completed_verified = True
+        if bool(action.get("completed_via_executor") is True):
+            legacy_completed_verified = True
+
+    def _maybe_set(status: str, reason: str) -> None:
+        if action_events_path is not None:
+            _set_action_status(action=action, new_status=status, reason=reason, action_events_path=action_events_path)
+        else:
+            action["status"] = status
+            action["status_reason"] = reason
+            action["updated_at_utc"] = _utc_iso()
+
+    if evidence["has_execution_evidence"]:
+        _maybe_set("completed", "execution_evidence_in_window")
+        if str(entry.get("status") or "") != "completed":
+            entry["status"] = "completed"
+            entry["last_attempt_utc"] = _utc_iso()
+            entry["last_attempt_result"] = {
+                "evidence_only": True,
+                "tool_call_count": evidence["tool_call_count"],
+                "blocked_attempt_count": evidence["blocked_attempt_count"],
+                "window_start_local": evidence["window_start_local"],
+                "window_end_local": evidence["window_end_local"],
+            }
+    elif str(entry.get("status") or "") == "completed" and legacy_completed_verified:
+        _maybe_set("completed", "ledger_completed_verified")
+    elif str(entry.get("status") or "") == "completed":
+        _maybe_set("completed", "legacy_completed_without_verification")
+    elif str(entry.get("status") or "") == "failed":
+        _maybe_set("failed", "executor_failed")
+    elif has_schedule:
+        if now_local < schedule_start:
+            _maybe_set("planned", "before_schedule_window")
+        elif schedule_start <= now_local <= schedule_end:
+            _maybe_set("running", "within_schedule_window")
+        else:
+            _maybe_set("missed", "schedule_window_elapsed_without_evidence")
+    else:
+        if commitment["at_local"] > grace_cutoff:
+            _maybe_set("planned", "within_grace_period")
+        else:
+            window_end = _parse_local_iso(evidence["window_end_local"])
+            if window_end is not None and now_local > window_end:
+                _maybe_set("missed", "default_window_elapsed_without_evidence")
+            else:
+                _maybe_set("planned", "awaiting_execution_evidence")
+
+    if action_events_path is not None:
+        _sync_action_step_statuses(
+            action=action,
+            evidence=evidence,
+            now_local=now_local,
+            action_events_path=action_events_path,
+        )
+    return evidence
+
+
+def _followthrough_due_decision(
+    *,
+    commitment: Dict[str, Any],
+    entry: Dict[str, Any],
+    action: Dict[str, Any],
+    now_local: dt.datetime,
+    now_utc: dt.datetime,
+    grace_cutoff: dt.datetime,
+    cooldown: dt.timedelta,
+) -> Dict[str, Any]:
+    action_status = str(action.get("status") or "")
+    schedule_end = _parse_local_iso(str(action.get("schedule_end_local") or ""))
+    has_schedule = schedule_end is not None
+    last_attempt = _parse_utc_iso(str(entry.get("last_attempt_utc") or ""))
+
+    decision: Dict[str, Any] = {"due": False, "reason": "", "status": action_status}
+    if str(entry.get("status") or "") == "completed":
+        decision["reason"] = "already_completed"
+        return decision
+    if action_status == "completed":
+        decision["reason"] = "action_completed"
+        return decision
+    if action_status == "missed":
+        if last_attempt is not None:
+            elapsed = now_utc - last_attempt
+            decision["seconds_since_last_attempt"] = round(elapsed.total_seconds(), 3)
+            if elapsed < cooldown:
+                decision["reason"] = "attempt_cooldown_active"
+                decision["cooldown_remaining_seconds"] = max(0, int((cooldown - elapsed).total_seconds()))
+                return decision
+        try:
+            attempt_count = int(entry.get("attempt_count") or 0)
+        except Exception:
+            attempt_count = 0
+        if attempt_count > 0 or last_attempt is not None:
+            decision["reason"] = "action_missed"
+            return decision
+
+    if has_schedule and schedule_end is not None and now_local <= schedule_end and action_status in {"planned", "running"}:
+        decision["reason"] = "schedule_window_open"
+        return decision
+
+    if not has_schedule and commitment["at_local"] > grace_cutoff:
+        decision["reason"] = "within_grace_period"
+        return decision
+
+    if last_attempt is not None:
+        elapsed = now_utc - last_attempt
+        decision["seconds_since_last_attempt"] = round(elapsed.total_seconds(), 3)
+        if elapsed < cooldown:
+            decision["reason"] = "attempt_cooldown_active"
+            decision["cooldown_remaining_seconds"] = max(0, int((cooldown - elapsed).total_seconds()))
+            return decision
+
+    decision["due"] = True
+    if has_schedule and schedule_end is not None and now_local > schedule_end:
+        decision["reason"] = "schedule_window_elapsed"
+        decision["minutes_overdue"] = max(0, int((now_local - schedule_end).total_seconds() // 60))
+    else:
+        window_end = _parse_local_iso(str(action.get("evidence", {}).get("window_end_local") or ""))
+        if window_end is not None:
+            decision["reason"] = "default_window_elapsed"
+            decision["minutes_overdue"] = max(0, int((now_local - window_end).total_seconds() // 60))
+        else:
+            decision["reason"] = "due_without_window_end"
+    return decision
+
+
+def _probe_due_followthrough_actions(
+    *,
+    commitments: List[Dict[str, Any]],
+    ledger: Dict[str, Any],
+    actions: Dict[str, Any],
+    workflow_specs: Dict[str, Dict[str, Any]],
+    tool_calls_by_conversation: Dict[str, List[Dict[str, Any]]],
+    decisions_by_conversation: Dict[str, List[Dict[str, Any]]],
+    now_local: dt.datetime,
+    now_utc: dt.datetime,
+    grace_cutoff: dt.datetime,
+    cooldown: dt.timedelta,
+    default_window_hours: float,
+    max_actions: int,
+) -> Dict[str, Any]:
+    due_actions: List[Dict[str, Any]] = []
+    for commitment in commitments:
+        commitment_id = str(commitment["commitment_id"])
+        entry = ledger.get(commitment_id)
+        action = actions.get(commitment_id)
+        if not isinstance(entry, dict) or not isinstance(action, dict):
+            continue
+        _update_action_runtime_state(
+            commitment=commitment,
+            entry=entry,
+            action=action,
+            now_local=now_local,
+            grace_cutoff=grace_cutoff,
+            action_events_path=None,
+            tool_calls_by_conversation=tool_calls_by_conversation,
+            decisions_by_conversation=decisions_by_conversation,
+            workflow_specs=workflow_specs,
+            fallback_window_hours=default_window_hours,
+        )
+        decision = _followthrough_due_decision(
+            commitment=commitment,
+            entry=entry,
+            action=action,
+            now_local=now_local,
+            now_utc=now_utc,
+            grace_cutoff=grace_cutoff,
+            cooldown=cooldown,
+        )
+        if not decision.get("due"):
+            continue
+        due_actions.append(
+            {
+                "commitment_id": commitment_id,
+                "conversation_id": str(commitment.get("conversation_id") or ""),
+                "workflow_name": str(action.get("workflow_name") or "autonomy_followthrough"),
+                "status": str(action.get("status") or ""),
+                "status_reason": str(action.get("status_reason") or ""),
+                "reason": str(decision.get("reason") or ""),
+                "minutes_overdue": int(decision.get("minutes_overdue") or 0),
+                "schedule_end_local": str(action.get("schedule_end_local") or ""),
+                "window_end_local": str(action.get("evidence", {}).get("window_end_local") or ""),
+                "blocked_attempt_count": int(action.get("evidence", {}).get("blocked_attempt_count") or 0),
+                "tool_call_count": int(action.get("evidence", {}).get("tool_call_count") or 0),
+            }
+        )
+    return {
+        "ok": True,
+        "probe_due": True,
+        "local_now": now_local.isoformat(timespec="seconds"),
+        "due_count": len(due_actions),
+        "due_actions": due_actions[: max(1, int(max_actions))],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run autonomy follow-through executor and update local ledgers")
     parser.add_argument("--base-url", default="http://127.0.0.1:8788")
     parser.add_argument("--vera-root", default=str(_default_vera_root()))
     parser.add_argument("--harness-root", default="")
-    parser.add_argument("--lookback-hours", type=float, default=24.0)
+    parser.add_argument("--external-ci-gate", default="")
+    parser.add_argument("--lookback-hours", type=float, default=72.0)
+    parser.add_argument("--transcripts-dir", default="", help="Optional transcript directory override")
     parser.add_argument("--grace-minutes", type=float, default=30.0)
     parser.add_argument("--attempt-cooldown-minutes", type=float, default=45.0)
     parser.add_argument("--max-runs-per-pass", type=int, default=1)
@@ -1130,15 +1515,24 @@ def main() -> int:
     parser.add_argument("--lock-file", default="tmp/followthrough_executor.lock")
     parser.add_argument("--escalate-failures", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--now-override", default="", help="Optional ISO8601 local/offset timestamp to use instead of current wall clock")
+    parser.add_argument("--only-commitment-id", default="", help="Restrict evaluation to a single commitment_id")
+    parser.add_argument(
+        "--probe-due",
+        action="store_true",
+        help="Report currently due followthrough work without side effects or state writes",
+    )
     args = parser.parse_args()
 
     vera_root = Path(args.vera_root).expanduser().resolve()
-    harness_root = _default_harness_root(vera_root).resolve() if not args.harness_root else Path(args.harness_root).expanduser().resolve()
-
-    if not (vera_root / "scripts" / "vera_doctor_professor_ci_gate.py").exists():
-        raise SystemExit(f"Missing CI gate under vera root: {vera_root}")
-    if not (harness_root / "doctor_clinic.py").exists():
-        raise SystemExit(f"Missing Doctor harness root: {harness_root}")
+    default_harness_root = _default_harness_root()
+    harness_root = Path(args.harness_root).expanduser().resolve() if args.harness_root else (
+        default_harness_root.resolve() if default_harness_root else None
+    )
+    default_external_ci_gate = _default_external_ci_gate(vera_root)
+    external_ci_gate = Path(args.external_ci_gate).expanduser().resolve() if args.external_ci_gate else (
+        default_external_ci_gate.resolve() if default_external_ci_gate else None
+    )
 
     state_path = Path(args.state_file) if Path(args.state_file).is_absolute() else (vera_root / args.state_file)
     events_path = Path(args.events_log) if Path(args.events_log).is_absolute() else (vera_root / args.events_log)
@@ -1156,6 +1550,114 @@ def main() -> int:
     logs_root = Path(args.logs_root) if Path(args.logs_root).is_absolute() else (vera_root / args.logs_root)
     lock_path = Path(args.lock_file) if Path(args.lock_file).is_absolute() else (vera_root / args.lock_file)
 
+    local_now = _resolve_local_now(args.now_override)
+    transcripts_dir = (
+        Path(args.transcripts_dir).expanduser().resolve()
+        if str(args.transcripts_dir or "").strip()
+        else (vera_root / "vera_memory" / "transcripts")
+    )
+    state = _load_state(state_path)
+    ledger = state.get("commitments")
+    if not isinstance(ledger, dict):
+        ledger = {}
+        state["commitments"] = ledger
+    _reconcile_ledger_from_events(state, events_path)
+
+    actions_payload = _load_actions(actions_path)
+    actions = actions_payload.get("actions")
+    if not isinstance(actions, dict):
+        actions = {}
+        actions_payload["actions"] = actions
+    _reconcile_action_terminal_statuses(actions=actions, ledger=ledger, action_events_path=None)
+    commitments = _scan_commitments(transcripts_dir, lookback_hours=args.lookback_hours, now_local=local_now)
+    commitments = _augment_commitments_with_open_actions(commitments, ledger=ledger, actions=actions)
+    if str(args.only_commitment_id or "").strip():
+        target_commitment_id = str(args.only_commitment_id).strip()
+        commitments = [
+            item for item in commitments
+            if str(item.get("commitment_id") or "") == target_commitment_id
+        ]
+    workflow_catalog = _load_workflow_catalog(workflow_catalog_path, learned_workflows_path)
+    workflow_specs = workflow_catalog.get("workflows")
+    if not isinstance(workflow_specs, dict):
+        workflow_specs = {}
+
+    now_utc = _utc_now()
+    grace_cutoff = local_now - dt.timedelta(minutes=max(0.0, float(args.grace_minutes)))
+    cooldown = dt.timedelta(minutes=max(0.0, float(args.attempt_cooldown_minutes)))
+
+    conversation_ids = {str(item["conversation_id"]) for item in commitments}
+    tool_calls_by_conversation, decisions_by_conversation = _collect_execution_evidence(
+        vera_root=vera_root,
+        conversation_ids=conversation_ids,
+    )
+
+    for commitment in commitments:
+        commitment_id = str(commitment["commitment_id"])
+        workflow_match = _infer_workflow(str(commitment.get("content") or ""), workflow_specs)
+        workflow_name = str(workflow_match.get("name") or "autonomy_followthrough")
+        workflow_spec = workflow_specs.get(workflow_name, workflow_specs.get("autonomy_followthrough", {}))
+        if commitment_id not in ledger:
+            ledger[commitment_id] = {
+                "commitment_id": commitment_id,
+                "conversation_id": commitment["conversation_id"],
+                "commitment_ts_epoch": commitment["ts_epoch"],
+                "commitment_at_local": commitment["at_local_iso"],
+                "source": commitment["source"],
+                "content_excerpt": commitment["content_excerpt"],
+                "status": "pending",
+                "attempt_count": 0,
+                "last_attempt_utc": "",
+                "last_attempt_result": {},
+                "artifacts_dir": "",
+            }
+
+        action = actions.get(commitment_id)
+        if not isinstance(action, dict):
+            action = {
+                "action_id": commitment_id,
+                "commitment_id": commitment_id,
+                "conversation_id": commitment["conversation_id"],
+                "workflow_name": workflow_name,
+                "workflow_confidence": float(workflow_match.get("confidence") or 0.0),
+                "workflow_match_source": str(workflow_match.get("source") or ""),
+                "workflow_matched_keywords": list(workflow_match.get("matched_keywords") or []),
+                "workflow_required_tools": list(workflow_spec.get("required_tools") or []),
+                "workflow_catalog_version": int(workflow_spec.get("catalog_version") or workflow_catalog.get("version") or 1),
+                "workflow_steps": _build_workflow_steps(workflow_spec),
+                "source": commitment["source"],
+                "content_excerpt": commitment["content_excerpt"],
+                "commitment_at_local": commitment["at_local_iso"],
+                "schedule_start_local": commitment.get("schedule_start_local", ""),
+                "schedule_end_local": commitment.get("schedule_end_local", ""),
+                "schedule_parse": commitment.get("schedule_parse", ""),
+                "status": "planned",
+                "status_reason": "new_commitment",
+                "evidence": {},
+                "completed_via_executor": False,
+                "created_at_utc": _utc_iso(),
+                "updated_at_utc": _utc_iso(),
+            }
+            actions[commitment_id] = action
+
+    if args.probe_due:
+        summary = _probe_due_followthrough_actions(
+            commitments=commitments,
+            ledger=ledger,
+            actions=actions,
+            workflow_specs=workflow_specs,
+            tool_calls_by_conversation=tool_calls_by_conversation,
+            decisions_by_conversation=decisions_by_conversation,
+            now_local=local_now,
+            now_utc=now_utc,
+            grace_cutoff=grace_cutoff,
+            cooldown=cooldown,
+            default_window_hours=float(args.default_window_hours),
+            max_actions=max(1, int(args.max_runs_per_pass)),
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=True))
+        return 0
+
     lock_handle = _acquire_lock(lock_path)
     if lock_handle is None:
         print(
@@ -1168,41 +1670,11 @@ def main() -> int:
         return 0
 
     try:
-        transcripts_dir = vera_root / "vera_memory" / "transcripts"
-        commitments = _scan_commitments(transcripts_dir, lookback_hours=args.lookback_hours)
-
-        state = _load_state(state_path)
-        ledger = state.get("commitments")
-        if not isinstance(ledger, dict):
-            ledger = {}
-            state["commitments"] = ledger
-        _reconcile_ledger_from_events(state, events_path)
-
-        actions_payload = _load_actions(actions_path)
-        actions = actions_payload.get("actions")
-        if not isinstance(actions, dict):
-            actions = {}
-            actions_payload["actions"] = actions
-        workflow_catalog = _load_workflow_catalog(workflow_catalog_path, learned_workflows_path)
-        workflow_specs = workflow_catalog.get("workflows")
-        if not isinstance(workflow_specs, dict):
-            workflow_specs = {}
         workflow_stats = _load_workflow_stats(workflow_stats_path)
         if not workflow_catalog_path.exists():
             _save_json_file(workflow_catalog_path, DEFAULT_WORKFLOW_CATALOG)
         if not learned_workflows_path.exists():
             _save_json_file(learned_workflows_path, {"version": 1, "workflows": [], "updated_at_utc": _utc_iso()})
-
-        conversation_ids = {str(item["conversation_id"]) for item in commitments}
-        tool_calls_by_conversation, decisions_by_conversation = _collect_execution_evidence(
-            vera_root=vera_root,
-            conversation_ids=conversation_ids,
-        )
-
-        now_utc = _utc_now()
-        now_local = dt.datetime.now()
-        grace_cutoff = now_local - dt.timedelta(minutes=max(0.0, float(args.grace_minutes)))
-        cooldown = dt.timedelta(minutes=max(0.0, float(args.attempt_cooldown_minutes)))
 
         for commitment in commitments:
             commitment_id = str(commitment["commitment_id"])
@@ -1352,82 +1824,17 @@ def main() -> int:
             action = actions.get(commitment_id)
             if not isinstance(entry, dict) or not isinstance(action, dict):
                 continue
-
-            evidence = _count_window_evidence(
+            _update_action_runtime_state(
                 commitment=commitment,
+                entry=entry,
+                action=action,
+                now_local=now_local,
+                grace_cutoff=grace_cutoff,
+                action_events_path=action_events_path,
                 tool_calls_by_conversation=tool_calls_by_conversation,
                 decisions_by_conversation=decisions_by_conversation,
-                default_window_hours=_workflow_effective_window_hours(
-                    action=action,
-                    workflow_specs=workflow_specs,
-                    fallback_hours=float(args.default_window_hours),
-                ),
-            )
-            action["evidence"] = {**evidence, "last_checked_local": now_local.isoformat(timespec="seconds")}
-            required_tools = action.get("workflow_required_tools")
-            if isinstance(required_tools, list) and required_tools:
-                observed_tools = set()
-                for row in tool_calls_by_conversation.get(str(action.get("conversation_id") or ""), []):
-                    if isinstance(row, dict):
-                        observed_tools.add(str(row.get("tool_name") or ""))
-                missing_required = [tool for tool in required_tools if tool not in observed_tools]
-            else:
-                missing_required = []
-            action["missing_required_tools"] = missing_required
-
-            schedule_start = _parse_local_iso(str(action.get("schedule_start_local") or ""))
-            schedule_end = _parse_local_iso(str(action.get("schedule_end_local") or ""))
-            has_schedule = schedule_start is not None and schedule_end is not None and schedule_end > schedule_start
-            legacy_completed_verified = False
-            if str(entry.get("status") or "") == "completed":
-                last_result = entry.get("last_attempt_result")
-                if isinstance(last_result, dict) and bool(last_result.get("manifest_overall_ok") is True):
-                    legacy_completed_verified = True
-                if bool(action.get("completed_via_executor") is True):
-                    legacy_completed_verified = True
-
-            if evidence["has_execution_evidence"]:
-                _set_action_status(action=action, new_status="completed", reason="execution_evidence_in_window", action_events_path=action_events_path)
-                if str(entry.get("status") or "") != "completed":
-                    entry["status"] = "completed"
-                    entry["last_attempt_utc"] = _utc_iso()
-                    entry["last_attempt_result"] = {
-                        "evidence_only": True,
-                        "tool_call_count": evidence["tool_call_count"],
-                        "blocked_attempt_count": evidence["blocked_attempt_count"],
-                        "window_start_local": evidence["window_start_local"],
-                        "window_end_local": evidence["window_end_local"],
-                    }
-            elif str(entry.get("status") or "") == "completed" and legacy_completed_verified:
-                _set_action_status(action=action, new_status="completed", reason="ledger_completed_verified", action_events_path=action_events_path)
-            elif str(entry.get("status") or "") == "completed":
-                if has_schedule and schedule_end is not None and now_local > schedule_end:
-                    _set_action_status(action=action, new_status="missed", reason="legacy_completed_without_verification", action_events_path=action_events_path)
-                else:
-                    _set_action_status(action=action, new_status="planned", reason="legacy_completed_without_verification", action_events_path=action_events_path)
-            elif str(entry.get("status") or "") == "failed":
-                _set_action_status(action=action, new_status="failed", reason="executor_failed", action_events_path=action_events_path)
-            elif has_schedule:
-                if now_local < schedule_start:
-                    _set_action_status(action=action, new_status="planned", reason="before_schedule_window", action_events_path=action_events_path)
-                elif schedule_start <= now_local <= schedule_end:
-                    _set_action_status(action=action, new_status="running", reason="within_schedule_window", action_events_path=action_events_path)
-                else:
-                    _set_action_status(action=action, new_status="missed", reason="schedule_window_elapsed_without_evidence", action_events_path=action_events_path)
-            else:
-                if commitment["at_local"] > grace_cutoff:
-                    _set_action_status(action=action, new_status="planned", reason="within_grace_period", action_events_path=action_events_path)
-                else:
-                    window_end = _parse_local_iso(evidence["window_end_local"])
-                    if window_end is not None and now_local > window_end:
-                        _set_action_status(action=action, new_status="missed", reason="default_window_elapsed_without_evidence", action_events_path=action_events_path)
-                    else:
-                        _set_action_status(action=action, new_status="planned", reason="awaiting_execution_evidence", action_events_path=action_events_path)
-            _sync_action_step_statuses(
-                action=action,
-                evidence=evidence,
-                now_local=now_local,
-                action_events_path=action_events_path,
+                workflow_specs=workflow_specs,
+                fallback_window_hours=float(args.default_window_hours),
             )
 
         for commitment in commitments:
@@ -1439,20 +1846,16 @@ def main() -> int:
             action = actions.get(commitment_id)
             if not isinstance(entry, dict) or not isinstance(action, dict):
                 continue
-            if str(entry.get("status") or "") == "completed":
-                continue
-
-            action_status = str(action.get("status") or "")
-            schedule_end = _parse_local_iso(str(action.get("schedule_end_local") or ""))
-            has_schedule = schedule_end is not None
-
-            if has_schedule and schedule_end is not None and now_local <= schedule_end and action_status in {"planned", "running"}:
-                continue
-            if not has_schedule and commitment["at_local"] > grace_cutoff:
-                continue
-
-            last_attempt = _parse_utc_iso(str(entry.get("last_attempt_utc") or ""))
-            if last_attempt is not None and (now_utc - last_attempt) < cooldown:
+            decision = _followthrough_due_decision(
+                commitment=commitment,
+                entry=entry,
+                action=action,
+                now_local=now_local,
+                now_utc=now_utc,
+                grace_cutoff=grace_cutoff,
+                cooldown=cooldown,
+            )
+            if not decision.get("due"):
                 continue
 
             runs_attempted += 1
@@ -1480,6 +1883,7 @@ def main() -> int:
             rc, stdout_text, stderr_text, manifest_path, manifest = _run_executor_bundle(
                 vera_root=vera_root,
                 harness_root=harness_root,
+                external_ci_gate=external_ci_gate,
                 base_url=args.base_url,
                 run_dir=run_dir,
                 timeout_s=float(args.executor_timeout),

@@ -5,7 +5,7 @@
 
   "filesystem": {
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/nizbot-macmini/projects/Vera_2.0", "/tmp"],
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", ".", "/tmp"],
     "env": {},
     "auto_start": true,
     "startup_grace": 5,
@@ -113,7 +113,7 @@
     "command": "scripts/run_obsidian_mcp.sh",
     "args": [],
     "env": {
-      "OBSIDIAN_VAULT_PATH": "/home/nizbot-macmini/Documents/Veras_Vault"
+      "OBSIDIAN_VAULT_PATH": "${OBSIDIAN_VAULT_PATH}"
     },
     "required_env": ["OBSIDIAN_VAULT_PATH"],
     "auto_start": true,
