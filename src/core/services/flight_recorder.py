@@ -10,17 +10,27 @@ with lightweight AIR (Automatic Intermediate Reward) scoring.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import threading
 import uuid
 import gzip
 import shutil
+import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import copy
+
+logger = logging.getLogger(__name__)
+
+try:
+    from memory.persistence.atomic_io import atomic_ndjson_append
+    HAS_ATOMIC_APPEND = True
+except Exception:
+    HAS_ATOMIC_APPEND = False
 
 try:
     from learning.reward_model import DEFAULT_MODEL_PATH, RewardModel, load_reward_model
@@ -48,6 +58,155 @@ def _json_dumps(value: Any) -> str:
         return json.dumps(value, ensure_ascii=True, default=str)
     except Exception:
         return str(value)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _compute_ledger_hash_self(record: Dict[str, Any]) -> str:
+    payload = {k: v for k, v in record.items() if k != "hash_self"}
+    return _sha256_hex(_canonical_json(payload))
+
+
+def _read_last_nonempty_json_line(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except Exception:
+        return None
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except Exception:
+            return None
+    return None
+
+
+def _read_last_nonempty_json_line_from_lines(lines: List[str]) -> Optional[Dict[str, Any]]:
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except Exception:
+            return None
+    return None
+
+
+def verify_flight_ledger(
+    ledger_path: Path,
+    *,
+    cross_check_source: bool = False,
+    max_errors: int = 10,
+) -> Dict[str, Any]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    records = 0
+    prev_hash: Optional[str] = None
+
+    if not ledger_path.exists():
+        return {
+            "ok": False,
+            "records": 0,
+            "errors": [f"ledger_missing:{ledger_path}"],
+            "warnings": [],
+            "exit_code": 30,
+        }
+
+    def _find_source_event(source_path: Path, event_uuid: str) -> Optional[Dict[str, Any]]:
+        if not source_path.exists() or not event_uuid:
+            return None
+        try:
+            with source_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(obj.get("uuid") or "") == event_uuid:
+                        return obj
+        except Exception:
+            return None
+        return None
+
+    with ledger_path.open("r", encoding="utf-8") as handle:
+        for line_num, line in enumerate(handle, 1):
+            line = line.strip()
+            if not line:
+                continue
+            records += 1
+            try:
+                record = json.loads(line)
+            except Exception:
+                errors.append(f"line_{line_num}:invalid_json")
+                if len(errors) >= max_errors:
+                    break
+                continue
+
+            record_type = str(record.get("record_type") or "")
+            hash_prev = str(record.get("hash_prev") or "")
+            hash_self = str(record.get("hash_self") or "")
+
+            if records == 1:
+                if record_type != "GENESIS":
+                    errors.append(f"line_{line_num}:missing_genesis")
+                if hash_prev != ("0" * 64):
+                    errors.append(f"line_{line_num}:genesis_prev_hash_invalid")
+            elif prev_hash and hash_prev != prev_hash:
+                errors.append(f"line_{line_num}:hash_prev_mismatch")
+
+            expected_hash = _compute_ledger_hash_self(record)
+            if hash_self != expected_hash:
+                errors.append(f"line_{line_num}:hash_self_mismatch")
+
+            if cross_check_source and record_type != "GENESIS":
+                source_file = Path(str(record.get("source_file") or ""))
+                event_uuid = str(record.get("event_uuid") or "")
+                source_obj = _find_source_event(source_file, event_uuid)
+                if source_obj is None:
+                    warnings.append(f"line_{line_num}:source_event_missing")
+                else:
+                    payload_sha256 = str(record.get("payload_sha256") or "")
+                    source_sha256 = _sha256_hex(_canonical_json(source_obj))
+                    if payload_sha256 != source_sha256:
+                        errors.append(f"line_{line_num}:payload_sha256_mismatch")
+
+            prev_hash = hash_self
+            if len(errors) >= max_errors:
+                break
+
+    exit_code = 30 if errors else (20 if warnings else 0)
+    return {
+        "ok": not errors,
+        "records": records,
+        "errors": errors,
+        "warnings": warnings,
+        "exit_code": exit_code,
+    }
 
 
 @dataclass
@@ -79,6 +238,7 @@ class FlightRecorder:
 
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.transitions_path = self.base_dir / "transitions.ndjson"
+        self.ledger_path = self.base_dir / "ledger.jsonl"
         self._max_mb = self._safe_env_float("VERA_FLIGHT_RECORDER_MAX_MB", 50.0, minimum=1.0)
         self._max_backups = self._safe_env_int("VERA_FLIGHT_RECORDER_MAX_BACKUPS", 2, minimum=1)
         self._compress_backups = os.getenv("VERA_FLIGHT_RECORDER_COMPRESS_BACKUPS", "1").lower() in {
@@ -88,8 +248,10 @@ class FlightRecorder:
             "on",
         }
         self._compression_level = self._safe_env_int("VERA_FLIGHT_RECORDER_GZIP_LEVEL", 6, minimum=1, maximum=9)
+        self._ledger_enabled = os.getenv("VERA_FLIGHT_LEDGER_ENABLED", "1").lower() not in {"0", "false", "off"}
         self._lock = threading.Lock()
         self._last_tool_hash: Dict[str, str] = {}
+        self._ledger_last_hash: Optional[str] = None
         self._reward_model_enabled = os.getenv("VERA_REWARD_MODEL_ENABLED", "0") == "1"
         self._reward_model_path = Path(os.getenv("VERA_REWARD_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
         self._reward_model: Optional[RewardModel] = None
@@ -209,6 +371,99 @@ class FlightRecorder:
             self._rotate_if_needed()
             with self.transitions_path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+            if self._ledger_enabled:
+                try:
+                    self._append_ledger_record_locked(payload)
+                except Exception as exc:
+                    logger.warning("flight ledger append failed: %s", exc)
+
+    def _append_ledger_line_locked(self, handle: Any, record: Dict[str, Any]) -> None:
+        line = _canonical_json(record)
+        handle.write(line + "\n")
+
+    def _ledger_summary(self, payload: Dict[str, Any]) -> str:
+        record_type = str(payload.get("type") or "transition")
+        action = payload.get("action") or {}
+        result = payload.get("result") or {}
+        if isinstance(action, dict):
+            if record_type == "transition":
+                action_type = str(action.get("type") or "")
+                tool_name = str(action.get("tool_name") or "")
+                model = str(action.get("model") or "")
+                if tool_name:
+                    return _truncate(f"{record_type}:{action_type}:{tool_name}", 160)
+                if model:
+                    return _truncate(f"{record_type}:{action_type}:{model}", 160)
+                if action_type:
+                    return _truncate(f"{record_type}:{action_type}", 160)
+        success = ""
+        if isinstance(result, dict) and "success" in result:
+            success = f":success={bool(result.get('success'))}"
+        return _truncate(f"{record_type}{success}", 160)
+
+    def _ledger_meta(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        action = payload.get("action") or {}
+        meta = payload.get("meta") or {}
+        compact = {
+            "action_type": str((action or {}).get("type") or ""),
+            "tool_name": str((action or {}).get("tool_name") or ""),
+            "model": str((action or {}).get("model") or ""),
+            "success": bool((meta or {}).get("success")) if "success" in (meta or {}) else None,
+            "air_score": payload.get("air_score"),
+            "air_reason": str(payload.get("air_reason") or ""),
+            "latency_ms": (meta or {}).get("latency_ms"),
+        }
+        return {k: v for k, v in compact.items() if v not in ("", None)}
+
+    def _append_ledger_record_locked(self, payload: Dict[str, Any]) -> None:
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.ledger_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.seek(0)
+                lines = handle.readlines()
+                last_record = _read_last_nonempty_json_line_from_lines(lines)
+                last_hash = str((last_record or {}).get("hash_self") or "")
+                if not last_hash:
+                    genesis = {
+                        "ledger_version": 1,
+                        "timestamp_utc": _utc_now_iso(),
+                        "record_type": "GENESIS",
+                        "event_uuid": "",
+                        "source_file": "",
+                        "source_kind": "flight_recorder",
+                        "hash_prev": "0" * 64,
+                        "hash_self": "",
+                        "payload_sha256": "",
+                        "summary": "flight ledger genesis",
+                        "meta": {},
+                    }
+                    genesis["hash_self"] = _compute_ledger_hash_self(genesis)
+                    handle.seek(0, os.SEEK_END)
+                    self._append_ledger_line_locked(handle, genesis)
+                    last_hash = genesis["hash_self"]
+                source_sha256 = _sha256_hex(_canonical_json(payload))
+                record = {
+                    "ledger_version": 1,
+                    "timestamp_utc": _utc_now_iso(),
+                    "record_type": str(payload.get("type") or "transition"),
+                    "event_uuid": str(payload.get("uuid") or str(uuid.uuid4())),
+                    "source_file": str(self.transitions_path),
+                    "source_kind": "flight_recorder",
+                    "hash_prev": last_hash or ("0" * 64),
+                    "hash_self": "",
+                    "payload_sha256": source_sha256,
+                    "summary": self._ledger_summary(payload),
+                    "meta": self._ledger_meta(payload),
+                }
+                record["hash_self"] = _compute_ledger_hash_self(record)
+                handle.seek(0, os.SEEK_END)
+                self._append_ledger_line_locked(handle, record)
+                handle.flush()
+                os.fsync(handle.fileno())
+                self._ledger_last_hash = record["hash_self"]
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _air_score_tool(
         self,
