@@ -165,7 +165,7 @@ export const saveMessages = async () => {
     getConversationTitle(
       selectedModel.value || 'open-ai-format',
       messages.value,
-      localStorage.getItem('localModelName') || localModelName.value || 'grok-4-1-fast-reasoning',
+      localStorage.getItem('localModelName') || localModelName.value || 'grok-4.20-experimental-beta-0304-reasoning',
       localStorage.getItem('localModelEndpoint') || localModelEndpoint.value || window.location.origin,
       localStorage.getItem('gpt-attitude') || 50
     )
@@ -598,7 +598,7 @@ SUMMARY:`;
 
   try {
     const endpoint = removeAPIEndpoints(localStorage.getItem('localModelEndpoint') || window.location.origin);
-    const modelName = localStorage.getItem('localModelName') || 'grok-4-1-fast-reasoning';
+    const modelName = localStorage.getItem('localModelName') || 'grok-4.20-experimental-beta-0304-reasoning';
 
     const response = await fetchOpenAICompatibleResponse(
       [{ role: 'user', content: summaryPrompt }],

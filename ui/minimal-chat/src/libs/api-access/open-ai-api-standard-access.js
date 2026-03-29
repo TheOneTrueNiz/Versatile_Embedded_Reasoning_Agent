@@ -14,7 +14,7 @@ const TITLE_MAX_TOKENS = 18;
 const DEFAULT_IMAGE_COUNT = 2;
 const DEFAULT_IMAGE_SIZE = '256x256';
 const FALLBACK_MODELS = [
-    { id: 'grok-4-1-fast-reasoning', name: 'grok-4-1-fast-reasoning' },
+    { id: 'grok-4.20-experimental-beta-0304-reasoning', name: 'grok-4.20-experimental-beta-0304-reasoning' },
     { id: 'grok-4-1-fast', name: 'grok-4-1-fast' },
     { id: 'grok-code-fast-1', name: 'grok-code-fast-1' },
     { id: 'grok-3', name: 'grok-3' },
@@ -29,6 +29,20 @@ const retryCounters = {
     imageGen: 0,
     videoGen: 0,
     title: 0
+};
+
+const isReasoningModel = (model = '') => {
+    const name = String(model || '').toLowerCase();
+    if (!name) {
+        return false;
+    }
+    if (name.includes('non-reasoning')) {
+        return false;
+    }
+    if (name.includes('reasoning')) {
+        return true;
+    }
+    return name.includes('o1') || name.includes('o3');
 };
 
 // Helper Functions
@@ -66,7 +80,7 @@ const createMessagePayload = (messages, model, options = {}) => {
         ...extraPayload
     };
 
-    return model.includes('o1') || model.includes('o3')
+    return isReasoningModel(model)
         ? reasoningPayload
         : standardPayload;
 };

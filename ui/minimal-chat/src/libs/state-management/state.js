@@ -42,6 +42,23 @@ const parseStoredJson = (key, fallback) => {
     }
 };
 
+const MODEL_ALIASES = {
+    'grok-4-1-fast-reasoning': 'grok-4.20-experimental-beta-0304-reasoning'
+};
+
+const normalizeStoredModelName = (value, fallback = 'grok-4.20-experimental-beta-0304-reasoning') => {
+    const raw = (value || '').trim();
+    if (!raw) {
+        return fallback;
+    }
+    return MODEL_ALIASES[raw] || raw;
+};
+
+const persistedLocalModelName = normalizeStoredModelName(localStorage.getItem('localModelName'));
+if (persistedLocalModelName !== (localStorage.getItem('localModelName') || '')) {
+    localStorage.setItem('localModelName', persistedLocalModelName);
+}
+
 export const pushToTalkMode = ref((JSON.parse(localStorage.getItem("use-push-to-talk")) || false));
 export const useWhisper = ref((JSON.parse(localStorage.getItem("use-whisper") || false)));
 export const audioSpeed = ref((parseFloat(localStorage.getItem("audio-speed")) || 1.0));
@@ -51,7 +68,7 @@ export const whisperTemperature = ref(parseFloat(localStorage.getItem("whisper-t
 export const audioQueue = ref([]);
 export const audioIsPlaying = ref(false);
 export const availableModels = ref([
-    { id: 'grok-4-1-fast-reasoning', name: 'grok-4-1-fast-reasoning' },
+    { id: 'grok-4.20-experimental-beta-0304-reasoning', name: 'grok-4.20-experimental-beta-0304-reasoning' },
     { id: 'grok-4-1-fast', name: 'grok-4-1-fast' },
     { id: 'grok-code-fast-1', name: 'grok-code-fast-1' },
     { id: 'grok-3', name: 'grok-3' },
@@ -92,7 +109,7 @@ export const quorumUiMode = ref(null);
 export const quorumUiActive = ref(false);
 
 export const localModelKey = ref(localStorage.getItem('localModelKey') || '');
-export const localModelName = ref(localStorage.getItem('localModelName') || 'grok-4-1-fast-reasoning');
+export const localModelName = ref(persistedLocalModelName);
 export const localModelEndpoint = ref(removeAPIEndpoints(localStorage.getItem('localModelEndpoint') || window.location.origin));
 export const localSliderValue = ref(parseFloat(localStorage.getItem('local-attitude')) || 0.6);
 export const gptKey = ref(localStorage.getItem('gptKey') || '');
