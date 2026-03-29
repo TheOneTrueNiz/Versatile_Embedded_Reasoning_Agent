@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy", action="append", dest="policies", help="Optional rollout policy variant. Repeat for multiple policies.")
     parser.add_argument("--include-archived", action="store_true", help="Search archived work-jar items too.")
     parser.add_argument("--artifact", default="", help="Optional artifact override path.")
+    parser.add_argument("--promote", action="store_true", help="Promote the preferred comparison policy into the rollout policy registry.")
     return parser.parse_args()
 
 
@@ -34,6 +35,7 @@ def main() -> int:
         include_archived=bool(args.include_archived),
         artifact_override=artifact_override,
         policies=list(args.policies or []),
+        promote=bool(args.promote),
     )
     print(json.dumps(result, indent=2, ensure_ascii=True))
     return 0

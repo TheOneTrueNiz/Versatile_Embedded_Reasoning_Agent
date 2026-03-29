@@ -1400,6 +1400,303 @@ def test_compare_work_item_rollout_prefers_strict_archive_policy(tmp_path: Path)
     assert len(result["comparisons"]) == 2
 
 
+def test_compare_work_item_rollout_can_promote_registry_entry(tmp_path: Path) -> None:
+    archive = tmp_path / "improvement_archive.json"
+    _write_json(
+        archive,
+        {
+            "version": 1,
+            "updated_at_utc": "2026-03-28T00:00:00Z",
+            "entries": [
+                {
+                    "archive_id": "ia_exact_signature",
+                    "created_at_utc": "2026-03-26T20:47:24Z",
+                    "title": "Exact signature match",
+                    "failure_class": "tool_routing_noise",
+                    "problem_signature": "preview:web_research:browser_noise",
+                    "intervention_type": "routing_rule",
+                    "source_work_item_id": "awj_web_research_shortlist_cleanup_01",
+                    "source_task_id": "TASK-TEST-1",
+                    "proof_artifact": "tmp/audits/exact.json",
+                    "files_changed": ["src/orchestration/llm_bridge.py"],
+                    "success_evidence": {"artifact_exists": True},
+                    "proof_check": {"artifact_exists": True, "reason": "ok"},
+                    "reuse_rule": "Exact signature candidate",
+                    "rollout_guard": "suggest_only_same_failure_class",
+                    "status": "active",
+                }
+            ],
+        },
+    )
+    memory_dir = tmp_path / "vera_memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(memory_dir / "improvement_archive.json", json.loads(archive.read_text(encoding="utf-8")))
+    work_jar = tmp_path / "autonomy_work_jar.json"
+    _write_json(
+        work_jar,
+        {
+            "version": 1,
+            "items": [
+                {
+                    "id": "awj_archive_policy_promote_probe_01",
+                    "title": "Archive policy promote probe",
+                    "objective": "Verify archive suggestions attach to queued work creation.",
+                    "context": "archive suggestions\nsuggest_only",
+                    "tool_choice": "none",
+                    "status": "pending",
+                    "completion_contract": {
+                        "kind": "markers",
+                        "match_mode": "all",
+                        "required_markers": ["archive suggestions", "suggest_only"],
+                    },
+                    "metadata": {
+                        "archive_query": {
+                            "problem_signature": "preview:web_research:browser_noise",
+                            "failure_class": "tool_routing_noise",
+                            "limit": 5,
+                        }
+                    },
+                }
+            ],
+            "archived_items": [],
+        },
+    )
+    service = RolloutService(
+        RolloutPaths(
+            work_jar_path=work_jar,
+            output_dir=memory_dir / "rollouts",
+            flight_recorder_dir=memory_dir / "flight_recorder",
+            registry_path=memory_dir / "rollout_policy_registry.json",
+        )
+    )
+    result = service.compare_work_item_rollout(
+        item_id="awj_archive_policy_promote_probe_01",
+        modes=["auto"],
+        policies=["strict_signature", "relaxed_failure_class"],
+        promote=True,
+    )
+
+    assert result["ok"] is True
+    promotion = dict(result.get("registry_promotion") or {})
+    assert promotion["ok"] is True
+    assert promotion["entry_key"] == "executor_kind:improvement_archive_suggest"
+    registry = service.load_policy_registry()
+    entry = dict((registry.get("entries") or {}).get("executor_kind:improvement_archive_suggest") or {})
+    assert entry["preferred_policy"] == "strict_signature"
+    assert entry["preferred_mode"] == "auto"
+    assert entry["source_work_item_id"] == "awj_archive_policy_promote_probe_01"
+
+
+def test_run_work_item_rollout_registry_mode_uses_promoted_policy(tmp_path: Path) -> None:
+    archive = tmp_path / "improvement_archive.json"
+    _write_json(
+        archive,
+        {
+            "version": 1,
+            "updated_at_utc": "2026-03-28T00:00:00Z",
+            "entries": [
+                {
+                    "archive_id": "ia_exact_signature",
+                    "created_at_utc": "2026-03-26T20:47:24Z",
+                    "title": "Exact signature match",
+                    "failure_class": "tool_routing_noise",
+                    "problem_signature": "preview:web_research:browser_noise",
+                    "intervention_type": "routing_rule",
+                    "source_work_item_id": "awj_web_research_shortlist_cleanup_01",
+                    "source_task_id": "TASK-TEST-1",
+                    "proof_artifact": "tmp/audits/exact.json",
+                    "files_changed": ["src/orchestration/llm_bridge.py"],
+                    "success_evidence": {"artifact_exists": True},
+                    "proof_check": {"artifact_exists": True, "reason": "ok"},
+                    "reuse_rule": "Exact signature candidate",
+                    "rollout_guard": "suggest_only_same_failure_class",
+                    "status": "active",
+                }
+            ],
+        },
+    )
+    memory_dir = tmp_path / "vera_memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(memory_dir / "improvement_archive.json", json.loads(archive.read_text(encoding="utf-8")))
+    _write_json(
+        memory_dir / "rollout_policy_registry.json",
+        {
+            "version": 1,
+            "entries": {
+                "executor_kind:improvement_archive_suggest": {
+                    "scope": "executor_kind",
+                    "executor_kind": "improvement_archive_suggest",
+                    "preferred_mode": "auto",
+                    "preferred_policy": "strict_signature",
+                    "source_work_item_id": "awj_archive_policy_promote_probe_01",
+                }
+            },
+        },
+    )
+    work_jar = tmp_path / "autonomy_work_jar.json"
+    _write_json(
+        work_jar,
+        {
+            "version": 1,
+            "items": [
+                {
+                    "id": "awj_archive_policy_registry_probe_01",
+                    "title": "Archive policy registry probe",
+                    "objective": "Verify archive suggestions attach to queued work creation.",
+                    "context": "archive suggestions\nsuggest_only",
+                    "tool_choice": "none",
+                    "status": "pending",
+                    "completion_contract": {
+                        "kind": "markers",
+                        "match_mode": "all",
+                        "required_markers": ["archive suggestions", "suggest_only"],
+                    },
+                    "metadata": {
+                        "archive_query": {
+                            "problem_signature": "preview:web_research:browser_noise",
+                            "failure_class": "tool_routing_noise",
+                            "limit": 5,
+                        }
+                    },
+                }
+            ],
+            "archived_items": [],
+        },
+    )
+    service = RolloutService(
+        RolloutPaths(
+            work_jar_path=work_jar,
+            output_dir=memory_dir / "rollouts",
+            flight_recorder_dir=memory_dir / "flight_recorder",
+            registry_path=memory_dir / "rollout_policy_registry.json",
+        )
+    )
+    result = service.run_work_item_rollout(
+        item_id="awj_archive_policy_registry_probe_01",
+        mode="registry",
+    )
+
+    assert result["ok"] is True
+    assert result["effective_mode"] == "auto"
+    assert result["mode_source"] == "registry"
+    assert result["effective_policy"] == "strict_signature"
+    assert result["policy_source"] == "registry"
+    assert result["envelope"]["metadata"]["rollout_policy"] == "strict_signature"
+
+
+def test_run_work_item_rollout_explicit_policy_overrides_registry(tmp_path: Path) -> None:
+    archive = tmp_path / "improvement_archive.json"
+    _write_json(
+        archive,
+        {
+            "version": 1,
+            "updated_at_utc": "2026-03-28T00:00:00Z",
+            "entries": [
+                {
+                    "archive_id": "ia_exact_signature",
+                    "created_at_utc": "2026-03-26T20:47:24Z",
+                    "title": "Exact signature match",
+                    "failure_class": "tool_routing_noise",
+                    "problem_signature": "preview:web_research:browser_noise",
+                    "intervention_type": "routing_rule",
+                    "source_work_item_id": "awj_web_research_shortlist_cleanup_01",
+                    "source_task_id": "TASK-TEST-1",
+                    "proof_artifact": "tmp/audits/exact.json",
+                    "files_changed": ["src/orchestration/llm_bridge.py"],
+                    "success_evidence": {"artifact_exists": True},
+                    "proof_check": {"artifact_exists": True, "reason": "ok"},
+                    "reuse_rule": "Exact signature candidate",
+                    "rollout_guard": "suggest_only_same_failure_class",
+                    "status": "active",
+                },
+                {
+                    "archive_id": "ia_failure_class_only",
+                    "created_at_utc": "2026-03-26T20:50:24Z",
+                    "title": "Failure class only match",
+                    "failure_class": "tool_routing_noise",
+                    "problem_signature": "preview:web_research:ranking_local_video_noise",
+                    "intervention_type": "ranking_rule",
+                    "source_work_item_id": "awj_web_research_ranking_cleanup_01",
+                    "source_task_id": "TASK-TEST-2",
+                    "proof_artifact": "tmp/audits/class_only.json",
+                    "files_changed": ["src/orchestration/llm_bridge.py"],
+                    "success_evidence": {"artifact_exists": True},
+                    "proof_check": {"artifact_exists": True, "reason": "ok"},
+                    "reuse_rule": "Failure class only candidate",
+                    "rollout_guard": "suggest_only_same_problem_signature",
+                    "status": "active",
+                },
+            ],
+        },
+    )
+    memory_dir = tmp_path / "vera_memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(memory_dir / "improvement_archive.json", json.loads(archive.read_text(encoding="utf-8")))
+    _write_json(
+        memory_dir / "rollout_policy_registry.json",
+        {
+            "version": 1,
+            "entries": {
+                "executor_kind:improvement_archive_suggest": {
+                    "scope": "executor_kind",
+                    "executor_kind": "improvement_archive_suggest",
+                    "preferred_mode": "auto",
+                    "preferred_policy": "strict_signature",
+                    "source_work_item_id": "awj_archive_policy_promote_probe_01",
+                }
+            },
+        },
+    )
+    work_jar = tmp_path / "autonomy_work_jar.json"
+    _write_json(
+        work_jar,
+        {
+            "version": 1,
+            "items": [
+                {
+                    "id": "awj_archive_policy_override_probe_01",
+                    "title": "Archive policy override probe",
+                    "objective": "Verify archive suggestions attach to queued work creation.",
+                    "context": "archive suggestions\nsuggest_only",
+                    "tool_choice": "none",
+                    "status": "pending",
+                    "completion_contract": {
+                        "kind": "markers",
+                        "match_mode": "all",
+                        "required_markers": ["archive suggestions", "suggest_only"],
+                    },
+                    "metadata": {
+                        "archive_query": {
+                            "problem_signature": "preview:web_research:browser_noise",
+                            "failure_class": "tool_routing_noise",
+                            "limit": 5,
+                        }
+                    },
+                }
+            ],
+            "archived_items": [],
+        },
+    )
+    service = RolloutService(
+        RolloutPaths(
+            work_jar_path=work_jar,
+            output_dir=memory_dir / "rollouts",
+            flight_recorder_dir=memory_dir / "flight_recorder",
+            registry_path=memory_dir / "rollout_policy_registry.json",
+        )
+    )
+    result = service.run_work_item_rollout(
+        item_id="awj_archive_policy_override_probe_01",
+        mode="registry",
+        policy_override="relaxed_failure_class",
+    )
+
+    assert result["ok"] is True
+    assert result["effective_mode"] == "auto"
+    assert result["effective_policy"] == "relaxed_failure_class"
+    assert result["policy_source"] == "explicit"
+
+
 def test_compare_work_item_rollout_prefers_strict_operator_policy(tmp_path: Path) -> None:
     work_jar = tmp_path / "autonomy_work_jar.json"
     _write_json(

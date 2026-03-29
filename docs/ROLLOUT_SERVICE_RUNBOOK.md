@@ -31,6 +31,8 @@ Current phase-1 runner supports:
 - isolated local runtime action for improvement-archive operator diagnostics
 - side-by-side replay comparison across multiple modes for the same work item
 - policy-variant comparison across the same replay envelope for the major local subsystems
+- policy promotion into a local rollout policy registry
+- registry-backed replay mode that reuses promoted executor policies
 
 It does not yet do:
 - live MCP/tool execution inside the replay lane
@@ -39,19 +41,27 @@ It does not yet do:
 ## Entrypoint
 
 ```bash
-python3 scripts/vera_rollout_run.py --item-id <work_item_id> [--include-archived] [--artifact /path/to/file] [--mode auto|artifact|executor]
+python3 scripts/vera_rollout_run.py --item-id <work_item_id> [--include-archived] [--artifact /path/to/file] [--mode auto|artifact|executor|registry] [--policy <policy_name>]
 ```
 
 Comparison:
 
 ```bash
-python3 scripts/vera_rollout_compare.py --item-id <work_item_id> [--include-archived] --mode artifact --mode auto [--policy verified_only --policy verified_or_completed]
+python3 scripts/vera_rollout_compare.py --item-id <work_item_id> [--include-archived] --mode artifact --mode auto [--policy verified_only --policy verified_or_completed] [--promote]
+```
+
+Registry inspection/promotion:
+
+```bash
+python3 scripts/vera_rollout_policy_registry.py
+python3 scripts/vera_rollout_policy_registry.py --comparison tmp/audits/<comparison_artifact>.json
 ```
 
 Mode semantics:
 - `auto`: use isolated executor replay for `tool_choice=none`, otherwise fall back to artifact replay
 - `artifact`: score the best available evidence artifact only
 - `executor`: force the isolated toolless executor path
+- `registry`: reuse the promoted preferred mode for the matched executor kind, falling back to `auto`
 
 Policy semantics:
 - policies are optional and executor-specific
@@ -80,6 +90,9 @@ Policy semantics:
   - `rebuild_only_if_invalid`
   - `always_rebuild_copy`
 - policy comparison runs the same replay envelope multiple times with different policy knobs and records a preferred policy when results tie on mechanical checks
+- `--promote` stores the preferred mode/policy for the matched executor kind in:
+  - `vera_memory/rollout_policy_registry.json`
+- explicit `--policy` overrides always beat the registry
 
 ## Outputs
 

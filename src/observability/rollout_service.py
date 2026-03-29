@@ -37,11 +37,15 @@ class RolloutPaths:
     work_jar_path: Path
     output_dir: Path
     flight_recorder_dir: Path
+    registry_path: Optional[Path] = None
 
 
 class RolloutService:
     def __init__(self, paths: RolloutPaths):
         self.paths = paths
+
+    def _policy_registry_path(self) -> Path:
+        return self.paths.registry_path or (self.paths.work_jar_path.parent / "rollout_policy_registry.json")
 
     def load_work_jar(self) -> Dict[str, Any]:
         data = safe_json_read(self.paths.work_jar_path, default={}) or {}
@@ -52,6 +56,82 @@ class RolloutService:
         if not isinstance(data.get("archived_items"), list):
             data["archived_items"] = []
         return data
+
+    def load_policy_registry(self) -> Dict[str, Any]:
+        data = safe_json_read(self._policy_registry_path(), default={}) or {}
+        if not isinstance(data, dict):
+            data = {}
+        if not isinstance(data.get("entries"), dict):
+            data["entries"] = {}
+        data["version"] = 1
+        return data
+
+    def _write_policy_registry(self, payload: Dict[str, Any]) -> Path:
+        registry = dict(payload or {})
+        registry["version"] = 1
+        registry["updated_at_utc"] = utc_iso()
+        if not isinstance(registry.get("entries"), dict):
+            registry["entries"] = {}
+        path = self._policy_registry_path()
+        atomic_json_write(path, registry, indent=2)
+        return path
+
+    def _get_promoted_policy_entry(self, *, executor_kind: str) -> Dict[str, Any]:
+        normalized_kind = str(executor_kind or "").strip()
+        if not normalized_kind:
+            return {}
+        registry = self.load_policy_registry()
+        entries = dict(registry.get("entries") or {})
+        row = entries.get(f"executor_kind:{normalized_kind}")
+        return dict(row or {}) if isinstance(row, dict) else {}
+
+    def promote_comparison_result(self, comparison_result: Dict[str, Any]) -> Dict[str, Any]:
+        work_item_id = str(comparison_result.get("work_item_id") or "").strip()
+        comparisons = list(comparison_result.get("comparisons") or [])
+        preferred_rollout_id = str(comparison_result.get("preferred_rollout_id") or "").strip()
+        preferred: Dict[str, Any] = {}
+        for row in comparisons:
+            if str(row.get("rollout_id") or "").strip() == preferred_rollout_id:
+                preferred = dict(row)
+                break
+        if not preferred and comparisons:
+            preferred = dict(comparisons[0] or {})
+        executor_kind = str(preferred.get("executor_kind") or "").strip()
+        if not executor_kind and work_item_id:
+            try:
+                item = self.find_work_item(work_item_id, include_archived=True)
+            except Exception:
+                item = {}
+            executor_kind = self._select_local_executor_kind(item) if item else ""
+        if not executor_kind:
+            return {
+                "ok": False,
+                "reason": "missing_executor_kind",
+                "work_item_id": work_item_id,
+            }
+        registry = self.load_policy_registry()
+        entries = dict(registry.get("entries") or {})
+        entry_key = f"executor_kind:{executor_kind}"
+        promoted_entry = {
+            "scope": "executor_kind",
+            "executor_kind": executor_kind,
+            "preferred_mode": str(comparison_result.get("preferred_mode") or "auto"),
+            "preferred_policy": str(comparison_result.get("preferred_policy") or ""),
+            "source_work_item_id": work_item_id,
+            "comparison_rollout_id": preferred_rollout_id,
+            "comparison_finished_at_utc": str(comparison_result.get("finished_at_utc") or ""),
+            "comparisons_count": len(comparisons),
+            "promoted_at_utc": utc_iso(),
+        }
+        entries[entry_key] = promoted_entry
+        registry["entries"] = entries
+        registry_path = self._write_policy_registry(registry)
+        return {
+            "ok": True,
+            "entry_key": entry_key,
+            "registry_path": str(registry_path),
+            "entry": promoted_entry,
+        }
 
     def find_work_item(self, item_id: str, *, include_archived: bool = False) -> Dict[str, Any]:
         jar = self.load_work_jar()
@@ -1884,15 +1964,44 @@ class RolloutService:
         policy_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         item = self.find_work_item(item_id, include_archived=include_archived)
+        normalized_mode = str(mode or "auto").strip().lower()
+        tool_choice_hint = str(item.get("tool_choice") or "auto").strip().lower()
+        executor_kind_hint = self._select_local_executor_kind(item) if tool_choice_hint == "none" else ""
+        promoted_entry = self._get_promoted_policy_entry(executor_kind=executor_kind_hint)
+        effective_mode = normalized_mode
+        mode_source = "explicit"
+        if normalized_mode == "registry":
+            effective_mode = str(promoted_entry.get("preferred_mode") or "auto").strip().lower() or "auto"
+            mode_source = "registry" if str(promoted_entry.get("preferred_mode") or "").strip() else "default"
+        effective_policy = str(policy_override or "").strip().lower()
+        policy_source = "explicit" if effective_policy else "none"
+        if not effective_policy:
+            effective_policy = str(promoted_entry.get("preferred_policy") or "").strip().lower()
+            if effective_policy:
+                policy_source = "registry"
         resolution = self.resolve_best_artifact(item, artifact_override)
         artifact_path = resolution.get("artifact_path")
         envelope = self.build_work_item_envelope(
             item=item,
             artifact_path=artifact_path if isinstance(artifact_path, Path) else None,
-            policy_override=policy_override,
+            policy_override=effective_policy or None,
         )
         rollout_id = str(envelope.get("rollout_id") or f"rollout_{uuid.uuid4().hex[:16]}")
         envelope["rollout_id"] = rollout_id
+        metadata = dict(envelope.get("metadata") or {})
+        metadata["rollout_effective_mode"] = effective_mode
+        metadata["rollout_mode_source"] = mode_source
+        metadata["rollout_policy_source"] = policy_source
+        if effective_policy:
+            metadata["rollout_policy"] = effective_policy
+        if promoted_entry:
+            metadata["rollout_registry_entry"] = {
+                "executor_kind": str(promoted_entry.get("executor_kind") or ""),
+                "preferred_mode": str(promoted_entry.get("preferred_mode") or ""),
+                "preferred_policy": str(promoted_entry.get("preferred_policy") or ""),
+                "source_work_item_id": str(promoted_entry.get("source_work_item_id") or ""),
+            }
+        envelope["metadata"] = metadata
         started_at = utc_iso()
         candidate_paths = [str(p) for p in self._candidate_artifact_paths(item, artifact_override)]
         steps: List[Dict[str, Any]] = [
@@ -1900,9 +2009,13 @@ class RolloutService:
                 "step": "load_work_item",
                 "ok": True,
                 "item_id": item_id,
-                    "include_archived": include_archived,
-                    "policy_override": str(policy_override or ""),
-                },
+                "include_archived": include_archived,
+                "policy_override": str(policy_override or ""),
+                "effective_policy": effective_policy,
+                "policy_source": policy_source,
+                "effective_mode": effective_mode,
+                "mode_source": mode_source,
+            },
             {
                 "step": "resolve_artifact",
                 "ok": bool(artifact_path),
@@ -1912,9 +2025,8 @@ class RolloutService:
         ]
         artifact_score = dict(resolution.get("score") or {})
         tool_choice = str(((envelope.get("tool_policy") or {}).get("tool_choice") or "auto")).strip().lower()
-        normalized_mode = str(mode or "auto").strip().lower()
         executor_result: Dict[str, Any] = {}
-        if normalized_mode in {"auto", "executor"} and tool_choice == "none":
+        if effective_mode in {"auto", "executor"} and tool_choice == "none":
             executor_result = self._execute_toolless_work_item(item, envelope, artifact_path if isinstance(artifact_path, Path) else None, artifact_score)
             steps.append(
                 {
@@ -1968,6 +2080,10 @@ class RolloutService:
                 "steps": steps,
             },
             "score": score,
+            "effective_mode": effective_mode,
+            "mode_source": mode_source,
+            "effective_policy": effective_policy,
+            "policy_source": policy_source,
         }
         if executor_result:
             result["executor_result"] = executor_result
@@ -1986,6 +2102,7 @@ class RolloutService:
         include_archived: bool = False,
         artifact_override: Optional[Path] = None,
         policies: Optional[List[str]] = None,
+        promote: bool = False,
     ) -> Dict[str, Any]:
         normalized_modes: List[str] = []
         for mode in modes:
@@ -2042,7 +2159,7 @@ class RolloutService:
                 row.get("mode") != "auto",
             ),
         )[0]
-        return {
+        result = {
             "ok": bool(preferred.get("ok")),
             "work_item_id": item_id,
             "started_at_utc": started_at,
@@ -2054,6 +2171,9 @@ class RolloutService:
             "preferred_rollout_id": str(preferred.get("rollout_id") or ""),
             "comparisons": comparisons,
         }
+        if promote:
+            result["registry_promotion"] = self.promote_comparison_result(result)
+        return result
 
     def _record_rollout(self, result: Dict[str, Any]) -> None:
         recorder = FlightRecorder(base_dir=self.paths.flight_recorder_dir, enabled=True)
