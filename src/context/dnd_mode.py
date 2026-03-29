@@ -508,6 +508,7 @@ class DNDManager:
             self.config_path = Path("vera_memory/dnd_config.json")
 
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self._last_saved_epoch: float = 0.0
 
         # Components
         self.calendar = calendar_provider or MockCalendarProvider()
@@ -623,6 +624,10 @@ class DNDManager:
             atomic_json_write(self.config_path, data)
         else:
             self.config_path.write_text(json.dumps(data, indent=2))
+        try:
+            self._last_saved_epoch = float(self.config_path.stat().st_mtime)
+        except Exception:
+            self._last_saved_epoch = 0.0
 
     def add_rule(self, rule: DNDRule) -> None:
         """Add a custom DND rule"""
