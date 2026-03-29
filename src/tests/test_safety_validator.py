@@ -161,6 +161,27 @@ class TestFileOperations:
         d = validator.validate("cat /tmp/test.txt")
         assert d.result in {ValidationResult.WHITELISTED, ValidationResult.ALLOWED}
 
+    def test_read_file_vera_memory_allowed_with_tool_context(self, validator):
+        d = validator.validate(
+            'read_file {"path":"vera_memory/autonomy_cadence_state.json"}',
+            context={"tool_name": "read_file"},
+        )
+        assert d.result in {ValidationResult.WHITELISTED, ValidationResult.ALLOWED}
+
+    def test_delete_vera_memory_still_requires_confirmation(self, validator):
+        d = validator.validate(
+            'delete_file {"path":"vera_memory/autonomy_cadence_state.json"}',
+            context={"tool_name": "delete_file"},
+        )
+        assert d.result in {ValidationResult.BLOCKED, ValidationResult.REQUIRES_CONFIRMATION}
+
+    def test_modify_run_vera_still_requires_confirmation_with_tool_context(self, validator):
+        d = validator.validate(
+            'edit_file {"path":"run_vera.py","edits":[]}',
+            context={"tool_name": "edit_file"},
+        )
+        assert d.result in {ValidationResult.BLOCKED, ValidationResult.REQUIRES_CONFIRMATION}
+
     def test_allowed_result_has_zero_severity(self, validator):
         d = validator.validate("ls")
         assert d.severity == 0

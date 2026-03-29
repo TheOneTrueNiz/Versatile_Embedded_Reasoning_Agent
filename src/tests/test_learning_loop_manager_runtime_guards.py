@@ -96,8 +96,13 @@ def _build_workflow_stub_manager() -> LearningLoopManager:
     ]
     mgr.workflow_min_success = 1
     mgr.workflow_min_reliability = 0.5
+    mgr.workflow_fuzzy_min_score = 0.35
     mgr.workflow_reward_weight = 0.15
+    mgr.workflow_failure_penalty_weight = 0.35
+    mgr.workflow_recent_failure_window_hours = 48
+    mgr.workflow_failure_hard_block_threshold = 0.95
     mgr._trace_workflow = lambda *args, **kwargs: None
+    mgr._match_workflow_trigger = lambda task_text: None
     mgr._score_workflow_transition = lambda **kwargs: 0.0
     mgr._apply_workflow_reward_score = lambda entry, score, now_iso: entry.update(
         {"reward_last_score": score, "reward_last_scored_at": now_iso}
@@ -246,6 +251,264 @@ def test_get_failure_recovery_plan_returns_avoid_and_recovery_chain() -> None:
     assert plan["avoid_tools"] == bad_chain
     assert plan["suggested_recovery_chain"] == good_chain
     assert plan["recovery_signature"] == "sig_good"
+
+
+def test_get_failure_recovery_plan_skips_recovery_chain_overlapping_avoid_tools() -> None:
+    mgr = _build_workflow_stub_manager()
+    bad_chain = ["time", "read_file", "calculate"]
+    overlapping_recovery = ["read_file", "write_file"]
+    safe_recovery = ["read_graph", "list_allowed_directories"]
+
+    mgr._workflows["templates"] = {
+        "sig_bad": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(bad_chain),
+                "tokens": ["running", "hours", "autonomy"],
+                "failure_count": 2,
+                "replay_failure_count": 1,
+                "last_error": "confirmation_required:read_file",
+                "last_failure_tag": "confirmation_required",
+                "last_failure_at": datetime.now().isoformat(),
+            },
+            signature="sig_bad",
+            task_text="figure out running hours",
+            chain=bad_chain,
+        ),
+        "sig_overlap": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(overlapping_recovery),
+                "tokens": ["running", "hours", "autonomy"],
+                "success_count": 5,
+                "replay_success_count": 2,
+            },
+            signature="sig_overlap",
+            task_text="figure out running hours",
+            chain=overlapping_recovery,
+        ),
+        "sig_safe": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(safe_recovery),
+                "tokens": ["running", "hours", "autonomy"],
+                "success_count": 4,
+                "replay_success_count": 1,
+            },
+            signature="sig_safe",
+            task_text="figure out running hours",
+            chain=safe_recovery,
+        ),
+    }
+
+    plan = mgr.get_failure_recovery_plan("figure out running hours and autonomy state")
+
+    assert plan["source_signature"] == "sig_bad"
+    assert plan["avoid_tools"] == bad_chain
+    assert plan["suggested_recovery_chain"] == safe_recovery
+    assert plan["recovery_signature"] == "sig_safe"
+
+
+def test_get_failure_recovery_plan_skips_eval_artifact_recovery_candidates() -> None:
+    mgr = _build_workflow_stub_manager()
+    bad_chain = ["time", "read_file"]
+    eval_recovery = ["read_media_file", "generate_image"]
+    safe_recovery = ["brave_web_search", "read_graph"]
+
+    mgr._workflows["templates"] = {
+        "sig_bad": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(bad_chain),
+                "tokens": ["figure", "long", "running", "autonomy", "read", "file"],
+                "failure_count": 2,
+                "last_error": "confirmation_required:read_file",
+                "last_failure_tag": "confirmation_required",
+                "last_failure_at": datetime.now().isoformat(),
+            },
+            signature="sig_bad",
+            task_text="figure out running autonomy state",
+            chain=bad_chain,
+        ),
+        "sig_eval": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(eval_recovery),
+                "tokens": ["direct", "tool", "exam", "read", "media", "file", "arguments"],
+                "sample_task": "Direct Tool Exam. You MUST call tool `read_media_file` exactly once in this turn.",
+                "success_count": 5,
+                "replay_success_count": 2,
+                "last_conversation_id": "targeted-native-20260227T035140Z-tier1-0013-read_media_file",
+            },
+            signature="sig_eval",
+            task_text="Direct Tool Exam",
+            chain=eval_recovery,
+        ),
+        "sig_safe": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(safe_recovery),
+                "tokens": ["figure", "long", "running", "autonomy", "state"],
+                "success_count": 4,
+                "replay_success_count": 1,
+            },
+            signature="sig_safe",
+            task_text="figure out how long you've been running",
+            chain=safe_recovery,
+        ),
+    }
+
+    plan = mgr.get_failure_recovery_plan("figure out how long you've been running")
+
+    assert plan["source_signature"] == "sig_bad"
+    assert plan["suggested_recovery_chain"] == safe_recovery
+    assert plan["recovery_signature"] == "sig_safe"
+
+
+def test_get_failure_recovery_plan_skips_guided_curriculum_recovery_candidates() -> None:
+    mgr = _build_workflow_stub_manager()
+    bad_chain = ["time", "read_file"]
+    curriculum_recovery = ["encode_event", "retrieve_memory"]
+    safe_recovery = ["brave_web_search", "read_graph"]
+
+    mgr._workflows["templates"] = {
+        "sig_bad": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(bad_chain),
+                "tokens": ["figure", "long", "running", "autonomy", "read", "file"],
+                "failure_count": 3,
+                "last_error": "confirmation_required:read_file",
+                "last_failure_tag": "confirmation_required",
+                "last_failure_at": datetime.now().isoformat(),
+            },
+            signature="sig_bad",
+            task_text="figure out how long you've been running",
+            chain=bad_chain,
+        ),
+        "sig_curriculum": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(curriculum_recovery),
+                "tokens": ["guided", "curriculum", "marker", "retrieve", "memory"],
+                "sample_task": (
+                    "Use `encode_event` to persist marker `guided_curriculum_marker`, "
+                    "then use `retrieve_memory` for that marker and reply PASS/FAIL.\n\n"
+                    "Execution requirements:\n- Required tool(s): encode_event, retrieve_memory"
+                ),
+                "success_count": 11,
+                "replay_success_count": 11,
+                "last_conversation_id": "guided-partner_memory-20260219T044655Z",
+            },
+            signature="sig_curriculum",
+            task_text="guided curriculum marker",
+            chain=curriculum_recovery,
+        ),
+        "sig_safe": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(safe_recovery),
+                "tokens": ["figure", "long", "running", "autonomy", "state"],
+                "success_count": 4,
+                "replay_success_count": 1,
+            },
+            signature="sig_safe",
+            task_text="figure out how long you've been running",
+            chain=safe_recovery,
+        ),
+    }
+
+    plan = mgr.get_failure_recovery_plan("figure out how long you've been running")
+
+    assert plan["source_signature"] == "sig_bad"
+    assert plan["suggested_recovery_chain"] == safe_recovery
+    assert plan["recovery_signature"] == "sig_safe"
+
+
+def test_get_failure_recovery_plan_skips_weak_single_token_overlap_candidates() -> None:
+    mgr = _build_workflow_stub_manager()
+    bad_chain = ["time", "read_file"]
+    weak_recovery = ["brave_web_search", "read_graph"]
+    safe_recovery = ["search_archive", "retrieve_memory"]
+
+    mgr._workflows["templates"] = {
+        "sig_bad": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(bad_chain),
+                "tokens": ["figure", "long", "running", "read", "file", "autonomy", "state"],
+                "failure_count": 3,
+                "last_error": "confirmation_required:read_file",
+                "last_failure_tag": "confirmation_required",
+                "last_failure_at": datetime.now().isoformat(),
+            },
+            signature="sig_bad",
+            task_text="figure out how long you've been running",
+            chain=bad_chain,
+        ),
+        "sig_weak": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(weak_recovery),
+                "tokens": ["health", "status", "running", "servers", "blocked", "pending", "missing"],
+                "success_count": 6,
+                "replay_success_count": 4,
+            },
+            signature="sig_weak",
+            task_text="check health status of running servers",
+            chain=weak_recovery,
+        ),
+        "sig_safe": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(safe_recovery),
+                "tokens": ["running", "autonomy", "state", "memory", "uptime"],
+                "success_count": 4,
+                "replay_success_count": 2,
+            },
+            signature="sig_safe",
+            task_text="inspect autonomy state and uptime memory",
+            chain=safe_recovery,
+        ),
+    }
+
+    plan = mgr.get_failure_recovery_plan("figure out running autonomy state")
+
+    assert plan["source_signature"] == "sig_bad"
+    assert plan["suggested_recovery_chain"] == safe_recovery
+    assert plan["recovery_signature"] == "sig_safe"
+
+
+def test_workflow_failure_penalty_prefers_reliable_chain_in_plan_lookup() -> None:
+    mgr = _build_workflow_stub_manager()
+    query = "find latest news summary for me"
+    bad_chain = ["search_web", "summarize"]
+    good_chain = ["brave_ai_grounding", "summarize"]
+    now_iso = datetime.now().isoformat()
+
+    mgr._workflows["templates"] = {
+        "sig_bad": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(bad_chain),
+                "tokens": ["latest", "news", "summary"],
+                "success_count": 3,
+                "failure_count": 2,
+                "last_failure_tag": "tool_call_limit_reached",
+                "last_failure_at": now_iso,
+            },
+            signature="sig_bad",
+            task_text="find latest news summary",
+            chain=bad_chain,
+        ),
+        "sig_good": mgr._normalize_workflow_entry(
+            {
+                "tool_chain": list(good_chain),
+                "tokens": ["latest", "news", "summary"],
+                "success_count": 3,
+                "failure_count": 2,
+            },
+            signature="sig_good",
+            task_text="find latest news summary",
+            chain=good_chain,
+        ),
+    }
+
+    bad_penalty = mgr._workflow_failure_penalty(mgr._workflows["templates"]["sig_bad"])
+    good_penalty = mgr._workflow_failure_penalty(mgr._workflows["templates"]["sig_good"])
+    assert bad_penalty > good_penalty
+
+    plan = mgr.get_workflow_plan(query)
+    assert plan["signature"] == "sig_good"
+    assert plan["source"] == "fuzzy"
+    assert float(plan.get("failure_penalty", 0.0)) < 0.8
 
 
 def test_on_daily_loop_done_restarts_loop_when_unexpectedly_cancelled() -> None:
