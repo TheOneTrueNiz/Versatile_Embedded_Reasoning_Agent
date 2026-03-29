@@ -22,7 +22,7 @@ from orchestration.providers.base import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "grok-4-1-fast-reasoning"
+DEFAULT_MODEL = "grok-4.20-experimental-beta-0304-reasoning"
 DEFAULT_BASE_URL = "https://api.x.ai/v1"
 
 

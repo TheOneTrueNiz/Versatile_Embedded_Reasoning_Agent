@@ -120,7 +120,7 @@ def main() -> int:
     parser.add_argument("--trainer-timeout", type=float, default=1500.0)
     parser.add_argument("--prompt-timeout", type=float, default=45.0)
     parser.add_argument("--call-timeout", type=float, default=20.0)
-    parser.add_argument("--model", default="grok-4-1-fast-reasoning")
+    parser.add_argument("--model", default="grok-4.20-experimental-beta-0304-reasoning")
     parser.add_argument("--server", action="append", default=[], help="Server filter (repeatable)")
     parser.add_argument("--require-server", action="append", default=[], help="Required server (repeatable)")
     parser.add_argument("--max-tools-per-server", type=int, default=2)

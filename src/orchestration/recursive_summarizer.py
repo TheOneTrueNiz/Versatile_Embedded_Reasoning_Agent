@@ -27,7 +27,7 @@ class RecursiveSummarizer:
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self.model = model or os.getenv("VERA_RECURSIVE_MODEL", "grok-4-1-fast-reasoning")
+        self.model = model or os.getenv("VERA_RECURSIVE_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
         self.timeout = timeout
 
     async def summarize(
