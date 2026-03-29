@@ -231,7 +231,10 @@
     "max_workflows_per_active_window": 1,
     "task_due_minutes": 120,
     "followthrough_enabled": true,
-    "followthrough_cooldown_seconds": 900
+    "followthrough_cooldown_seconds": 900,
+    "week1_executor_enabled": true,
+    "week1_executor_cooldown_seconds": 900,
+    "week1_executor_timeout_seconds": 600
   },
   "initiative_tuning": {
     "enabled": true,
