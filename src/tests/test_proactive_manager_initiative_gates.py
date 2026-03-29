@@ -255,6 +255,17 @@ def test_compute_type_cooldown_seconds(tmp_path: Path) -> None:
     assert manager._compute_type_cooldown_seconds(10) <= 14400.0  # capped
 
 
+def test_compute_noop_cooldown_seconds(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path)
+
+    assert manager._compute_noop_cooldown_seconds(0) == 0.0
+    assert manager._compute_noop_cooldown_seconds(4) == 0.0
+    assert manager._compute_noop_cooldown_seconds(5) == 300.0
+    assert manager._compute_noop_cooldown_seconds(6) == 600.0
+    assert manager._compute_noop_cooldown_seconds(7) == 1200.0
+    assert manager._compute_noop_cooldown_seconds(20) <= 14400.0
+
+
 def test_cooldown_multiplier_for_mood(tmp_path: Path) -> None:
     assert ProactiveManager._cooldown_multiplier_for_mood("strained") == 1.50
     assert ProactiveManager._cooldown_multiplier_for_mood("energized") == 0.75
@@ -331,7 +342,7 @@ def test_cooldown_does_not_affect_other_action_types(tmp_path: Path) -> None:
     rec_free = _recommendation(action_type="reflect", priority=ActionPriority.NORMAL)
     allowed_free, reason_free = manager._should_execute_recommendation(rec_free)
     assert allowed_free is True
-    assert reason_free.startswith("allowed;")
+    assert reason_free == "internal_cadence_bypass"
 
 
 def test_internal_autonomy_cycle_bypasses_initiative_gates(tmp_path: Path) -> None:
@@ -381,6 +392,72 @@ def test_internal_autonomy_cycle_stats_never_set_cooldown(tmp_path: Path) -> Non
     manager._update_action_type_stats(action_type="autonomy_cycle", outcome="action_success_noop")
     state_after_noop = manager._ensure_initiative_runtime()
     stats = state_after_noop["action_type_stats"]["autonomy_cycle"]
-    assert stats["total_noops"] == 1
+    assert stats["total_noops"] == 0
+    assert stats["last_outcome"] == "action_success_noop"
     assert stats["cooldown_until_utc"] is None
     assert stats["consecutive_noops"] == 0
+
+
+def test_internal_reflect_stats_never_set_cooldown_or_noop_totals(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, minutes_since_activity=10.0)
+
+    manager._update_action_type_stats(action_type="reflect", outcome="action_success_skipped")
+    stats = manager._ensure_initiative_runtime()["action_type_stats"]["reflect"]
+
+    assert stats["total_noops"] == 0
+    assert stats["last_outcome"] == "action_success_skipped"
+    assert stats["cooldown_until_utc"] is None
+    assert stats["consecutive_noops"] == 0
+
+
+def test_noop_streak_applies_exponential_cooldown_without_reset(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, minutes_since_activity=10.0)
+
+    for _ in range(5):
+        manager._update_action_type_stats(action_type="check_tasks", outcome="action_success_noop")
+
+    stats = manager._ensure_initiative_runtime()["action_type_stats"]["check_tasks"]
+    first_cooldown = datetime.fromisoformat(stats["cooldown_until_utc"].replace("Z", "+00:00"))
+    first_remaining = (first_cooldown - datetime.now(timezone.utc)).total_seconds()
+    assert 250 <= first_remaining <= 330
+    assert stats["consecutive_noops"] == 5
+
+    manager._update_action_type_stats(action_type="check_tasks", outcome="action_success_noop")
+    stats = manager._ensure_initiative_runtime()["action_type_stats"]["check_tasks"]
+    second_cooldown = datetime.fromisoformat(stats["cooldown_until_utc"].replace("Z", "+00:00"))
+    second_remaining = (second_cooldown - datetime.now(timezone.utc)).total_seconds()
+    assert 550 <= second_remaining <= 630
+    assert stats["consecutive_noops"] == 6
+
+
+def test_feedback_linking_ignores_internal_cadence_not_due_rows(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, minutes_since_activity=10.0)
+    manager._initiative_state["recent_actions"] = [
+        {
+            "ts_utc": _utc_ago(30),
+            "action_id": "week1",
+            "trigger_id": "week1_due_check",
+            "action_type": "week1_due_check",
+            "priority": "HIGH",
+            "conversation_id": "",
+            "success": True,
+            "signal_type": "action_success_not_due",
+            "result_preview": "{'scheduled': False, 'attempted': False, 'reason': 'no_due_work'}",
+        },
+        {
+            "ts_utc": _utc_ago(20),
+            "action_id": "tasks",
+            "trigger_id": "check_tasks",
+            "action_type": "check_tasks",
+            "priority": "LOW",
+            "conversation_id": "default",
+            "success": True,
+            "signal_type": "action_success",
+            "result_preview": "{'scheduled': True}",
+        },
+    ]
+
+    linked, row = manager._is_feedback_linked_to_recent_action("default")
+
+    assert linked is True
+    assert row.get("action_id") == "tasks"

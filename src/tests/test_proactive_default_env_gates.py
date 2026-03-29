@@ -77,3 +77,22 @@ def test_proactive_execution_respects_explicit_disable(monkeypatch, tmp_path: Pa
     result = asyncio.run(manager._process_sentinel_recommendations())
 
     assert result is None
+
+
+def test_autonomy_config_includes_week1_executor_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("VERA_AUTONOMY_WEEK1_EXECUTOR_ENABLED", raising=False)
+    monkeypatch.delenv("VERA_AUTONOMY_WEEK1_EXECUTOR_COOLDOWN_SECONDS", raising=False)
+    monkeypatch.delenv("VERA_AUTONOMY_WEEK1_EXECUTOR_TIMEOUT_SECONDS", raising=False)
+
+    manager = object.__new__(ProactiveManager)
+    config = manager._load_autonomy_config()
+
+    assert config.get("week1_executor_enabled") is True
+    assert int(config.get("week1_executor_cooldown_seconds")) >= 60
+    assert int(config.get("week1_executor_timeout_seconds")) >= 120
+
+
+def test_default_autonomy_state_includes_week1_timestamp() -> None:
+    manager = object.__new__(ProactiveManager)
+    state = manager._default_autonomy_state()
+    assert "last_week1_executor_utc" in state

@@ -25,12 +25,20 @@ def _make_manager(tmp_path: Path) -> ProactiveManager:
     manager._memory_dir.mkdir(parents=True, exist_ok=True)
     manager._owner = MagicMock()
     manager._owner.process_messages = AsyncMock(return_value="[]")
+    manager._owner._internal_tool_call_handler = AsyncMock(
+        return_value={
+            "content": [{"type": "text", "text": "No events found in calendar 'primary' for jeffnyzio@gmail.com for the specified time range."}],
+            "structuredContent": {"result": "No events found in calendar 'primary' for jeffnyzio@gmail.com for the specified time range."},
+            "isError": False,
+        }
+    )
     manager._owner._proactive_tool_whitelist = None
     manager.dnd = MagicMock()
     manager.dnd.can_interrupt = MagicMock(return_value=True)
     manager.sentinel = MagicMock()
     manager.sentinel.recommender = MagicMock()
     manager.sentinel.recommender.get_pending_recommendations = MagicMock(return_value=[])
+    manager._autonomy_config = {"pulse_interval_seconds": 300}
     return manager
 
 
@@ -46,11 +54,11 @@ def test_calendar_check_skips_when_env_off(tmp_path: Path) -> None:
             manager._check_calendar_proactive()
         )
     assert result is None
-    manager._owner.process_messages.assert_not_called()
+    manager._owner._internal_tool_call_handler.assert_not_called()
 
 
 def test_calendar_check_respects_cooldown(tmp_path: Path) -> None:
-    """If polled < 30 min ago, should skip."""
+    """If polled within the computed cooldown window, should skip."""
     manager = _make_manager(tmp_path)
     # Write a recent poll timestamp
     state_path = tmp_path / "calendar_alerts_state.json"
@@ -64,7 +72,29 @@ def test_calendar_check_respects_cooldown(tmp_path: Path) -> None:
     assert result is not None
     assert result.get("skipped") is True
     assert result.get("reason") == "cooldown_active"
-    manager._owner.process_messages.assert_not_called()
+    assert result.get("cooldown_seconds") == 300
+    manager._owner._internal_tool_call_handler.assert_not_called()
+
+
+def test_calendar_check_default_cooldown_tracks_alert_window(tmp_path: Path) -> None:
+    """Default cooldown should not exceed the alert window or pulse cadence."""
+    manager = _make_manager(tmp_path)
+    manager._autonomy_config = {"pulse_interval_seconds": 600}
+
+    state_path = tmp_path / "calendar_alerts_state.json"
+    recent_poll = (_utc_now() - timedelta(minutes=9)).isoformat().replace("+00:00", "Z")
+    atomic_json_write(state_path, {"last_poll_utc": recent_poll, "alerted_event_ids": []})
+
+    with patch.dict(os.environ, {
+        "VERA_CALENDAR_PROACTIVE": "1",
+        "VERA_CALENDAR_ALERT_MINUTES": "10",
+    }, clear=False):
+        result = asyncio.run(manager._check_calendar_proactive())
+
+    assert result is not None
+    assert result.get("skipped") is True
+    assert result.get("cooldown_seconds") == 600
+    manager._owner._internal_tool_call_handler.assert_not_called()
 
 
 def test_calendar_check_alerts_upcoming_event(tmp_path: Path) -> None:
@@ -73,16 +103,22 @@ def test_calendar_check_alerts_upcoming_event(tmp_path: Path) -> None:
     now_utc = _utc_now()
     event_start = (now_utc + timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
 
-    mock_events = json.dumps([{
-        "id": "evt_123",
-        "summary": "Team standup",
-        "start_time": event_start,
-        "end_time": (now_utc + timedelta(minutes=40)).isoformat().replace("+00:00", "Z"),
-        "location": "Room 42",
-    }])
+    mock_events = (
+        "Successfully retrieved 1 events from calendar 'primary' for jeffnyzio@gmail.com:\n"
+        f'- "Team standup" (Starts: {event_start}, Ends: {(now_utc + timedelta(minutes=40)).isoformat().replace("+00:00", "Z")})\n'
+        "  Description: No Description\n"
+        "  Location: Room 42\n"
+        "  Attendees: None\n"
+        "  Attendee Details: None\n"
+        "  ID: evt_123 | Link: https://example.test/event"
+    )
 
-    # First call returns events, second call sends notification
-    manager._owner.process_messages = AsyncMock(side_effect=[mock_events, "Notification sent"])
+    manager._owner._internal_tool_call_handler = AsyncMock(
+        side_effect=[
+            {"structuredContent": {"result": mock_events}, "content": [{"type": "text", "text": mock_events}]},
+            {"structuredContent": {"result": "Native push sent."}, "content": [{"type": "text", "text": "Native push sent."}]},
+        ]
+    )
 
     with patch.dict(os.environ, {
         "VERA_CALENDAR_PROACTIVE": "1",
@@ -96,8 +132,7 @@ def test_calendar_check_alerts_upcoming_event(tmp_path: Path) -> None:
     assert result.get("ok") is True
     assert len(result.get("alerts_sent", [])) == 1
     assert result["alerts_sent"][0]["summary"] == "Team standup"
-    # Should have called process_messages twice (once for events, once for notification)
-    assert manager._owner.process_messages.call_count == 2
+    assert manager._owner._internal_tool_call_handler.call_count == 2
 
 
 def test_calendar_check_skips_already_alerted(tmp_path: Path) -> None:
@@ -115,12 +150,18 @@ def test_calendar_check_skips_already_alerted(tmp_path: Path) -> None:
     }
     atomic_json_write(state_path, state)
 
-    mock_events = json.dumps([{
-        "id": "evt_already",
-        "summary": "Already alerted meeting",
-        "start_time": event_start,
-    }])
-    manager._owner.process_messages = AsyncMock(return_value=mock_events)
+    mock_events = (
+        "Successfully retrieved 1 events from calendar 'primary' for jeffnyzio@gmail.com:\n"
+        f'- "Already alerted meeting" (Starts: {event_start}, Ends: {(now_utc + timedelta(minutes=30)).isoformat().replace("+00:00", "Z")})\n'
+        "  Description: No Description\n"
+        "  Location: No Location\n"
+        "  Attendees: None\n"
+        "  Attendee Details: None\n"
+        "  ID: evt_already | Link: https://example.test/event"
+    )
+    manager._owner._internal_tool_call_handler = AsyncMock(
+        return_value={"structuredContent": {"result": mock_events}, "content": [{"type": "text", "text": mock_events}]}
+    )
 
     with patch.dict(os.environ, {
         "VERA_CALENDAR_PROACTIVE": "1",
@@ -133,14 +174,13 @@ def test_calendar_check_skips_already_alerted(tmp_path: Path) -> None:
     assert result is not None
     assert result.get("ok") is True
     assert len(result.get("alerts_sent", [])) == 0
-    # Only one call (events fetch), no notification
-    assert manager._owner.process_messages.call_count == 1
+    assert manager._owner._internal_tool_call_handler.call_count == 1
 
 
 def test_calendar_check_handles_missing_tool(tmp_path: Path) -> None:
-    """If process_messages raises, should return graceful error."""
+    """If the direct tool call raises, should return graceful error."""
     manager = _make_manager(tmp_path)
-    manager._owner.process_messages = AsyncMock(side_effect=Exception("Tool not found"))
+    manager._owner._internal_tool_call_handler = AsyncMock(side_effect=Exception("Tool not found"))
 
     with patch.dict(os.environ, {"VERA_CALENDAR_PROACTIVE": "1"}, clear=False):
         result = asyncio.run(
@@ -150,3 +190,42 @@ def test_calendar_check_handles_missing_tool(tmp_path: Path) -> None:
     assert result is not None
     assert result.get("ok") is False
     assert result.get("reason") == "calendar_tool_unavailable"
+
+
+def test_parse_calendar_event_listing_extracts_structured_rows(tmp_path: Path) -> None:
+    text = (
+        "Successfully retrieved 2 events from calendar 'primary' for jeffnyzio@gmail.com:\n"
+        '- "Team standup" (Starts: 2026-03-07T18:00:00Z, Ends: 2026-03-07T18:30:00Z)\n'
+        "  Description: No Description\n"
+        "  Location: Room 42\n"
+        "  Attendees: None\n"
+        "  Attendee Details: None\n"
+        "  ID: evt_123 | Link: https://example.test/1\n"
+        '- "Planning block" (Starts: 2026-03-07T19:00:00Z, Ends: 2026-03-07T19:30:00Z)\n'
+        "  Description: No Description\n"
+        "  Location: No Location\n"
+        "  Attendees: None\n"
+        "  Attendee Details: None\n"
+        "  ID: evt_456 | Link: https://example.test/2"
+    )
+
+    rows = ProactiveManager._parse_calendar_event_listing(text)
+
+    assert rows == [
+        {
+            "summary": "Team standup",
+            "start_time": "2026-03-07T18:00:00Z",
+            "end_time": "2026-03-07T18:30:00Z",
+            "location": "Room 42",
+            "id": "evt_123",
+            "link": "https://example.test/1",
+        },
+        {
+            "summary": "Planning block",
+            "start_time": "2026-03-07T19:00:00Z",
+            "end_time": "2026-03-07T19:30:00Z",
+            "location": "No Location",
+            "id": "evt_456",
+            "link": "https://example.test/2",
+        },
+    ]

@@ -1,0 +1,52 @@
+DAY 1 OPERATOR CHECKLIST (Niz)
+Timezone: America/Chicago
+
+Goal: quick human verification that Vera is helping without becoming noisy.
+
+How to use
+- Check each block in under 2 minutes.
+- Mark OK / Needs Tuning.
+- If Needs Tuning, write one short adjustment request.
+
+08:00-08:15 Morning Startup
+[ ] Wake + hydration prompt arrived
+[ ] Morning Merge Card produced (YOUR DAY / ISAAC DAY / CONFLICTS / TOP 3)
+[ ] Day template selected (Green/Yellow/Red) with reason
+[ ] First reminders are realistic (not stacked)
+Adjustment note: ______________________________
+
+11:30-12:30 Midday Safety Window
+[ ] Food ladder behavior is appropriate (soft -> firm only if needed)
+[ ] Midday check arrived (Top 3 status + blockers + next action)
+[ ] Low-dopamine START STEP prompt is actionable
+[ ] Notification volume feels acceptable (not spammy)
+Adjustment note: ______________________________
+
+Isaac Sidecar Checks (whenever lesson windows occur)
+[ ] Lesson reminder chain ran at T-30 / T-10 / T-2
+[ ] JOINED ACK flow works
+[ ] Escalation only happens when ACK missing
+[ ] Tonight Tomorrow Brief is queued for 20:45
+Adjustment note: ______________________________
+
+15:00-16:30 Collaboration Ops
+[ ] Follow-up factory produced useful drafts
+[ ] P0/P1 items are visible and tracked
+[ ] Relationship ping is draft-only unless approved
+Adjustment note: ______________________________
+
+20:30 Closeout
+[ ] Closeout summary generated (shipped/slipped/rescheduled)
+[ ] Tomorrow Top 3 pre-draft looks realistic
+[ ] Open items converted to reminders/followthrough
+[ ] Overall day quality: Helpful / Acceptable / Noisy
+Adjustment note: ______________________________
+
+Hard Guardrail Checks (all day)
+[ ] No heavy desktop_* automation attempts
+[ ] No unapproved high-risk external side effects
+[ ] Interrupt budgets respected (hard <= 2, soft <= 6)
+[ ] Critical ACK tokens recognized (WATER, ATE, MOVED, BATHROOM, JOINED, SUBMITTED, DONE, COMPLETE)
+
+End-of-day tuning request template
+"Vera, for tomorrow: keep _______, reduce _______, and change reminder timing for _______."
