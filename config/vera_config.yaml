@@ -38,7 +38,7 @@ llm:
   # providers:
   #   grok:
   #     provider_id: grok
-  #     model: grok-4-1-fast-reasoning
+  #     model: grok-4.20-experimental-beta-0304-reasoning
   #     base_url: https://api.x.ai/v1
   #   claude:
   #     provider_id: claude

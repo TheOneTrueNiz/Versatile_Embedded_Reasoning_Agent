@@ -46,8 +46,8 @@ def _resolve_model(client: httpx.Client) -> str:
     data = response.json()
     models = data.get("data", [])
     if not models:
-        return os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
-    return models[0].get("id") or os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
+        return os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
+    return models[0].get("id") or os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
 
 
 def _wait_for_api(client: httpx.Client, timeout_seconds: float = 60.0) -> None:
