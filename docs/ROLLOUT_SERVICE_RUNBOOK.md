@@ -33,6 +33,8 @@ Current phase-1 runner supports:
 - policy-variant comparison across the same replay envelope for the major local subsystems
 - policy promotion into a local rollout policy registry
 - registry-backed replay mode that reuses promoted executor policies
+- cross-subsystem scorecard generation over comparison artifacts
+- bulk subsystem-policy promotion from the scorecard with pruning for failed subsystem variants
 
 It does not yet do:
 - live MCP/tool execution inside the replay lane
@@ -55,6 +57,14 @@ Registry inspection/promotion:
 ```bash
 python3 scripts/vera_rollout_policy_registry.py
 python3 scripts/vera_rollout_policy_registry.py --comparison tmp/audits/<comparison_artifact>.json
+```
+
+Cross-subsystem scorecard:
+
+```bash
+python3 scripts/vera_rollout_scorecard.py
+python3 scripts/vera_rollout_scorecard.py --promote
+python3 scripts/vera_rollout_scorecard.py --comparison tmp/audits/<comparison_a>.json --comparison tmp/audits/<comparison_b>.json
 ```
 
 Mode semantics:
@@ -93,11 +103,14 @@ Policy semantics:
 - `--promote` stores the preferred mode/policy for the matched executor kind in:
   - `vera_memory/rollout_policy_registry.json`
 - explicit `--policy` overrides always beat the registry
+- `vera_rollout_scorecard.py --promote` bulk-promotes only fully successful subsystem comparisons
+- failed subsystem comparisons prune stale registry entries for the affected executor kind
 
 ## Outputs
 
 Trajectory artifacts:
 - `vera_memory/rollouts/<rollout_id>.json`
+- `vera_memory/rollout_cross_subsystem_scorecard.json`
 
 Executor-backed replay outputs:
 - `vera_memory/rollouts/<rollout_id>/MASTER_TODO.md`
@@ -254,6 +267,18 @@ In the comparison artifact:
 - `comparisons[*].executor_kind`
 - `comparisons[*].artifact_path`
 
+In the cross-subsystem scorecard:
+- `valid_artifact_count`
+- `invalid_artifact_count`
+- `subsystem_count`
+- `successful_subsystem_count`
+- `policy_coverage_count`
+- `score_pct`
+- `subsystems[*].promotion_eligible`
+- `subsystems[*].registry_promotion`
+- `invalid_artifacts[*].reason`
+- `scorecard_path`
+
 ## Current Guardrails
 
 - opt-in only
@@ -270,7 +295,6 @@ That avoids stale `hash_prev` mismatches when multiple recorder instances or pro
 
 ## Recommended Next Step
 
-This local-subsystem comparison phase is now broad enough to stop expanding sideways.
-The next step should be one of:
-- cross-subsystem scoring/promotion logic over the existing replay artifacts
-- or one tightly bounded live-tool replay lane outside the active-window dispatcher
+The local-subsystem comparison and scorecard phase is now broad enough.
+The next step should be:
+- one tightly bounded live-tool replay lane outside the active-window dispatcher

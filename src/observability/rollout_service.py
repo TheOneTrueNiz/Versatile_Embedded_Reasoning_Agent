@@ -47,6 +47,9 @@ class RolloutService:
     def _policy_registry_path(self) -> Path:
         return self.paths.registry_path or (self.paths.work_jar_path.parent / "rollout_policy_registry.json")
 
+    def _scorecard_path(self) -> Path:
+        return self.paths.work_jar_path.parent / "rollout_cross_subsystem_scorecard.json"
+
     def load_work_jar(self) -> Dict[str, Any]:
         data = safe_json_read(self.paths.work_jar_path, default={}) or {}
         if not isinstance(data, dict):
@@ -84,6 +87,31 @@ class RolloutService:
         entries = dict(registry.get("entries") or {})
         row = entries.get(f"executor_kind:{normalized_kind}")
         return dict(row or {}) if isinstance(row, dict) else {}
+
+    def _prune_promoted_policy_entry(self, *, executor_kind: str) -> Dict[str, Any]:
+        normalized_kind = str(executor_kind or "").strip()
+        if not normalized_kind:
+            return {"ok": False, "reason": "missing_executor_kind"}
+        registry = self.load_policy_registry()
+        entries = dict(registry.get("entries") or {})
+        entry_key = f"executor_kind:{normalized_kind}"
+        existing = dict(entries.get(entry_key) or {}) if isinstance(entries.get(entry_key), dict) else {}
+        if entry_key in entries:
+            entries.pop(entry_key, None)
+            registry["entries"] = entries
+            registry_path = self._write_policy_registry(registry)
+            return {
+                "ok": True,
+                "reason": "registry_entry_pruned",
+                "entry_key": entry_key,
+                "registry_path": str(registry_path),
+                "removed_entry": existing,
+            }
+        return {
+            "ok": True,
+            "reason": "registry_entry_absent",
+            "entry_key": entry_key,
+        }
 
     def promote_comparison_result(self, comparison_result: Dict[str, Any]) -> Dict[str, Any]:
         work_item_id = str(comparison_result.get("work_item_id") or "").strip()
@@ -132,6 +160,171 @@ class RolloutService:
             "registry_path": str(registry_path),
             "entry": promoted_entry,
         }
+
+    def _normalize_comparison_artifact(self, payload: Any) -> Dict[str, Any]:
+        if isinstance(payload, dict):
+            compare = payload.get("compare")
+            if isinstance(compare, dict):
+                normalized = dict(compare)
+                if isinstance(payload.get("ledger_verify"), dict):
+                    normalized["ledger_verify"] = dict(payload.get("ledger_verify") or {})
+                normalized["_artifact_shape"] = "wrapped"
+                return normalized
+            normalized = dict(payload)
+            normalized["_artifact_shape"] = "direct"
+            return normalized
+        return {}
+
+    def summarize_comparison_artifact(self, comparison_path: Path) -> Dict[str, Any]:
+        payload = safe_json_read(comparison_path, default={}) or {}
+        normalized = self._normalize_comparison_artifact(payload)
+        comparisons = list(normalized.get("comparisons") or [])
+        preferred_rollout_id = str(normalized.get("preferred_rollout_id") or "").strip()
+        preferred_row: Dict[str, Any] = {}
+        for row in comparisons:
+            if str((row or {}).get("rollout_id") or "").strip() == preferred_rollout_id:
+                preferred_row = dict(row or {})
+                break
+        if not preferred_row and comparisons:
+            preferred_row = dict(comparisons[0] or {})
+        executor_kind = str(preferred_row.get("executor_kind") or "").strip()
+        if not executor_kind:
+            for row in comparisons:
+                executor_kind = str((row or {}).get("executor_kind") or "").strip()
+                if executor_kind:
+                    break
+        work_item_id = str(normalized.get("work_item_id") or "").strip()
+        preferred_mode = str(normalized.get("preferred_mode") or "").strip()
+        preferred_policy = str(normalized.get("preferred_policy") or "").strip()
+        valid = bool(comparisons) and bool(work_item_id) and bool(preferred_mode)
+        passing_count = sum(1 for row in comparisons if bool((row or {}).get("ok")))
+        failing_count = max(0, len(comparisons) - passing_count)
+        summary = {
+            "ok": valid and bool(normalized.get("ok")),
+            "valid": valid,
+            "artifact_path": str(comparison_path),
+            "artifact_shape": str(normalized.get("_artifact_shape") or "direct"),
+            "work_item_id": work_item_id,
+            "executor_kind": executor_kind,
+            "preferred_mode": preferred_mode,
+            "preferred_policy": preferred_policy,
+            "comparisons_count": len(comparisons),
+            "passing_count": passing_count,
+            "failing_count": failing_count,
+            "has_policy_variants": len({str((row or {}).get('policy') or '').strip() for row in comparisons if str((row or {}).get('policy') or '').strip()}) > 1,
+            "has_registry_promotion": isinstance(normalized.get("registry_promotion"), dict),
+            "finished_at_utc": str(normalized.get("finished_at_utc") or ""),
+            "ledger_verify_ok": bool((normalized.get("ledger_verify") or {}).get("ok")),
+            "reason": "ok" if valid else "invalid_or_empty_comparison_artifact",
+        }
+        if not valid:
+            if not comparisons:
+                summary["reason"] = "missing_comparisons"
+            elif not work_item_id:
+                summary["reason"] = "missing_work_item_id"
+            elif not preferred_mode:
+                summary["reason"] = "missing_preferred_mode"
+        return {
+            "summary": summary,
+            "comparison": normalized,
+        }
+
+    def build_cross_subsystem_scorecard(
+        self,
+        *,
+        comparison_paths: List[Path],
+        promote: bool = False,
+    ) -> Dict[str, Any]:
+        started_at = utc_iso()
+        scanned: List[Dict[str, Any]] = []
+        valid_entries: List[Dict[str, Any]] = []
+        invalid_entries: List[Dict[str, Any]] = []
+        for raw_path in comparison_paths:
+            path = Path(raw_path)
+            result = self.summarize_comparison_artifact(path)
+            summary = dict(result.get("summary") or {})
+            scanned.append(summary)
+            if summary.get("valid"):
+                valid_entries.append({
+                    "summary": summary,
+                    "comparison": dict(result.get("comparison") or {}),
+                })
+            else:
+                invalid_entries.append(summary)
+
+        latest_by_subsystem: Dict[str, Dict[str, Any]] = {}
+        for row in valid_entries:
+            summary = dict(row.get("summary") or {})
+            subsystem_key = str(summary.get("executor_kind") or "").strip() or f"work_item:{str(summary.get('work_item_id') or '').strip()}"
+            incumbent = latest_by_subsystem.get(subsystem_key)
+            candidate_finished = str(summary.get("finished_at_utc") or "")
+            incumbent_finished = str(((incumbent or {}).get("summary") or {}).get("finished_at_utc") or "")
+            if incumbent is None or candidate_finished >= incumbent_finished:
+                latest_by_subsystem[subsystem_key] = row
+
+        subsystem_rows: List[Dict[str, Any]] = []
+        promotions: List[Dict[str, Any]] = []
+        policy_coverage_count = 0
+        for subsystem_key, row in sorted(latest_by_subsystem.items()):
+            summary = dict(row.get("summary") or {})
+            comparison = dict(row.get("comparison") or {})
+            promotion_eligible = bool(summary.get("ok")) and int(summary.get("comparisons_count") or 0) > 0 and int(summary.get("failing_count") or 0) == 0
+            if str(summary.get("preferred_policy") or "").strip():
+                policy_coverage_count += 1
+            subsystem_row = {
+                "subsystem_key": subsystem_key,
+                "executor_kind": str(summary.get("executor_kind") or ""),
+                "work_item_id": str(summary.get("work_item_id") or ""),
+                "artifact_path": str(summary.get("artifact_path") or ""),
+                "preferred_mode": str(summary.get("preferred_mode") or ""),
+                "preferred_policy": str(summary.get("preferred_policy") or ""),
+                "comparisons_count": int(summary.get("comparisons_count") or 0),
+                "passing_count": int(summary.get("passing_count") or 0),
+                "failing_count": int(summary.get("failing_count") or 0),
+                "has_policy_variants": bool(summary.get("has_policy_variants")),
+                "ledger_verify_ok": bool(summary.get("ledger_verify_ok")),
+                "finished_at_utc": str(summary.get("finished_at_utc") or ""),
+                "promotion_eligible": promotion_eligible,
+                "status": "preferred_policy_selected" if str(summary.get("preferred_policy") or "").strip() else "preferred_mode_selected",
+            }
+            if promote:
+                if promotion_eligible:
+                    promotion = self.promote_comparison_result(comparison)
+                else:
+                    promotion = self._prune_promoted_policy_entry(executor_kind=subsystem_row["executor_kind"])
+                    promotion["promotion_eligible"] = False
+                    promotion["work_item_id"] = subsystem_row["work_item_id"]
+                subsystem_row["registry_promotion"] = promotion
+                promotions.append(promotion)
+            subsystem_rows.append(subsystem_row)
+
+        subsystem_count = len(subsystem_rows)
+        successful_subsystems = sum(
+            1
+            for row in subsystem_rows
+            if int(row.get("comparisons_count") or 0) > 0 and int(row.get("failing_count") or 0) == 0
+        )
+        score_pct = round((successful_subsystems / subsystem_count) * 100.0, 1) if subsystem_count else 0.0
+        result = {
+            "ok": bool(subsystem_count),
+            "started_at_utc": started_at,
+            "finished_at_utc": utc_iso(),
+            "comparison_path_count": len(comparison_paths),
+            "valid_artifact_count": len(valid_entries),
+            "invalid_artifact_count": len(invalid_entries),
+            "subsystem_count": subsystem_count,
+            "successful_subsystem_count": successful_subsystems,
+            "policy_coverage_count": policy_coverage_count,
+            "score_pct": score_pct,
+            "scanned_artifacts": scanned,
+            "invalid_artifacts": invalid_entries,
+            "subsystems": subsystem_rows,
+            "promotions": promotions,
+        }
+        scorecard_path = self._scorecard_path()
+        atomic_json_write(scorecard_path, result, indent=2)
+        result["scorecard_path"] = str(scorecard_path)
+        return result
 
     def find_work_item(self, item_id: str, *, include_archived: bool = False) -> Dict[str, Any]:
         jar = self.load_work_jar()

@@ -2041,3 +2041,249 @@ def test_compare_work_item_rollout_prefers_strict_flight_ledger_policy(tmp_path:
     assert result["preferred_policy"] == "rebuild_only_if_invalid"
     assert result["policies"] == ["rebuild_only_if_invalid", "always_rebuild_copy"]
     assert len(result["comparisons"]) == 2
+
+
+def test_build_cross_subsystem_scorecard_handles_direct_and_wrapped_artifacts(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "vera_memory"
+    work_jar = memory_dir / "autonomy_work_jar.json"
+    _write_json(work_jar, {"version": 1, "items": [], "archived_items": []})
+    service = RolloutService(
+        RolloutPaths(
+            work_jar_path=work_jar,
+            output_dir=memory_dir / "rollouts",
+            flight_recorder_dir=memory_dir / "flight_recorder",
+            registry_path=memory_dir / "rollout_policy_registry.json",
+        )
+    )
+    direct_path = tmp_path / "compare_archive_policy.json"
+    _write_json(
+        direct_path,
+        {
+            "ok": True,
+            "work_item_id": "awj_archive_policy_compare_live_probe_01",
+            "finished_at_utc": "2026-03-29T00:13:18Z",
+            "preferred_mode": "auto",
+            "preferred_policy": "strict_signature",
+            "preferred_rollout_id": "rollout_archive_1",
+            "comparisons": [
+                {
+                    "mode": "auto",
+                    "policy": "strict_signature",
+                    "ok": True,
+                    "rollout_id": "rollout_archive_1",
+                    "executor_kind": "improvement_archive_suggest",
+                },
+                {
+                    "mode": "auto",
+                    "policy": "relaxed_failure_class",
+                    "ok": True,
+                    "rollout_id": "rollout_archive_2",
+                    "executor_kind": "improvement_archive_suggest",
+                },
+            ],
+        },
+    )
+    wrapped_path = tmp_path / "compare_week1_validation_policy.json"
+    _write_json(
+        wrapped_path,
+        {
+            "compare": {
+                "ok": True,
+                "work_item_id": "awj_week1_validation_policy_compare_probe_01",
+                "finished_at_utc": "2026-03-29T02:27:31Z",
+                "preferred_mode": "auto",
+                "preferred_policy": "strict_ack_required",
+                "preferred_rollout_id": "rollout_week1_1",
+                "comparisons": [
+                    {
+                        "mode": "auto",
+                        "policy": "strict_ack_required",
+                        "ok": True,
+                        "rollout_id": "rollout_week1_1",
+                        "executor_kind": "week1_validation_snapshot",
+                    },
+                    {
+                        "mode": "auto",
+                        "policy": "delivery_signal_only",
+                        "ok": True,
+                        "rollout_id": "rollout_week1_2",
+                        "executor_kind": "week1_validation_snapshot",
+                    },
+                ],
+            },
+            "ledger_verify": {"ok": True},
+        },
+    )
+    invalid_path = tmp_path / "compare_invalid.json"
+    invalid_path.write_text("{}", encoding="utf-8")
+
+    result = service.build_cross_subsystem_scorecard(
+        comparison_paths=[direct_path, wrapped_path, invalid_path],
+        promote=False,
+    )
+
+    assert result["ok"] is True
+    assert result["comparison_path_count"] == 3
+    assert result["valid_artifact_count"] == 2
+    assert result["invalid_artifact_count"] == 1
+    assert result["subsystem_count"] == 2
+    assert result["policy_coverage_count"] == 2
+    assert result["score_pct"] == 100.0
+    assert Path(result["scorecard_path"]).exists()
+    subsystem_keys = {row["subsystem_key"] for row in result["subsystems"]}
+    assert "improvement_archive_suggest" in subsystem_keys
+    assert "week1_validation_snapshot" in subsystem_keys
+    invalid_reasons = {row["reason"] for row in result["invalid_artifacts"]}
+    assert "missing_comparisons" in invalid_reasons
+
+
+def test_build_cross_subsystem_scorecard_can_bulk_promote_registry_entries(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "vera_memory"
+    work_jar = memory_dir / "autonomy_work_jar.json"
+    _write_json(work_jar, {"version": 1, "items": [], "archived_items": []})
+    service = RolloutService(
+        RolloutPaths(
+            work_jar_path=work_jar,
+            output_dir=memory_dir / "rollouts",
+            flight_recorder_dir=memory_dir / "flight_recorder",
+            registry_path=memory_dir / "rollout_policy_registry.json",
+        )
+    )
+    archive_path = tmp_path / "compare_archive_policy.json"
+    _write_json(
+        archive_path,
+        {
+            "ok": True,
+            "work_item_id": "awj_archive_policy_compare_live_probe_01",
+            "finished_at_utc": "2026-03-29T00:13:18Z",
+            "preferred_mode": "auto",
+            "preferred_policy": "strict_signature",
+            "preferred_rollout_id": "rollout_archive_1",
+            "comparisons": [
+                {
+                    "mode": "auto",
+                    "policy": "strict_signature",
+                    "ok": True,
+                    "rollout_id": "rollout_archive_1",
+                    "executor_kind": "improvement_archive_suggest",
+                },
+                {
+                    "mode": "auto",
+                    "policy": "relaxed_failure_class",
+                    "ok": True,
+                    "rollout_id": "rollout_archive_2",
+                    "executor_kind": "improvement_archive_suggest",
+                },
+            ],
+        },
+    )
+    operator_path = tmp_path / "compare_operator_policy.json"
+    _write_json(
+        operator_path,
+        {
+            "ok": True,
+            "work_item_id": "awj_operator_runtime_policy_compare_live_probe_01",
+            "finished_at_utc": "2026-03-29T00:59:09Z",
+            "preferred_mode": "auto",
+            "preferred_policy": "strict_operator_health",
+            "preferred_rollout_id": "rollout_operator_1",
+            "comparisons": [
+                {
+                    "mode": "auto",
+                    "policy": "strict_operator_health",
+                    "ok": True,
+                    "rollout_id": "rollout_operator_1",
+                    "executor_kind": "operator_runtime_snapshot",
+                },
+                {
+                    "mode": "auto",
+                    "policy": "baseline_favoring_health",
+                    "ok": True,
+                    "rollout_id": "rollout_operator_2",
+                    "executor_kind": "operator_runtime_snapshot",
+                },
+            ],
+        },
+    )
+
+    result = service.build_cross_subsystem_scorecard(
+        comparison_paths=[archive_path, operator_path],
+        promote=True,
+    )
+
+    assert result["ok"] is True
+    assert len(result["promotions"]) == 2
+    assert all(bool(row.get("ok")) for row in result["promotions"])
+    registry = service.load_policy_registry()
+    entries = dict(registry.get("entries") or {})
+    assert entries["executor_kind:improvement_archive_suggest"]["preferred_policy"] == "strict_signature"
+    assert entries["executor_kind:operator_runtime_snapshot"]["preferred_policy"] == "strict_operator_health"
+
+
+def test_build_cross_subsystem_scorecard_skips_promotion_for_failed_subsystem(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "vera_memory"
+    work_jar = memory_dir / "autonomy_work_jar.json"
+    _write_json(work_jar, {"version": 1, "items": [], "archived_items": []})
+    _write_json(
+        memory_dir / "rollout_policy_registry.json",
+        {
+            "version": 1,
+            "entries": {
+                "executor_kind:autonomy_queue_surface_snapshot": {
+                    "scope": "executor_kind",
+                    "executor_kind": "autonomy_queue_surface_snapshot",
+                    "preferred_mode": "auto",
+                    "preferred_policy": "",
+                    "source_work_item_id": "older_probe",
+                }
+            },
+        },
+    )
+    service = RolloutService(
+        RolloutPaths(
+            work_jar_path=work_jar,
+            output_dir=memory_dir / "rollouts",
+            flight_recorder_dir=memory_dir / "flight_recorder",
+            registry_path=memory_dir / "rollout_policy_registry.json",
+        )
+    )
+    failing_path = tmp_path / "compare_queue_surface.json"
+    _write_json(
+        failing_path,
+        {
+            "ok": True,
+            "work_item_id": "awj_autonomy_queue_surface_snapshot_rollout_probe_01",
+            "finished_at_utc": "2026-03-28T22:15:58Z",
+            "preferred_mode": "auto",
+            "preferred_policy": "",
+            "preferred_rollout_id": "rollout_good_1",
+            "comparisons": [
+                {
+                    "mode": "artifact",
+                    "policy": "",
+                    "ok": False,
+                    "rollout_id": "rollout_bad_1",
+                    "executor_kind": "autonomy_queue_surface_snapshot",
+                },
+                {
+                    "mode": "auto",
+                    "policy": "",
+                    "ok": True,
+                    "rollout_id": "rollout_good_1",
+                    "executor_kind": "autonomy_queue_surface_snapshot",
+                },
+            ],
+        },
+    )
+
+    result = service.build_cross_subsystem_scorecard(
+        comparison_paths=[failing_path],
+        promote=True,
+    )
+
+    assert result["ok"] is True
+    assert len(result["promotions"]) == 1
+    assert result["promotions"][0]["ok"] is True
+    assert result["promotions"][0]["promotion_eligible"] is False
+    assert result["promotions"][0]["reason"] == "registry_entry_pruned"
+    assert service.load_policy_registry()["entries"] == {}
