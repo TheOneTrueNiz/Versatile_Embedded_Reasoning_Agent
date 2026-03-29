@@ -47,7 +47,7 @@
                             labelText="Model ID override"
                             inputId="local-model-override"
                             :value="localModelName"
-                            :placeholderText="'Enter a model ID (e.g., grok-4-1-fast-reasoning or a local OSS model)'"
+                            :placeholderText="'Enter a model ID (e.g., grok-4.20-experimental-beta-0304-reasoning or a local OSS model)'"
                             @update:value="updateModelOverride"
                         />
                         <p class="model-hint">

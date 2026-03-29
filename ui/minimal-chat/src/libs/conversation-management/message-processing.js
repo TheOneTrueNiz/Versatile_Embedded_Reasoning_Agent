@@ -219,7 +219,7 @@ async function handleGPTMessage(
         abortController.value = new AbortController();
 
         const storedModelName = localStorage.getItem('localModelName');
-        const fallbackModelName = storedModelName || localModelName || 'grok-4-1-fast-reasoning';
+        const fallbackModelName = storedModelName || localModelName || 'grok-4.20-experimental-beta-0304-reasoning';
         const hasOpenAiKey = Boolean(gptKey.value || localStorage.getItem('gptKey'));
         const endpoint = localModelEndpoint || window.location.origin;
         const isOpenAiFormat = selectedModel.includes('open-ai-format');
