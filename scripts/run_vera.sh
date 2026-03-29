@@ -23,6 +23,36 @@ compute_sha256() {
   fi
 }
 
+report_week1_source() {
+  local docx_candidates=()
+  local seed_csv="${ROOT_DIR}/ops/week1/WEEK1_SEEDED_TASK_BACKLOG.csv"
+  local candidate resolved
+
+  if [ -n "${VERA_WEEK1_DOCX_PATH:-}" ]; then
+    docx_candidates+=("${VERA_WEEK1_DOCX_PATH}")
+  fi
+  docx_candidates+=(
+    "${HOME}/Desktop/Vera_Week1_Operating_System_v10.docx"
+    "${ROOT_DIR}/ops/week1/Vera_Week1_Operating_System_v10.docx"
+  )
+
+  for candidate in "${docx_candidates[@]}"; do
+    [ -n "${candidate}" ] || continue
+    resolved="$(realpath -m "${candidate}")"
+    if [ -f "${resolved}" ]; then
+      echo "[VERA] Week1 source: docx (${resolved})"
+      return 0
+    fi
+  done
+
+  if [ -f "${seed_csv}" ]; then
+    echo "[VERA] Week1 source: seed CSV fallback (${seed_csv})"
+    return 0
+  fi
+
+  echo "[VERA] Week1 source: unavailable (no docx and no seed CSV at ${seed_csv})"
+}
+
 prune_preseed_backups() {
   local always_keep_basename="${1:-}"
   local keep_raw keep idx keep_slots
@@ -142,6 +172,12 @@ if [ -z "${API_KEY:-}" ] && [ -n "${XAI_API_KEY:-}" ]; then
   export API_KEY="${XAI_API_KEY}"
 fi
 
+# Broad filesystem access defaults for Vera (can be overridden by env).
+export VERA_FILESYSTEM_AUTO_EXPAND_HOME="${VERA_FILESYSTEM_AUTO_EXPAND_HOME:-1}"
+if [ -z "${VERA_FILESYSTEM_EXTRA_ROOTS:-}" ]; then
+  export VERA_FILESYSTEM_EXTRA_ROOTS="${HOME}:${HOME}/Desktop:${HOME}/Documents:${HOME}/Downloads:/tmp:/media:/mnt"
+fi
+
 if [ "${VERA_MAX:-0}" = "1" ]; then
   export VERA_VOICE=1
   export VERA_BROWSER=1
@@ -153,6 +189,8 @@ if [ "${VERA_MEMVID_ENABLED:-0}" = "1" ] || [ "${VERA_MEMVID_ENABLED:-0}" = "tru
   echo "[VERA] Memvid fast recall is experimental in VERA 2.0 and disabled by default."
   echo "[VERA] Proceeding because VERA_MEMVID_ENABLED is set."
 fi
+
+report_week1_source
 
 if [ ! -d "${VENV_DIR}" ]; then
   "${PYTHON_BIN}" -m venv "${VENV_DIR}"

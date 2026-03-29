@@ -23,6 +23,30 @@ VERA is a local-first agent runtime with:
 - `./scripts/restart_vera.sh --no-searxng`
 - `./.venv/bin/python run_vera_api.py --host 127.0.0.1 --port 8788 --logging`
 
+## Public Week1 Bootstrap
+- The public repo ships a deterministic Week1 seed backlog at:
+  - `ops/week1/WEEK1_SEEDED_TASK_BACKLOG.csv`
+- A private Week1 `.docx` is optional, not required.
+- Startup launchers now report which Week1 source will be used:
+  - private `.docx`, if found
+  - otherwise the shipped seed CSV fallback
+- CSV-only dry-run import:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/import_week1_operating_tasks.py \
+  --seed-csv ops/week1/WEEK1_SEEDED_TASK_BACKLOG.csv \
+  --dry-run
+```
+
+- Full Week1 executor dry-run:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/vera_week1_executor.py \
+  --vera-root . \
+  --base-url http://127.0.0.1:8788 \
+  --dry-run
+```
+
 ## Operator Docs
 - `RUNBOOK.md`
 - `OFFLINE_BOOTSTRAP.md`
