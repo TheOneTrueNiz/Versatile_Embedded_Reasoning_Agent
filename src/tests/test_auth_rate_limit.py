@@ -101,6 +101,14 @@ class TestResolveRateLimitBucket:
         assert max_req == 456
         assert window == 45.0
 
+    def test_local_outbox_get_uses_poll_bucket(self, monkeypatch):
+        monkeypatch.setenv("VERA_RATE_LIMIT_POLL_MAX", "456")
+        monkeypatch.setenv("VERA_RATE_LIMIT_POLL_WINDOW", "45")
+        bucket, max_req, window = self._resolve(self._fake_request("/api/channels/local/outbox", method="GET"))
+        assert bucket == "poll_rate_limit"
+        assert max_req == 456
+        assert window == 45.0
+
     def test_non_poll_post_uses_global_bucket(self, monkeypatch):
         monkeypatch.setenv("VERA_RATE_LIMIT_MAX", "77")
         monkeypatch.setenv("VERA_RATE_LIMIT_WINDOW", "70")

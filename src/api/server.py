@@ -44,6 +44,7 @@ from core.runtime.genome_config import (
     apply_genome_patch,
     load_genome_config,
 )
+from core.runtime.autonomy_runplane import ack_required_delivery_channels, run_requires_ack
 from observability.git_context import GitContext
 from core.services.push_notifications import PushNotificationService
 from core.services.native_push_notifications import NativePushNotificationService
@@ -219,6 +220,7 @@ def _evaluate_tools_readiness(app: web.Application) -> Dict[str, Any]:
     unknown_health_grace = float(os.getenv("VERA_STARTUP_UNKNOWN_HEALTH_GRACE_SECONDS", "15"))
     critical_wait_cap = _readiness_max_wait_seconds()
     app_uptime_seconds = max(0.0, time.time() - started_at)
+    warnings: List[Dict[str, Any]] = []
 
     for name in critical_servers:
         info = servers.get(name)
@@ -250,6 +252,18 @@ def _evaluate_tools_readiness(app: web.Application) -> Dict[str, Any]:
             continue
         pending_servers.append(name)
 
+    for name, info in servers.items():
+        warning = str(info.get("warning") or "").strip()
+        if not warning:
+            continue
+        warnings.append(
+            {
+                "server": name,
+                "message": warning,
+                "runtime_status": info.get("runtime_status") or {},
+            }
+        )
+
     ready = len(pending_servers) == 0
     degraded_servers = sorted({*blocked_servers, *missing_servers})
     if not ready:
@@ -276,6 +290,7 @@ def _evaluate_tools_readiness(app: web.Application) -> Dict[str, Any]:
         "blocked_servers": blocked_servers,
         "checked_at": checked_at,
         "uptime_seconds": max(0.0, time.time() - started_at),
+        "warnings": warnings,
         "mcp": {
             "total_configured": mcp_status.get("total_configured", 0),
             "total_running": mcp_status.get("total_running", 0),
@@ -1353,6 +1368,9 @@ _RATE_LIMIT_POLL_PREFIXES = (
     "/api/tools",
     "/api/memory/stats",
     "/api/session/activity",
+    "/api/session/links",
+    "/api/channels/status",
+    "/api/channels/local/outbox",
     "/api/confirmations/sync",
     "/api/innerlife/status",
 )
@@ -1413,7 +1431,7 @@ async def health(request: web.Request) -> web.Response:
     readiness = _evaluate_tools_readiness(request.app)
     vera = request.app.get("vera")
     bridge = getattr(vera, "_llm_bridge", None) if vera else None
-    model = getattr(bridge, "model", None) or os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
+    model = getattr(bridge, "model", None) or os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
     status = "ok" if readiness.get("ready") else ("degraded" if readiness.get("phase") == "degraded" else "error")
     return web.json_response({
         "ok": True,
@@ -1428,7 +1446,7 @@ async def readiness(request: web.Request) -> web.Response:
 
 
 async def list_models(request: web.Request) -> web.Response:
-    primary = os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
+    primary = os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
     models_env = os.getenv("VERA_MODELS", "")
     if models_env:
         models = [item.strip() for item in models_env.split(",") if item.strip()]
@@ -1465,7 +1483,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         raw_messages = [str(raw_messages)]
     last_user_text_raw = _get_last_user_text(raw_messages)
     last_user_text = last_user_text_raw.lower()
-    model = payload.get("model") or os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
+    model = payload.get("model") or os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
     stream = bool(payload.get("stream", False))
     tool_choice_override = payload.get("tool_choice")
     if last_user_text in {"/exit", "/quit", "/shutdown"}:
@@ -1760,7 +1778,7 @@ async def voice_chat_completions(request: web.Request) -> web.Response:
         payload.get("model")
         or os.getenv("VERA_CALLME_MODEL")
         or os.getenv("VERA_VOICE_MODEL")
-        or os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
+        or os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
     )
     generation_config = _extract_generation_config(payload)
     generation_config = _filter_generation_config_for_model(model, generation_config)
@@ -1907,7 +1925,19 @@ async def session_activity(request: web.Request) -> web.Response:
             logger.debug("Suppressed Exception in server")
             pass
 
-    return web.json_response({"ok": True, "conversation_id": resolved_conversation_id})
+    ack_run_id = _maybe_proxy_ack_on_session_activity(
+        request,
+        {
+            **(payload if isinstance(payload, dict) else {}),
+            "conversation_id": resolved_conversation_id,
+            "channel_id": channel_id,
+        },
+    )
+
+    response_payload: Dict[str, Any] = {"ok": True, "conversation_id": resolved_conversation_id}
+    if ack_run_id:
+        response_payload["ack_run_id"] = ack_run_id
+    return web.json_response(response_payload)
 
 
 def _session_link_map_path() -> Path:
@@ -3496,6 +3526,14 @@ async def local_loopback_inbound(request: web.Request) -> web.Response:
     text = str(payload.get("text") or "").strip()
     if not text:
         return web.json_response({"error": "Field 'text' is required."}, status=400)
+    wait_for_handler = bool(payload.get("wait", True))
+    raw_timeout = payload.get("timeout_seconds")
+    timeout_seconds: Optional[float] = None
+    if raw_timeout is not None:
+        try:
+            timeout_seconds = max(0.1, min(float(raw_timeout), 120.0))
+        except Exception:
+            timeout_seconds = None
 
     try:
         result = await adapter.inject_inbound(
@@ -3508,11 +3546,23 @@ async def local_loopback_inbound(request: web.Request) -> web.Response:
             thread_id=(str(payload.get("thread_id")).strip() if payload.get("thread_id") is not None else None),
             reply_to_id=(str(payload.get("reply_to_id")).strip() if payload.get("reply_to_id") is not None else None),
             raw=payload if isinstance(payload, dict) else {},
+            wait_for_handler=wait_for_handler,
+            timeout_seconds=timeout_seconds,
         )
         return web.json_response({
             "ok": True,
             "result": result,
         })
+    except asyncio.TimeoutError:
+        return web.json_response({
+            "ok": False,
+            "result": {
+                "status": "timeout",
+                "channel": adapter.channel_id,
+                "background": False,
+                "timeout_seconds": timeout_seconds,
+            },
+        }, status=202)
     except Exception as exc:
         logger.warning("Local loopback inbound error: %s", exc)
         return web.json_response({"error": "Loopback handler error"}, status=500)
@@ -3641,6 +3691,96 @@ def _append_push_ack(row: Dict[str, Any]) -> Tuple[bool, str]:
     return True, str(path)
 
 
+def _expected_reachout_ack_channels(app: web.Application, delivered_to: List[str]) -> List[str]:
+    channels: List[str] = list(ack_required_delivery_channels(delivered_to))
+    normalized = [str(item).strip().lower() for item in delivered_to if str(item).strip()]
+    if "api" not in normalized:
+        return channels
+
+    seen = set(channels)
+
+    push_service = app.get("push_service")
+    try:
+        if getattr(push_service, "enabled", False) and callable(getattr(push_service, "list_subscriptions", None)):
+            if push_service.list_subscriptions():
+                if "web_push" not in seen:
+                    channels.append("web_push")
+                    seen.add("web_push")
+    except Exception:
+        logger.debug("Failed to inspect web push state for reach-out ack expectation")
+
+    native_push_service = app.get("native_push_service")
+    try:
+        if (
+            getattr(native_push_service, "enabled", False)
+            and getattr(native_push_service, "configured", False)
+            and callable(getattr(native_push_service, "list_devices", None))
+        ):
+            if native_push_service.list_devices():
+                if "fcm" not in seen:
+                    channels.append("fcm")
+                    seen.add("fcm")
+    except Exception:
+        logger.debug("Failed to inspect native push state for reach-out ack expectation")
+
+    return channels
+
+
+def _effective_reachout_delivery_channels(app: web.Application, delivered_to: List[str]) -> List[str]:
+    normalized = [str(item).strip().lower() for item in delivered_to if str(item).strip()]
+    effective: List[str] = []
+    seen = set()
+
+    def _append(channel: str) -> None:
+        cleaned = str(channel or "").strip().lower()
+        if not cleaned or cleaned in seen:
+            return
+        seen.add(cleaned)
+        effective.append(cleaned)
+
+    api_present = "api" in normalized
+    for channel in normalized:
+        if channel == "api":
+            continue
+        _append(channel)
+
+    if api_present:
+        for channel in _expected_reachout_ack_channels(app, delivered_to):
+            _append(channel)
+
+    if not effective:
+        for channel in normalized:
+            _append(channel)
+
+    return effective
+
+
+def _ack_runplane_if_available(
+    request: web.Request,
+    *,
+    run_id: str,
+    ack_type: str,
+    source: str,
+) -> Dict[str, Any]:
+    target_run_id = str(run_id or "").strip()
+    if not target_run_id:
+        return {"ok": False, "reason": "missing_run_id"}
+    try:
+        vera = request.app.get("vera")
+        proactive = getattr(vera, "proactive_manager", None) if vera else None
+        runplane = getattr(proactive, "runplane", None) if proactive else None
+        if not runplane or not hasattr(runplane, "ack_run"):
+            return {"ok": False, "reason": "runplane_unavailable"}
+        return runplane.ack_run(
+            target_run_id,
+            ack_type=_normalize_push_ack_type(ack_type),
+            source=str(source or "unknown").strip().lower() or "unknown",
+        )
+    except Exception as exc:
+        logger.warning("Failed to ingest runplane ack for %s: %s", target_run_id, exc)
+        return {"ok": False, "reason": "runplane_ack_failed"}
+
+
 def _ack_exists_for_run_id(run_id: str, max_scan_lines: int = 200) -> bool:
     path = _push_ack_log_path()
     if not path.exists():
@@ -3660,6 +3800,53 @@ def _ack_exists_for_run_id(run_id: str, max_scan_lines: int = 200) -> bool:
         if isinstance(row, dict) and str(row.get("run_id") or "").strip() == run_id:
             return True
     return False
+
+
+def _close_superseded_reachout_runs(
+    app: web.Application,
+    *,
+    current_run_id: str,
+    max_to_close: int = 8,
+) -> int:
+    run_id = str(current_run_id or "").strip()
+    if not run_id:
+        return 0
+    vera = app.get("vera")
+    proactive = getattr(vera, "proactive_manager", None) if vera else None
+    runplane = getattr(proactive, "runplane", None) if proactive else None
+    if not runplane or not hasattr(runplane, "list_runs") or not hasattr(runplane, "mark_run_status"):
+        return 0
+
+    closed = 0
+    candidate_rows: List[Dict[str, Any]] = []
+    for status in ("delivered", "escalated"):
+        try:
+            rows = runplane.list_runs(limit=200, status_filter=status)
+        except Exception:
+            logger.debug("Failed to inspect runplane for superseded reachouts")
+            return closed
+        if isinstance(rows, list):
+            candidate_rows.extend(row for row in rows if isinstance(row, dict))
+
+    for row in candidate_rows:
+        if closed >= max_to_close:
+            break
+        row_run_id = str(row.get("run_id") or "").strip()
+        if not row_run_id or row_run_id == run_id:
+            continue
+        if str(row.get("kind") or "").strip().lower() != "delivery_reachout":
+            continue
+        if not run_requires_ack(row):
+            continue
+        mark = runplane.mark_run_status(
+            run_id=row_run_id,
+            status="closed",
+            source="reachout_superseded",
+            note=f"superseded_by:{run_id}",
+        )
+        if mark.get("ok"):
+            closed += 1
+    return closed
 
 
 def _parse_utc_timestamp(value: Any) -> Optional[datetime]:
@@ -3692,12 +3879,19 @@ def _maybe_proxy_ack_on_native_register(
     token: str,
 ) -> Optional[str]:
     explicit_run_id = str(payload.get("run_id") or payload.get("ack_run_id") or "").strip()[:128]
+    explicit_ack_type = str(payload.get("ack_type") or "opened")
     if explicit_run_id:
         if _ack_exists_for_run_id(explicit_run_id):
+            _ack_runplane_if_available(
+                request,
+                run_id=explicit_run_id,
+                ack_type=explicit_ack_type,
+                source="native_register_explicit_existing",
+            )
             return explicit_run_id
         row = _build_push_ack_row(
             run_id=explicit_run_id,
-            ack_type=str(payload.get("ack_type") or "opened"),
+            ack_type=explicit_ack_type,
             channel="fcm",
             source="native_register_explicit",
             device_id=token,
@@ -3705,6 +3899,13 @@ def _maybe_proxy_ack_on_native_register(
             metadata={"path": "native_register"},
         )
         ok, _ = _append_push_ack(row)
+        if ok:
+            _ack_runplane_if_available(
+                request,
+                run_id=explicit_run_id,
+                ack_type=explicit_ack_type,
+                source="native_register_explicit",
+            )
         return explicit_run_id if ok else None
 
     window_seconds = _parse_int_env("VERA_PUSH_REGISTER_ACK_WINDOW_SECONDS", 180, minimum=30)
@@ -3734,6 +3935,65 @@ def _maybe_proxy_ack_on_native_register(
         },
     )
     ok, _ = _append_push_ack(row)
+    if ok:
+        _ack_runplane_if_available(
+            request,
+            run_id=run_id,
+            ack_type="opened",
+            source="native_register_proxy",
+        )
+    return run_id if ok else None
+
+
+def _maybe_proxy_ack_on_session_activity(
+    request: web.Request,
+    payload: Dict[str, Any],
+) -> Optional[str]:
+    window_seconds = _parse_int_env("VERA_SESSION_ACTIVITY_ACK_WINDOW_SECONDS", 900, minimum=30)
+    last_reachout = request.app.get("last_reachout_event")
+    if not isinstance(last_reachout, dict):
+        return None
+    run_id = str(last_reachout.get("run_id") or "").strip()[:128]
+    timestamp = _parse_utc_timestamp(str(last_reachout.get("timestamp") or ""))
+    if not run_id or not timestamp:
+        return None
+    age_seconds = (datetime.now(timestamp.tzinfo) - timestamp).total_seconds()
+    if age_seconds < 0 or age_seconds > float(window_seconds):
+        return None
+    if _ack_exists_for_run_id(run_id):
+        _ack_runplane_if_available(
+            request,
+            run_id=run_id,
+            ack_type="opened",
+            source="session_activity_proxy_existing",
+        )
+        return run_id
+
+    channel_id = str(payload.get("channel_id") or "ui").strip().lower()[:64] or "ui"
+    conversation_id = str(payload.get("conversation_id") or "").strip()[:128]
+    trigger = str(payload.get("trigger") or "").strip()[:128]
+    row = _build_push_ack_row(
+        run_id=run_id,
+        ack_type="opened",
+        channel=channel_id,
+        source="session_activity_proxy",
+        event_type="innerlife.reached_out",
+        metadata={
+            "path": "session_activity_proxy",
+            "window_seconds": window_seconds,
+            "age_seconds": round(age_seconds, 3),
+            "conversation_id": conversation_id,
+            "trigger": trigger,
+        },
+    )
+    ok, _ = _append_push_ack(row)
+    if ok:
+        _ack_runplane_if_available(
+            request,
+            run_id=run_id,
+            ack_type="opened",
+            source="session_activity_proxy",
+        )
     return run_id if ok else None
 
 
@@ -3916,6 +4176,12 @@ async def push_native_ack(request: web.Request) -> web.Response:
     ok, path = _append_push_ack(row)
     if not ok:
         return web.json_response({"ok": False, "error": path}, status=500)
+    runplane_ack = _ack_runplane_if_available(
+        request,
+        run_id=run_id,
+        ack_type=ack_type,
+        source=source or "native_ack",
+    )
 
     return web.json_response(
         {
@@ -3923,6 +4189,7 @@ async def push_native_ack(request: web.Request) -> web.Response:
             "run_id": run_id,
             "ack_type": ack_type,
             "log_path": path,
+            "runplane_ack": runplane_ack,
         }
     )
 
@@ -4172,11 +4439,21 @@ async def tools_start(request: web.Request) -> web.Response:
     vera = request.app["vera"]
     payload = await request.json()
     servers = payload.get("servers")
+    start_timeout = _parse_float_env("VERA_MCP_MANUAL_START_TIMEOUT_SECONDS", 20.0, minimum=1.0)
+
+    def _start_server(name: str) -> bool:
+        starter = getattr(vera.mcp, "start_server_with_timeout", None)
+        if callable(starter):
+            return bool(starter(name, start_timeout))
+        bounded = getattr(vera.mcp, "_start_server_with_timeout", None)
+        if callable(bounded):
+            return bool(bounded(name, start_timeout))
+        return bool(vera.mcp.start_server(name))
 
     if servers:
         results = {}
         for name in servers:
-            results[name] = await asyncio.to_thread(vera.mcp.start_server, name)
+            results[name] = await asyncio.to_thread(_start_server, name)
         return web.json_response({"started": results})
 
     await asyncio.to_thread(vera.mcp.start_all)
@@ -4220,6 +4497,43 @@ async def tools_last_payload(request: web.Request) -> web.Response:
     if bridge and getattr(bridge, "get_last_tool_payload", None):
         payload = bridge.get_last_tool_payload()
     return web.json_response({"payload": payload})
+
+
+async def tools_preview(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    bridge = getattr(vera, "_llm_bridge", None)
+    if bridge is None and getattr(vera, "llm_router", None):
+        bridge = vera.llm_router.create_bridge()
+        vera._llm_bridge = bridge
+    if not bridge or not getattr(bridge, "_build_tool_schemas", None):
+        return web.json_response({"ok": False, "error": "LLM bridge unavailable"}, status=503)
+
+    payload: Dict[str, Any] = {}
+    if request.can_read_body:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+    context = str(payload.get("context") or "").strip()
+    if not context:
+        return web.json_response({"ok": False, "error": "context is required"}, status=400)
+
+    try:
+        tools, tool_choice, explicit = await bridge._build_tool_schemas(context=context)
+        preview_payload = bridge.get_last_tool_payload() if getattr(bridge, "get_last_tool_payload", None) else {}
+        return web.json_response(
+            {
+                "ok": True,
+                "tool_count": len(tools or []),
+                "tool_choice": tool_choice,
+                "explicit_tools": list(explicit or []),
+                "payload": preview_payload,
+            }
+        )
+    except Exception as exc:
+        logger.exception("tools_preview failed")
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
 async def tools_history(request: web.Request) -> web.Response:
@@ -4675,8 +4989,18 @@ async def innerlife_autonomy_cycle(request: web.Request) -> web.Response:
     trigger = str(payload.get("trigger") or "manual_api")
     force = bool(payload.get("force", False))
     wait_for_completion = bool(payload.get("wait", False))
-    timeout_seconds = float(payload.get("timeout_seconds", 0) or 0)
-    timeout_seconds = max(1.0, min(timeout_seconds, 300.0)) if wait_for_completion else 0.0
+    timeout_raw = payload.get("timeout_seconds", None)
+    if wait_for_completion:
+        if timeout_raw in (None, "", 0, 0.0):
+            timeout_seconds = 30.0
+        else:
+            try:
+                timeout_seconds = float(timeout_raw)
+            except Exception:
+                timeout_seconds = 30.0
+        timeout_seconds = max(1.0, min(timeout_seconds, 300.0))
+    else:
+        timeout_seconds = 0.0
 
     try:
         scheduled = proactive.action_autonomy_cycle({"trigger": trigger, "force": force})
@@ -4703,12 +5027,295 @@ async def innerlife_autonomy_cycle(request: web.Request) -> web.Response:
         return web.json_response(response_payload)
     except asyncio.TimeoutError:
         return web.json_response(
-            {"scheduled": True, "completed": False, "error": "autonomy cycle timed out"},
-            status=504,
+            {
+                "scheduled": True,
+                "completed": False,
+                "in_progress": True,
+                "timeout_seconds": timeout_seconds,
+                "error": "autonomy cycle timed out; continuing in background",
+            },
+            status=202,
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("Failed to schedule autonomy cycle")
         return web.json_response({"error": "Internal server error."}, status=500)
+
+
+async def autonomy_action_run(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    proactive = getattr(vera, "proactive_manager", None)
+    if not proactive:
+        return web.json_response({"error": "Proactive manager unavailable."}, status=503)
+
+    payload: Dict[str, Any] = {}
+    if request.can_read_body:
+        try:
+            raw = await request.json()
+            if isinstance(raw, dict):
+                payload = raw
+        except Exception:
+            payload = {}
+
+    action_type = str(payload.get("action_type") or "").strip()
+    allowed_actions = {
+        "check_tasks",
+        "week1_due_check",
+        "red_team_check",
+        "reload_config",
+    }
+    if action_type not in allowed_actions:
+        return web.json_response(
+            {"error": "Unsupported autonomy action.", "allowed_actions": sorted(allowed_actions)},
+            status=400,
+        )
+
+    handler = getattr(proactive, f"action_{action_type}", None)
+    if not callable(handler):
+        return web.json_response({"error": "Action handler unavailable."}, status=503)
+
+    action_payload = payload.get("payload")
+    if not isinstance(action_payload, dict):
+        action_payload = {}
+
+    try:
+        result = handler(action_payload)
+        return web.json_response({"ok": True, "action_type": action_type, "result": result})
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to run autonomy action")
+        return web.json_response({"error": "Internal server error."}, status=500)
+
+
+async def autonomy_jobs(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    proactive = getattr(vera, "proactive_manager", None)
+    runplane = getattr(proactive, "runplane", None) if proactive else None
+    if not runplane:
+        return web.json_response({"error": "Autonomy runplane unavailable."}, status=503)
+
+    try:
+        limit = int(str(request.query.get("limit", "200")).strip())
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 2000))
+    state_filter = str(request.query.get("state", "") or "").strip().lower()
+    if state_filter and state_filter not in {
+        "planned",
+        "due",
+        "running",
+        "delivered",
+        "acked",
+        "escalated",
+        "closed",
+        "failed",
+        "dead_letter",
+    }:
+        return web.json_response({"error": "invalid state filter"}, status=400)
+
+    rows = runplane.list_jobs(limit=limit, state_filter=state_filter)
+    payload = {
+        "count": len(rows),
+        "limit": limit,
+        "state_filter": state_filter or "all",
+        "jobs": rows,
+        "status": runplane.status_snapshot(),
+    }
+    return web.json_response(json.loads(json.dumps(payload, default=str)))
+
+
+async def autonomy_runs(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    proactive = getattr(vera, "proactive_manager", None)
+    runplane = getattr(proactive, "runplane", None) if proactive else None
+    if not runplane:
+        return web.json_response({"error": "Autonomy runplane unavailable."}, status=503)
+
+    try:
+        limit = int(str(request.query.get("limit", "200")).strip())
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 4000))
+    job_id = str(request.query.get("job_id", "") or "").strip()
+    status_filter = str(request.query.get("status", "") or "").strip().lower()
+    if status_filter and status_filter not in {
+        "planned",
+        "due",
+        "running",
+        "delivered",
+        "acked",
+        "escalated",
+        "closed",
+        "failed",
+        "dead_letter",
+    }:
+        return web.json_response({"error": "invalid status filter"}, status=400)
+
+    rows = runplane.list_runs(limit=limit, job_id=job_id, status_filter=status_filter)
+    payload = {
+        "count": len(rows),
+        "limit": limit,
+        "job_id": job_id or "",
+        "status_filter": status_filter or "all",
+        "runs": rows,
+        "status": runplane.status_snapshot(),
+    }
+    return web.json_response(json.loads(json.dumps(payload, default=str)))
+
+
+async def autonomy_runs_mark(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    proactive = getattr(vera, "proactive_manager", None)
+    runplane = getattr(proactive, "runplane", None) if proactive else None
+    if not runplane:
+        return web.json_response({"error": "Autonomy runplane unavailable."}, status=503)
+
+    payload: Dict[str, Any] = {}
+    if request.can_read_body:
+        try:
+            raw = await request.json()
+            if isinstance(raw, dict):
+                payload = raw
+        except Exception:
+            payload = {}
+
+    run_id = str(payload.get("run_id") or "").strip()
+    status = str(payload.get("status") or "").strip().lower()
+    source = str(payload.get("source") or "api").strip()
+    note = str(payload.get("note") or "").strip()
+    if not run_id or not status:
+        return web.json_response({"error": "run_id and status required"}, status=400)
+
+    result = runplane.mark_run_status(
+        run_id=run_id,
+        status=status,
+        source=source,
+        note=note,
+    )
+    if not result.get("ok"):
+        reason = str(result.get("reason") or "mark_failed")
+        status_code = 404 if reason == "run_not_found" else 400
+        return web.json_response({"ok": False, "error": reason, "result": result}, status=status_code)
+    response_payload = {
+        "ok": True,
+        "result": result,
+        "status": runplane.status_snapshot(),
+        "slo": runplane.slo_snapshot(),
+    }
+    return web.json_response(json.loads(json.dumps(response_payload, default=str)))
+
+
+async def autonomy_dead_letter(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    proactive = getattr(vera, "proactive_manager", None)
+    runplane = getattr(proactive, "runplane", None) if proactive else None
+    if not runplane:
+        return web.json_response({"error": "Autonomy runplane unavailable."}, status=503)
+
+    try:
+        limit = int(str(request.query.get("limit", "200")).strip())
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 2000))
+    rows = runplane.list_dead_letters(limit=limit)
+    payload = {
+        "count": len(rows),
+        "limit": limit,
+        "dead_letters": rows,
+        "status": runplane.status_snapshot(),
+    }
+    return web.json_response(json.loads(json.dumps(payload, default=str)))
+
+
+async def autonomy_dead_letter_replay(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    proactive = getattr(vera, "proactive_manager", None)
+    runplane = getattr(proactive, "runplane", None) if proactive else None
+    if not runplane:
+        return web.json_response({"error": "Autonomy runplane unavailable."}, status=503)
+
+    payload: Dict[str, Any] = {}
+    if request.can_read_body:
+        try:
+            raw = await request.json()
+            if isinstance(raw, dict):
+                payload = raw
+        except Exception:
+            payload = {}
+    run_id = str(payload.get("run_id") or "").strip()
+    job_id = str(payload.get("job_id") or "").strip()
+    trigger = str(payload.get("trigger") or "api_replay").strip() or "api_replay"
+    if not run_id and not job_id:
+        return web.json_response({"error": "run_id or job_id required"}, status=400)
+
+    result = runplane.replay_dead_letter(run_id=run_id, job_id=job_id, trigger=trigger)
+    if result.get("ok"):
+        response_payload = {
+            "ok": True,
+            "result": result,
+            "status": runplane.status_snapshot(),
+            "slo": runplane.slo_snapshot(),
+        }
+        return web.json_response(json.loads(json.dumps(response_payload, default=str)))
+
+    reason = str(result.get("reason") or "replay_failed")
+    status_code = 404 if reason in {"dead_letter_not_found", "job_not_found"} else 400
+    return web.json_response({"ok": False, "error": reason, "result": result}, status=status_code)
+
+
+async def autonomy_slo(request: web.Request) -> web.Response:
+    vera = request.app["vera"]
+    proactive = getattr(vera, "proactive_manager", None)
+    runplane = getattr(proactive, "runplane", None) if proactive else None
+    if not runplane:
+        return web.json_response({"error": "Autonomy runplane unavailable."}, status=503)
+
+    payload = {
+        "slo": runplane.slo_snapshot(),
+        "operator_baseline": runplane.operator_baseline_snapshot(),
+        "status": runplane.status_snapshot(),
+    }
+    slo_windows = getattr(runplane, "slo_windows_snapshot", None)
+    if callable(slo_windows):
+        try:
+            payload["windows"] = slo_windows()
+        except Exception:
+            logger.debug("Failed to compute autonomy SLO windows", exc_info=True)
+    return web.json_response(json.loads(json.dumps(payload, default=str)))
+
+
+async def improvement_archive_suggest(request: web.Request) -> web.Response:
+    payload: Dict[str, Any] = {}
+    if request.can_read_body:
+        try:
+            raw = await request.json()
+            if isinstance(raw, dict):
+                payload = raw
+        except Exception:
+            payload = {}
+
+    archive_path = Path(str(payload.get("archive_path") or "vera_memory/improvement_archive.json"))
+    if not archive_path.exists():
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "improvement_archive_missing",
+                "archive_path": str(archive_path),
+            },
+            status=404,
+        )
+
+    try:
+        from observability.improvement_archive import suggest_improvement_entries
+
+        result = suggest_improvement_entries(
+            archive_path=archive_path,
+            problem_signature=str(payload.get("problem_signature") or ""),
+            failure_class=str(payload.get("failure_class") or ""),
+            limit=max(0, int(payload.get("limit") or 3)),
+        )
+        return web.json_response({"ok": True, "result": result})
+    except Exception as exc:
+        logger.exception("improvement_archive_suggest failed")
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
 async def browser_status(request: web.Request) -> web.Response:
@@ -4888,6 +5495,27 @@ def _release_mcp_call_capacity(
         global_sem.release()
 
 
+def _mcp_server_not_running_error(vera, server_name: str) -> str:
+    try:
+        status = vera.mcp.get_status()
+    except Exception:
+        return ""
+    if not isinstance(status, dict):
+        return ""
+    servers = status.get("servers")
+    if not isinstance(servers, dict):
+        return ""
+    info = servers.get(server_name)
+    if not isinstance(info, dict):
+        return ""
+    running = info.get("running")
+    effective_health = str(info.get("effective_health") or "").strip().lower()
+    health = str(info.get("health") or "").strip().lower()
+    if running is False or effective_health in {"stopped", "unhealthy"} or health == "stopped":
+        return f"MCP server {server_name} not running"
+    return ""
+
+
 async def tools_call(request: web.Request) -> web.Response:
     vera = request.app["vera"]
     payload = await request.json()
@@ -4896,7 +5524,11 @@ async def tools_call(request: web.Request) -> web.Response:
     if not tool_name:
         return web.json_response({"error": "Tool name is required."}, status=400)
 
-    args = payload.get("arguments") or {}
+    args = payload.get("arguments")
+    if args is None:
+        args = payload.get("args")
+    if args is None:
+        args = {}
     if not isinstance(args, dict):
         return web.json_response({"error": "Tool arguments must be an object."}, status=400)
 
@@ -4913,10 +5545,14 @@ async def tools_call(request: web.Request) -> web.Response:
     if not server_name:
         return web.json_response({"error": "Server name is required for MCP tools."}, status=400)
 
-    try:
-        timeout = float(payload.get("timeout", 20))
-    except (TypeError, ValueError):
-        return web.json_response({"error": "timeout must be a number."}, status=400)
+    timeout_value = payload.get("timeout")
+    if timeout_value is None:
+        timeout = _default_mcp_tool_timeout_seconds(server_name, str(tool_name))
+    else:
+        try:
+            timeout = float(timeout_value)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "timeout must be a number."}, status=400)
     if timeout <= 0:
         return web.json_response({"error": "timeout must be > 0."}, status=400)
 
@@ -4929,6 +5565,16 @@ async def tools_call(request: web.Request) -> web.Response:
             timeout,
         )
     except asyncio.TimeoutError:
+        unavailable_error = _mcp_server_not_running_error(vera, server_name)
+        if unavailable_error:
+            return web.json_response(
+                {
+                    "error": unavailable_error,
+                    "server": server_name,
+                    "tool": tool_name,
+                },
+                status=502,
+            )
         return web.json_response(
             {
                 "error": "Tool server is busy; please retry.",
@@ -4950,11 +5596,57 @@ async def tools_call(request: web.Request) -> web.Response:
         )
     except Exception as exc:
         logger.error("MCP tool call %s/%s failed: %s", server_name, tool_name, exc)
-        return web.json_response({"error": "Internal server error."}, status=500)
+        return web.json_response(
+            {"error": _safe_mcp_exception_text(exc), "server": server_name, "tool": tool_name},
+            status=502,
+        )
     finally:
         _release_mcp_call_capacity(capacity_global, capacity_server)
 
+    mcp_error = _extract_mcp_error_text(result)
+    if mcp_error:
+        logger.warning("MCP tool call %s/%s returned error payload: %s", server_name, tool_name, mcp_error)
+        return web.json_response(
+            {"error": mcp_error, "server": server_name, "tool": tool_name},
+            status=502,
+        )
+
     return web.json_response({"result": result, "tool": tool_name, "server": server_name, "type": "mcp"})
+
+
+def _default_mcp_tool_timeout_seconds(server_name: str, tool_name: str) -> float:
+    server = str(server_name or "").strip().lower()
+    tool = str(tool_name or "").strip().lower()
+    if server == "call-me" and tool == "initiate_call":
+        return 75.0
+    return 20.0
+
+
+def _safe_mcp_exception_text(exc: Exception) -> str:
+    text = str(exc or "").strip()
+    if not text:
+        return "MCP tool execution failed."
+    return text
+
+
+def _extract_mcp_error_text(result: Any) -> str:
+    if not isinstance(result, dict) or not result.get("isError"):
+        return ""
+    content = result.get("content")
+    if isinstance(content, list):
+        for entry in content:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text") or "").strip()
+            if text:
+                return text
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        for key in ("error", "message", "detail", "result", "text"):
+            value = structured.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return "MCP tool returned error payload."
 
 
 async def _call_mcp_tool(
@@ -4965,10 +5657,13 @@ async def _call_mcp_tool(
     timeout: float,
 ) -> Tuple[bool, str]:
     try:
-        await asyncio.wait_for(
+        result = await asyncio.wait_for(
             asyncio.to_thread(vera.mcp.call_tool, server, tool, args, timeout),
             timeout=timeout + 1.0,
         )
+        mcp_error = _extract_mcp_error_text(result)
+        if mcp_error:
+            return False, mcp_error
         return True, ""
     except asyncio.TimeoutError:
         return False, "timed out"
@@ -5065,7 +5760,12 @@ async def tools_verify(request: web.Request) -> web.Response:
             vera,
             "sequential-thinking",
             "sequentialthinking",
-            {"thought": "diagnostic test", "max_steps": 3},
+            {
+                "thought": "diagnostic test",
+                "nextThoughtNeeded": False,
+                "thoughtNumber": 1,
+                "totalThoughts": 1,
+            },
             timeout,
         )
         record("ok" if ok else "fail", "sequential-thinking", detail)
@@ -5780,7 +6480,7 @@ async def api_ping(request: web.Request) -> web.Response:
     """Simple connection test — UI measures round-trip latency client-side."""
     vera = request.app.get("vera")
     bridge = getattr(vera, "_llm_bridge", None) if vera else None
-    model = getattr(bridge, "model", None) or os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
+    model = getattr(bridge, "model", None) or os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
     return web.json_response({
         "pong": True,
         "model": model,
@@ -6429,6 +7129,7 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app["push_service"] = PushNotificationService()
     app["native_push_service"] = NativePushNotificationService()
     app["last_reachout_event"] = {}
+    app["reachout_runplane_seen"] = {}
     app["started_at"] = time.time()
     app["tool_execution_history"] = []  # In-memory ring buffer for tool execution tracking
     app["vera_api_key"] = _get_secret_env("VERA_API_KEY")
@@ -6449,6 +7150,7 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/readiness", readiness)
     app.router.add_get("/api/tools", tools_status)
+    app.router.add_get("/api/tools/status", tools_status)
     app.router.add_get("/api/channels/status", channels_status)
     app.router.add_get("/api/channels/whatsapp/webhook", whatsapp_webhook_verify)
     app.router.add_post("/api/channels/whatsapp/webhook", whatsapp_webhook_receive)
@@ -6471,6 +7173,7 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app.router.add_get("/api/tools/list", tools_list)
     app.router.add_get("/api/tools/defs", tools_defs)
     app.router.add_get("/api/tools/last_payload", tools_last_payload)
+    app.router.add_post("/api/tools/preview", tools_preview)
     app.router.add_post("/api/tools/start", tools_start)
     app.router.add_post("/api/tools/restart", tools_restart)
     app.router.add_post("/api/tools/call", tools_call)
@@ -6489,6 +7192,14 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     app.router.add_get("/api/learning/lora-readiness", learning_loop_lora_readiness)
     app.router.add_post("/api/learning/run-cycle", learning_loop_run_cycle)
     app.router.add_get("/api/innerlife/status", innerlife_status)
+    app.router.add_get("/api/autonomy/jobs", autonomy_jobs)
+    app.router.add_post("/api/autonomy/actions/run", autonomy_action_run)
+    app.router.add_get("/api/autonomy/runs", autonomy_runs)
+    app.router.add_post("/api/autonomy/runs/mark", autonomy_runs_mark)
+    app.router.add_get("/api/autonomy/dead-letter", autonomy_dead_letter)
+    app.router.add_post("/api/autonomy/dead-letter/replay", autonomy_dead_letter_replay)
+    app.router.add_get("/api/autonomy/slo", autonomy_slo)
+    app.router.add_post("/api/improvement-archive/suggest", improvement_archive_suggest)
     app.router.add_post("/api/innerlife/goals", innerlife_goals_add)
     app.router.add_post("/api/innerlife/reflect", innerlife_reflect)
     app.router.add_post("/api/innerlife/autonomy-cycle", innerlife_autonomy_cycle)
@@ -6581,6 +7292,89 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
     push_service = app.get("push_service")
     event_bus = getattr(vera, "event_bus", None)
     if event_bus:
+        def _record_reachout_delivery_run(payload: Dict[str, Any], timestamp: Any) -> None:
+            run_id = str(payload.get("run_id") or "").strip()
+            if not run_id:
+                return
+            proactive = getattr(vera, "proactive_manager", None)
+            runplane = getattr(proactive, "runplane", None) if proactive else None
+            if not runplane:
+                return
+            seen = app.get("reachout_runplane_seen")
+            if not isinstance(seen, dict):
+                seen = {}
+                app["reachout_runplane_seen"] = seen
+            if run_id in seen:
+                return
+            seen[run_id] = time.time()
+            if len(seen) > 512:
+                for stale_run_id, _ in sorted(seen.items(), key=lambda item: float(item[1]))[:128]:
+                    seen.pop(stale_run_id, None)
+
+            delivered_to_raw = payload.get("delivered_to")
+            delivered_to = [str(item).strip() for item in delivered_to_raw] if isinstance(delivered_to_raw, list) else []
+            delivered_to = [item for item in delivered_to if item][:8]
+            effective_delivered_to = _effective_reachout_delivery_channels(app, delivered_to)
+            ack_channels = _expected_reachout_ack_channels(app, delivered_to)
+            ack_expected = bool(ack_channels)
+
+            job_id = f"delivery.reachout.{run_id}"
+            lane_key = f"delivery:reachout:{run_id}"
+            begin = runplane.begin_run(
+                job_id=job_id,
+                lane_key=lane_key,
+                trigger="innerlife.reached_out",
+                kind="delivery_reachout",
+                metadata={
+                    "external_run_id": run_id,
+                    "innerlife_run_id": run_id,
+                    "ack_expected": ack_expected,
+                    "ack_channels": list(ack_channels),
+                },
+                max_attempts=4,
+            )
+            if not begin.get("ok"):
+                return
+            runplane_run_id = str(begin.get("run_id") or "").strip()
+            if not runplane_run_id:
+                return
+
+            result_payload = {
+                "external_run_id": run_id,
+                "innerlife_run_id": run_id,
+                "event_timestamp": str(timestamp),
+                "delivered_to": effective_delivered_to,
+                "delivery_source_channels": delivered_to,
+                "ack_expected": ack_expected,
+            }
+            if ack_channels:
+                result_payload["ack_channels"] = list(ack_channels)
+            if effective_delivered_to:
+                complete_result = runplane.complete_run(
+                    job_id=job_id,
+                    run_id=runplane_run_id,
+                    ok=True,
+                    status="delivered",
+                    result=result_payload,
+                )
+                if complete_result.get("ok"):
+                    _close_superseded_reachout_runs(
+                        app,
+                        current_run_id=runplane_run_id,
+                    )
+            else:
+                runplane.complete_run(
+                    job_id=job_id,
+                    run_id=runplane_run_id,
+                    ok=False,
+                    failure_class="delivery_unroutable",
+                    retryable=True,
+                    result={
+                        **result_payload,
+                        "reason": "no_delivery_channels",
+                    },
+                )
+
         def _track_innerlife_reachout(event) -> None:
             if event.event_type != "innerlife.reached_out":
                 return
@@ -6591,6 +7385,11 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
             try:
                 app["last_reachout_event"] = {"run_id": run_id, "timestamp": str(event.timestamp)}
             except Exception:
+                pass
+            try:
+                _record_reachout_delivery_run(payload, event.timestamp)
+            except Exception:
+                logger.debug("Suppressed Exception in server")
                 pass
 
         try:
@@ -6678,6 +7477,46 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
                 logger.debug("Suppressed Exception in server")
                 pass
 
+        def _on_innerlife_native(event) -> None:
+            if not loop:
+                return
+            if event.event_type != "innerlife.reached_out":
+                return
+            native_service = app.get("native_push_service")
+            if not isinstance(native_service, NativePushNotificationService):
+                return
+            if not native_service.enabled or not native_service.configured:
+                return
+            try:
+                if not native_service.list_devices():
+                    return
+            except Exception:
+                logger.debug("Suppressed Exception in server")
+                return
+            event_payload = event.payload if isinstance(event.payload, dict) else {}
+            run_id = str(event_payload.get("run_id") or "").strip()
+            push_data: Dict[str, Any] = {
+                "event_type": event.event_type,
+                "timestamp": event.timestamp,
+            }
+            if run_id:
+                push_data["run_id"] = run_id
+                push_data["ack_endpoint"] = "/api/push/native/ack"
+                push_data["ack_type"] = "opened"
+            delivered_to = event_payload.get("delivered_to")
+            if isinstance(delivered_to, list):
+                push_data["delivered_to"] = [str(item) for item in delivered_to if str(item).strip()]
+            payload = {
+                "title": "VERA reached out",
+                "body": "VERA has a new update. Tap to open.",
+                "data": push_data,
+            }
+            try:
+                asyncio.run_coroutine_threadsafe(native_service.broadcast(payload), loop)
+            except Exception:
+                logger.debug("Suppressed Exception in server")
+                pass
+
         def _on_message(event) -> None:
             if event.event_type != "message.assistant" or not push_message_events:
                 return
@@ -6743,6 +7582,11 @@ def create_app(vera, ui_dist: Optional[Path] = None) -> web.Application:
                 "innerlife.reached_out",
                 _on_innerlife,
                 subscriber_id="push-innerlife",
+            )
+            event_bus.subscribe(
+                "innerlife.reached_out",
+                _on_innerlife_native,
+                subscriber_id="native-push-innerlife",
             )
             event_bus.subscribe(
                 "message.assistant",
