@@ -1,0 +1,14 @@
+WEEK 1 TASK IMPORT CHECKLIST
+
+For each task imported:
+[ ] Task title normalized
+[ ] Priority assigned (P0/P1/P2)
+[ ] START STEP defined (<= 2 minutes)
+[ ] Initial reminder scheduled
+[ ] Status prompt included (DONE/STARTED/SNOOZE 10/RESCHEDULE)
+[ ] Escalation ladder attached
+[ ] Quiet-hours behavior set
+[ ] Definition of done set
+
+Suggested ACK tokens:
+WATER, ATE, MOVED, BATHROOM, JOINED, SUBMITTED, DONE, COMPLETE

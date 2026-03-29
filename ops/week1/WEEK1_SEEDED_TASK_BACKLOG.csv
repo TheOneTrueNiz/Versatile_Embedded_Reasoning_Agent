@@ -1,0 +1,19 @@
+category,task,priority,start_step,default_status_prompt,notes
+Home logistics,Order Hungryroot and set recurring drinks/snacks,P1,"Open Hungryroot and check last order items",DONE|STARTED|SNOOZE 10|RESCHEDULE,"reduce household friction"
+Home logistics,Email wealth manager,P1,"Open draft and write 2-sentence update request",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Home logistics,Figure out insurance cost and health coverage,P0,"List current policy provider and renewal date",DONE|STARTED|SNOOZE 10|RESCHEDULE,"appointment/admin item"
+Appointments,Make vet appointment for dog,P1,"Find clinic phone number and preferred day",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Appointments,Make colonoscopy appointment,P0,"Identify preferred clinic and call window",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Appointments,Make ADHD/autism assessment appointment,P0,"List 3 providers and preferred contact method",DONE|STARTED|SNOOZE 10|RESCHEDULE,"learning/mitigation focus"
+Cleaning baseline,Dog bath and bedding clean,P1,"Gather bath supplies and start water",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Cleaning baseline,Vacuum whole house,P1,"Plug in vacuum and do first room only",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Cleaning baseline,Swiffer worst spots,P2,"Swiffer one highest-traffic area",DONE|STARTED|SNOOZE 10|RESCHEDULE,"mop later"
+Cleaning baseline,Clean kitchen + dishes + mop floor,P1,"Clear sink and run first dish cycle",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Cleaning baseline,Clean bathrooms and reset,P1,"Clear counter surfaces in one bathroom",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Cleaning baseline,Sort clothes and bin then put away in chunks,P1,"Sort one basket into keep/wash/put-away",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Cleaning baseline,Walls and windows,P2,"Pick one window and clean it",DONE|STARTED|SNOOZE 10|RESCHEDULE,"lowest priority unless urgent"
+Declutter,Clean laundry room shelves keep/toss,P1,"Pick one shelf and label keep/toss",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Declutter,Declutter Ezra room with keep/toss decisions,P1,"Collect one small pile for Ezra review",DONE|STARTED|SNOOZE 10|RESCHEDULE,"avoid tossing without review"
+Declutter,Declutter Isaac room with keep/toss decisions,P1,"Collect one small pile for Isaac review",DONE|STARTED|SNOOZE 10|RESCHEDULE,"avoid tossing without review"
+Declutter,Clean my room and clear nightstand,P1,"Clear nightstand top only",DONE|STARTED|SNOOZE 10|RESCHEDULE,
+Declutter,Clean toy room in chunks,P1,"Set 10-minute timer and clear one zone",DONE|STARTED|SNOOZE 10|RESCHEDULE,
