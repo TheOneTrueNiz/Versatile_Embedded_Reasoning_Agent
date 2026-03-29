@@ -154,7 +154,7 @@ Retention controls:
 
 - `scripts/run_vera.sh` and `scripts/run_vera_full.sh` auto-load secrets from OS keychain by default.
 - Disable keychain autoload with `VERA_KEYCHAIN_LOAD=0`.
-- The legacy `CREDS_DIR` location remains as a compatibility fallback.
+- Legacy file-based credential fallback remains available for migration scenarios.
 - Preferred production pattern is environment/secret-manager injection.
 
 ## 11) Memory Footprint Budget
@@ -235,3 +235,125 @@ Strict proactive soak (tier-3 required) reads the ack log by default:
 ```
 
 For browser push, the service worker posts click/open acknowledgements automatically when push payload includes `run_id`.
+
+## 14) Week1 Continuous Cadence Executor
+
+- Runtime owner: `src/core/runtime/proactive_manager.py`
+- Executor script: `scripts/vera_week1_executor.py`
+- Cadence model: timer-driven tick under autonomy cadence (not startup-only)
+- State and evidence:
+  - `vera_memory/week1_executor_state.json`
+  - `vera_memory/week1_executor_events.jsonl`
+
+Default behavior:
+- Daily Week1 task import/reconciliation through `scripts/import_week1_operating_tasks.py`
+- Public-clone fallback:
+  - if no private Week1 `.docx` resolves, the importer now uses the shipped seed backlog at `ops/week1/WEEK1_SEEDED_TASK_BACKLOG.csv`
+  - `scripts/run_vera.sh` and `scripts/run_vera_full.sh` print the detected Week1 source at startup
+- Due-time anchors:
+  - 07:30 Isaac Learning Boost (email)
+  - 08:00 wake call (+ push fallback)
+  - 08:05 daily sweep (push)
+  - 08:10 morning merge (push)
+  - 12:00 midday check (push)
+  - 12:05 low-dopamine start step (push)
+  - 15:00 follow-up factory (push)
+  - 20:30 closeout (push)
+  - 20:45 tomorrow brief (email)
+
+Autonomy toggles:
+- `VERA_AUTONOMY_WEEK1_EXECUTOR_ENABLED=1` (default)
+- `VERA_AUTONOMY_WEEK1_EXECUTOR_COOLDOWN_SECONDS=900` (default)
+- `VERA_AUTONOMY_WEEK1_EXECUTOR_TIMEOUT_SECONDS=600` (default)
+- `VERA_WEEK1_EMAIL_MODE=send|draft` (default `send`)
+
+Manual tick:
+
+```bash
+.venv/bin/python scripts/vera_week1_executor.py --vera-root . --base-url http://127.0.0.1:8788
+```
+
+Manual dry-run tick (no side effects, no state writes):
+
+```bash
+.venv/bin/python scripts/vera_week1_executor.py --vera-root . --base-url http://127.0.0.1:8788 --dry-run --email-mode draft
+```
+
+CSV-only import dry-run:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/import_week1_operating_tasks.py --seed-csv ops/week1/WEEK1_SEEDED_TASK_BACKLOG.csv --dry-run
+```
+
+## 15) Autonomy Runplane Ops Surface
+
+State/metrics APIs:
+- `GET /api/autonomy/jobs`
+- `GET /api/autonomy/runs`
+- `GET /api/autonomy/dead-letter`
+- `GET /api/autonomy/slo`
+
+Operator controls:
+- `POST /api/autonomy/dead-letter/replay` (requires `run_id` or `job_id`)
+- `POST /api/autonomy/runs/mark` (requires `run_id` + `status`)
+  - common statuses: `escalated`, `closed`
+
+Reach-out delivery and ACK:
+- `innerlife.reached_out` now records a delivery run in runplane.
+- Push ACK (`/api/push/native/ack`) can resolve by external inner-life run ID alias, not only internal runplane ID.
+
+Channel routing mode:
+- `VERA_INNER_LIFE_DELIVERY_MODE=fallback` (default): stop after first successful channel.
+- `VERA_INNER_LIFE_DELIVERY_MODE=broadcast`: attempt all configured channels.
+
+Lane queue tuning:
+- `VERA_PROACTIVE_LANE_QUEUE_MAX` (default `8`): max queued proactive actions per lane (`action_type:session_scope`).
+
+Auto dead-letter replay:
+- `VERA_AUTONOMY_DEAD_LETTER_AUTO_REPLAY=1` (default on)
+- `VERA_AUTONOMY_DEAD_LETTER_REPLAY_MAX_PER_CYCLE=2`
+- `VERA_AUTONOMY_DEAD_LETTER_REPLAY_COOLDOWN_SECONDS=1800`
+- `VERA_AUTONOMY_DEAD_LETTER_MAX_REPLAYS_PER_JOB=3`
+- `VERA_AUTONOMY_DEAD_LETTER_REPLAY_FAIL_ESCALATION_THRESHOLD=2`
+- `VERA_AUTONOMY_DEAD_LETTER_REPLAY_ALLOW=<csv failure classes>`
+  - default includes: `delivery_unroutable,stale_lane,transport_error,rate_limited,transient_timeout,executor_failure,executor_nonzero_exit`
+
+Dead-letter replay SLO audit hooks:
+- `VERA_AUTONOMY_DEAD_LETTER_SLO_MIN_SUCCESS_RATE=0.50`
+- `VERA_AUTONOMY_DEAD_LETTER_SLO_MAX_BACKLOG=20`
+- `VERA_AUTONOMY_DEAD_LETTER_SLO_MAX_CYCLE_FAILURES=3`
+- `VERA_AUTONOMY_DEAD_LETTER_SLO_MAX_ESCALATED_PER_CYCLE=2`
+- Audit events are appended to `vera_memory/autonomy_cadence_events.jsonl` (`type=dead_letter_replay_slo_audit`).
+
+ACK-SLA stale delivery escalation:
+- `VERA_AUTONOMY_ACK_SLA_ESCALATION_ENABLED=1`
+- `VERA_AUTONOMY_ACK_SLA_SECONDS=900`
+- `VERA_AUTONOMY_ACK_SLA_MAX_ESCALATIONS_PER_CYCLE=3`
+- `VERA_AUTONOMY_ACK_SLA_SCAN_LIMIT=400`
+- `VERA_AUTONOMY_ACK_SLA_KIND_PREFIXES=delivery`
+- Cycle emits `delivery_ack_sla_scan` into `vera_memory/autonomy_cadence_events.jsonl`.
+
+Failure-learning event log:
+- `vera_memory/failure_learning_events.jsonl`
+
+Learning-loop failure ingestion (new):
+- `VERA_FAILURE_LEARNING_INGEST_ENABLED=1` (default on)
+- `VERA_FAILURE_LEARNING_BATCH_MAX=250`
+- Ingested by `LearningLoopManager.run_daily_learning_cycle()` as `failure_learning_ingest`.
+- Progress counters in `learning_loop_state.json`:
+  - `failure_learning_offset`
+  - `failure_learning_processed_total`
+  - `failure_learning_examples_total`
+  - `failure_learning_malformed_total`
+
+Workflow failure-risk scoring (selection hardening):
+- `VERA_WORKFLOW_FAILURE_PENALTY_WEIGHT=0.25`
+- `VERA_WORKFLOW_RECENT_FAILURE_WINDOW_HOURS=48`
+- `VERA_WORKFLOW_FAILURE_HARD_BLOCK_THRESHOLD=0.92`
+- `VERA_WORKFLOW_MAX_FAILURE_PENALTY=0.70` (LLM bridge chain acceptance gate)
+- `VERA_WORKFLOW_RECOVERY_OVERRIDE_MIN_PENALTY=0.60` (when to auto-switch to recovery chain)
+- These values bias workflow suggestion away from recently failing/repeatedly failing chains.
+- Runtime telemetry is exposed in `workflow_recording.failure_recovery_override` via last tool payload:
+  - `applied`, `replayed`, `successes`, `failures`, `success_rate_pct`, `replay_rate_pct`
+- Inspect with:
+  - `GET /api/tools/last_payload` → `payload.workflow_recording.failure_recovery_override`

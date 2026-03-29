@@ -149,7 +149,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="VERA API diagnostics")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
-    parser.add_argument("--model", default="grok-4-1-fast-reasoning")
+    parser.add_argument("--model", default="grok-4.20-experimental-beta-0304-reasoning")
     parser.add_argument("--message", default="Hello from diagnostics. Reply with OK.")
     parser.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout in seconds")
     parser.add_argument("--tools", action="store_true", help="Check /api/tools")

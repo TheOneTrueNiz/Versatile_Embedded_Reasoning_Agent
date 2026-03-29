@@ -40,6 +40,12 @@ if [ -z "${API_KEY:-}" ] && [ -n "${XAI_API_KEY:-}" ]; then
   export API_KEY="${XAI_API_KEY}"
 fi
 
+# Broad filesystem access defaults for Vera (can be overridden by env).
+export VERA_FILESYSTEM_AUTO_EXPAND_HOME="${VERA_FILESYSTEM_AUTO_EXPAND_HOME:-1}"
+if [ -z "${VERA_FILESYSTEM_EXTRA_ROOTS:-}" ]; then
+  export VERA_FILESYSTEM_EXTRA_ROOTS="${HOME}:${HOME}/Desktop:${HOME}/Documents:${HOME}/Downloads:/tmp:/media:/mnt"
+fi
+
 CALLME_PROFILE="${CALLME_PROFILE:-carol-prod}"
 CALLME_PROFILE_FILE="${ROOT_DIR}/config/callme_profiles/${CALLME_PROFILE}.env"
 CALLME_PROFILE_EXAMPLE_FILE="${ROOT_DIR}/config/callme_profiles/${CALLME_PROFILE}.example.env"
@@ -235,6 +241,36 @@ docker_compose_exec() {
   return 1
 }
 
+report_week1_source() {
+  local docx_candidates=()
+  local seed_csv="${ROOT_DIR}/ops/week1/WEEK1_SEEDED_TASK_BACKLOG.csv"
+  local candidate resolved
+
+  if [ -n "${VERA_WEEK1_DOCX_PATH:-}" ]; then
+    docx_candidates+=("${VERA_WEEK1_DOCX_PATH}")
+  fi
+  docx_candidates+=(
+    "${HOME}/Desktop/Vera_Week1_Operating_System_v10.docx"
+    "${ROOT_DIR}/ops/week1/Vera_Week1_Operating_System_v10.docx"
+  )
+
+  for candidate in "${docx_candidates[@]}"; do
+    [ -n "${candidate}" ] || continue
+    resolved="$(realpath -m "${candidate}")"
+    if [ -f "${resolved}" ]; then
+      echo "[VERA] Week1 source: docx (${resolved})"
+      return 0
+    fi
+  done
+
+  if [ -f "${seed_csv}" ]; then
+    echo "[VERA] Week1 source: seed CSV fallback (${seed_csv})"
+    return 0
+  fi
+
+  echo "[VERA] Week1 source: unavailable (no docx and no seed CSV at ${seed_csv})"
+}
+
 if [ "${QUIET}" = "1" ]; then
   export VERA_CONFIG_WATCH_ENABLED="${VERA_CONFIG_WATCH_ENABLED:-0}"
   export VERA_TASK_CHECK_INTERVAL="${VERA_TASK_CHECK_INTERVAL:-600}"
@@ -243,6 +279,8 @@ if [ "${QUIET}" = "1" ]; then
   export VERA_DND_MINUTES="${VERA_DND_MINUTES:-120}"
   export VERA_DND_REASON="${VERA_DND_REASON:-Quiet startup}"
 fi
+
+report_week1_source
 
 if [ "${DIAG_ONLY}" = "1" ]; then
   SKIP_UI=1

@@ -50,3 +50,7 @@ Backup retention after successful restore:
 - If `requirements.txt` changes, core dependency install is re-triggered automatically via hash mismatch.
 - If wheelhouse is seed-only (no `*.whl`), bootstrap can still succeed via `.venv` seed restore.
 - Keep `VERA_WHEELHOUSE_DIR` on durable storage if you want repeatable offline bring-up.
+- Public Week1 note:
+  - the repo ships `ops/week1/WEEK1_SEEDED_TASK_BACKLOG.csv`
+  - the Week1 importer/executor can use that CSV without a private `.docx`
+  - launchers print the detected Week1 source during startup

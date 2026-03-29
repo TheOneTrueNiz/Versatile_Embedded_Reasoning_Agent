@@ -545,7 +545,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run controlled preflight checks")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
-    parser.add_argument("--model", default="grok-4-1-fast-reasoning")
+    parser.add_argument("--model", default="grok-4.20-experimental-beta-0304-reasoning")
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--restart-port", type=int, default=8791)
     parser.add_argument("--fallback-port", type=int, default=8792)
