@@ -46,12 +46,14 @@ Usage:
 
 import json
 import re
+import os
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
 from enum import Enum
 from collections import defaultdict
+from difflib import SequenceMatcher
 
 # Import atomic operations
 try:
@@ -161,6 +163,13 @@ CORRECTION_PATTERNS = [
 ]
 
 ALWAYS_RELEVANT_CATEGORIES = {"communication", "formatting", "tone", "autonomy"}
+PARTNER_MODEL_PREFIXES = (
+    "i keep in mind that my partner prefers:",
+    "i avoid repeating this partner frustration:",
+    "i align execution with this partner goal:",
+    "i support this long-term project:",
+    "i adapt to this partner working style:",
+)
 
 
 def _tokenize_text(text: str) -> List[str]:
@@ -249,6 +258,37 @@ def _format_identity_commitment(category: str, key: str, value: Any) -> Optional
     return None
 
 
+def _normalize_partner_model_commitment(text: Any) -> str:
+    normalized = " ".join(str(text or "").strip().lower().split())
+    for prefix in PARTNER_MODEL_PREFIXES:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):].strip()
+            break
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    normalized = " ".join(normalized.split())
+    return normalized
+
+
+def _partner_model_similarity(a: Any, b: Any) -> float:
+    left = _normalize_partner_model_commitment(a)
+    right = _normalize_partner_model_commitment(b)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if left in right or right in left:
+        shorter = min(len(left.split()), len(right.split()))
+        if shorter >= 4:
+            return 0.95
+    left_tokens = set(_tokenize_text(left))
+    right_tokens = set(_tokenize_text(right))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    jaccard = len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens))
+    ratio = SequenceMatcher(None, left, right).ratio()
+    return max(jaccard, ratio)
+
+
 def tokenize_text(text: str) -> List[str]:
     """Tokenize text for lightweight relevance matching."""
     return _tokenize_text(text)
@@ -331,6 +371,7 @@ class PreferenceManager:
             self.storage_path = Path("vera_memory/preferences.json")
 
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        self._last_saved_epoch: float = 0.0
 
         # Preferences by category.key
         self._preferences: Dict[str, Preference] = {}
@@ -388,6 +429,10 @@ class PreferenceManager:
             atomic_json_write(self.storage_path, data)
         else:
             self.storage_path.write_text(json.dumps(data, indent=2))
+        try:
+            self._last_saved_epoch = float(self.storage_path.stat().st_mtime)
+        except Exception:
+            self._last_saved_epoch = 0.0
 
     def set_preference(
         self,
@@ -414,8 +459,20 @@ class PreferenceManager:
         pref_key = f"{category.value}.{key}"
 
         existing = self._preferences.get(pref_key)
+        normalized_reason = reason or ""
+
+        if existing is None and category == PreferenceCategory.PARTNER_MODEL:
+            similar_pref = self._find_similar_partner_model_preference(key=key, value=value)
+            if similar_pref is not None:
+                return similar_pref
 
         if existing:
+            if (
+                existing.value == value
+                and existing.strength == strength.value
+                and (existing.notes or "") == normalized_reason
+            ):
+                return existing
             existing.value = value
             existing.strength = strength.value
             existing.updated_at = now
@@ -432,12 +489,35 @@ class PreferenceManager:
                 source="explicit",
                 created_at=now,
                 updated_at=now,
-                notes=reason or ""
+                notes=normalized_reason
             )
             self._preferences[pref_key] = pref
 
         self._save()
         return pref
+
+    def _find_similar_partner_model_preference(self, key: str, value: Any) -> Optional[Preference]:
+        prefix = str(key or "").split("_", 1)[0].strip().lower()
+        threshold_raw = str(os.getenv("VERA_PARTNER_MODEL_DEDUP_THRESHOLD", "0.78")).strip()
+        try:
+            threshold = max(0.0, min(1.0, float(threshold_raw)))
+        except Exception:
+            threshold = 0.78
+        best_pref: Optional[Preference] = None
+        best_score = 0.0
+        for pref in self._preferences.values():
+            if pref.category != PreferenceCategory.PARTNER_MODEL.value:
+                continue
+            pref_prefix = str(pref.key or "").split("_", 1)[0].strip().lower()
+            if prefix and pref_prefix and pref_prefix != prefix:
+                continue
+            score = _partner_model_similarity(pref.value, value)
+            if score < threshold:
+                continue
+            if score > best_score:
+                best_score = score
+                best_pref = pref
+        return best_pref
 
     def get(
         self,
@@ -594,6 +674,7 @@ class PreferenceManager:
         changed = False
         promoted_now = 0
         active_count = 0
+        ranked_candidates: List[Dict[str, Any]] = []
 
         # Keep only latest entries deterministically ordered.
         ordered = sorted(
@@ -610,13 +691,7 @@ class PreferenceManager:
             pref_key = f"{pref.category}.{pref.key}"
             confidence = self._preference_confidence(pref)
             existing = self._core_identity_promotions.get(pref_key)
-
-            if confidence < threshold:
-                if existing and existing.get("active"):
-                    # Keep promoted values durable unless manually reverted.
-                    existing["confidence"] = confidence
-                    existing["last_evaluated_at"] = now
-                    self._core_identity_promotions[pref_key] = existing
+            if confidence < threshold and not (existing and existing.get("active")):
                 continue
 
             payload = {
@@ -628,13 +703,48 @@ class PreferenceManager:
                 "source": pref.source,
                 "pref_occurrences": int(pref.occurrences),
                 "promoted_at": (existing or {}).get("promoted_at", now),
-                "last_updated": now,
-                "last_evaluated_at": now,
-                "active": True,
-                "revert_reason": "",
+                "last_updated": str((existing or {}).get("last_updated") or now),
+                "last_evaluated_at": str((existing or {}).get("last_evaluated_at") or now),
+                "active": bool((existing or {}).get("active", False)),
+                "revert_reason": str((existing or {}).get("revert_reason") or ""),
             }
+            ranked_candidates.append(
+                {
+                    "pref_key": pref_key,
+                    "confidence": confidence,
+                    "existing": existing if isinstance(existing, dict) else None,
+                    "payload": payload,
+                    "updated_at": str(pref.updated_at or ""),
+                }
+            )
+
+        ranked_candidates.sort(
+            key=lambda row: (
+                self._clamp_confidence(row.get("confidence", 0.0)),
+                str(row.get("updated_at") or ""),
+                str(row.get("pref_key") or ""),
+            ),
+            reverse=True,
+        )
+        keep_active = {str(row.get("pref_key") or "") for row in ranked_candidates[:max_items]}
+
+        for row in ranked_candidates:
+            pref_key = str(row.get("pref_key") or "")
+            if not pref_key:
+                continue
+            existing = row.get("existing")
+            payload = dict(row.get("payload") or {})
+            confidence = self._clamp_confidence(row.get("confidence", 0.0))
+            should_be_active = pref_key in keep_active
+            payload["active"] = should_be_active
+            payload["revert_reason"] = "" if should_be_active else str((existing or {}).get("revert_reason") or "")
 
             if not existing:
+                if not should_be_active:
+                    continue
+                payload["last_updated"] = now
+                payload["last_evaluated_at"] = now
+                self._core_identity_promotions[pref_key] = payload
                 changed = True
                 promoted_now += 1
                 self._promotion_events.append({
@@ -643,66 +753,58 @@ class PreferenceManager:
                     "pref_key": pref_key,
                     "confidence": confidence,
                     "threshold": threshold,
-                    "value": pref.value,
-                    "commitment": commitment,
+                    "value": payload.get("value"),
+                    "commitment": payload.get("commitment"),
                 })
-            elif (
-                existing.get("value") != pref.value
-                or existing.get("active") is not True
-                or abs(self._clamp_confidence(existing.get("confidence", 0.0)) - confidence) > 0.01
-                or existing.get("commitment") != commitment
-            ):
-                changed = True
-                if existing.get("active") is not True:
+                continue
+
+            existing_confidence = self._clamp_confidence(existing.get("confidence", 0.0))
+            semantic_change = (
+                existing.get("value") != payload.get("value")
+                or existing.get("commitment") != payload.get("commitment")
+                or existing.get("source") != payload.get("source")
+                or int(existing.get("pref_occurrences", 0) or 0) != int(payload.get("pref_occurrences", 0) or 0)
+                or abs(existing_confidence - confidence) > 0.01
+            )
+            active_change = bool(existing.get("active")) != should_be_active
+            revert_change = str(existing.get("revert_reason") or "") != str(payload.get("revert_reason") or "")
+
+            if not semantic_change and not active_change and not revert_change:
+                continue
+
+            payload["last_evaluated_at"] = now
+            if semantic_change or active_change or revert_change:
+                payload["last_updated"] = now
+
+            if active_change:
+                if should_be_active:
                     promoted_now += 1
                     event_action = "reactivate"
                 else:
-                    event_action = "update"
-                self._promotion_events.append({
-                    "timestamp": now,
-                    "action": event_action,
-                    "pref_key": pref_key,
-                    "confidence": confidence,
-                    "threshold": threshold,
-                    "value": pref.value,
-                    "commitment": commitment,
-                })
+                    payload["revert_reason"] = "auto_trim"
+                    event_action = "auto_trim"
+            else:
+                event_action = "update"
 
             self._core_identity_promotions[pref_key] = payload
-
-        active_promotions = [
-            value for value in self._core_identity_promotions.values()
-            if isinstance(value, dict) and value.get("active")
-        ]
-        if len(active_promotions) > max_items:
-            active_promotions.sort(
-                key=lambda e: (
-                    self._clamp_confidence(e.get("confidence", 0.0)),
-                    str(e.get("last_updated") or ""),
-                ),
-                reverse=True,
-            )
-            keep = {
-                f"{entry.get('category')}.{entry.get('key')}"
-                for entry in active_promotions[:max_items]
+            changed = True
+            event_payload = {
+                "timestamp": now,
+                "action": event_action,
+                "pref_key": pref_key,
             }
-            for pref_key, entry in self._core_identity_promotions.items():
-                if not isinstance(entry, dict):
-                    continue
-                if not entry.get("active"):
-                    continue
-                if pref_key in keep:
-                    continue
-                entry["active"] = False
-                entry["revert_reason"] = "auto_trim"
-                entry["last_updated"] = now
-                changed = True
-                self._promotion_events.append({
-                    "timestamp": now,
-                    "action": "auto_trim",
-                    "pref_key": pref_key,
-                    "reason": "max_items_limit",
-                })
+            if event_action != "auto_trim":
+                event_payload.update(
+                    {
+                        "confidence": confidence,
+                        "threshold": threshold,
+                        "value": payload.get("value"),
+                        "commitment": payload.get("commitment"),
+                    }
+                )
+            else:
+                event_payload["reason"] = "max_items_limit"
+            self._promotion_events.append(event_payload)
 
         for entry in self._core_identity_promotions.values():
             if isinstance(entry, dict) and entry.get("active"):

@@ -53,3 +53,31 @@ def test_loopback_outbox_snapshot_and_clear() -> None:
 
     asyncio.run(_run())
 
+
+def test_loopback_inject_inbound_background_mode_returns_immediately() -> None:
+    adapter = LocalLoopbackAdapter()
+    captured = {"done": False}
+
+    async def _handler(message):
+        await asyncio.sleep(0.01)
+        captured["done"] = True
+        captured["text"] = message.text
+
+    adapter.set_message_handler(_handler)
+
+    async def _run() -> None:
+        await adapter.start()
+        result = await adapter.inject_inbound(
+            text="background hello",
+            sender_id="tester",
+            wait_for_handler=False,
+        )
+        assert result.get("status") == "accepted"
+        assert result.get("background") is True
+        await asyncio.sleep(0.05)
+        await adapter.stop()
+
+    asyncio.run(_run())
+
+    assert captured["done"] is True
+    assert captured["text"] == "background hello"

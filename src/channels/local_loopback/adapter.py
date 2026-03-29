@@ -63,6 +63,7 @@ class LocalLoopbackAdapter:
         self._handler: Optional[Callable] = None
         self._outbox: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self.running = False
 
     async def start(self) -> None:
@@ -108,6 +109,8 @@ class LocalLoopbackAdapter:
         thread_id: Optional[str] = None,
         reply_to_id: Optional[str] = None,
         raw: Optional[Dict[str, Any]] = None,
+        wait_for_handler: bool = True,
+        timeout_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         if not self._handler:
             return {"status": "error", "error": "message_handler_not_set"}
@@ -134,9 +137,25 @@ class LocalLoopbackAdapter:
 
         result = self._handler(inbound)
         if asyncio.iscoroutine(result):
-            await result
+            if not wait_for_handler:
+                task = asyncio.create_task(result)
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                task.add_done_callback(self._log_background_task_result)
+                return {"status": "accepted", "channel": self.channel_id, "background": True}
+            if timeout_seconds is not None and float(timeout_seconds) > 0:
+                await asyncio.wait_for(result, timeout=float(timeout_seconds))
+            else:
+                await result
 
-        return {"status": "ok", "channel": self.channel_id}
+        return {"status": "ok", "channel": self.channel_id, "background": False}
+
+    @staticmethod
+    def _log_background_task_result(task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except Exception:
+            logger.exception("Local loopback background handler failed")
 
     async def clear_outbox(self) -> int:
         async with self._lock:
@@ -150,4 +169,3 @@ class LocalLoopbackAdapter:
             if not self._outbox:
                 return []
             return list(self._outbox[-safe_limit:])
-
