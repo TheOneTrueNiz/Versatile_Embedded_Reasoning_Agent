@@ -83,7 +83,7 @@ def test_models_endpoint_lists_models() -> None:
 def test_basic_chat_completion() -> None:
     """Simple chat completion returns a well-formed response."""
     payload = {
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.20-experimental-beta-0304-reasoning",
         "messages": [
             {"role": "user", "content": "What is 2 + 2? Reply with just the number."}
         ],
@@ -110,7 +110,7 @@ def test_chat_completion_with_conversation_id() -> None:
     """Chat completion respects conversation_id for session isolation."""
     cid = f"smoke-test-{int(time.time())}"
     payload = {
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.20-experimental-beta-0304-reasoning",
         "messages": [
             {"role": "user", "content": "Say 'pong'. Nothing else."}
         ],
@@ -137,7 +137,7 @@ def test_chat_completion_with_conversation_id() -> None:
 def test_tool_invocation_time() -> None:
     """Explicit tool_choice forces the 'time' tool and returns a timestamp."""
     payload = {
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.20-experimental-beta-0304-reasoning",
         "messages": [
             {"role": "user", "content": "What time is it right now?"}
         ],
@@ -160,7 +160,7 @@ def test_tool_invocation_time() -> None:
 def test_tool_invocation_calculate() -> None:
     """Calculator tool returns correct arithmetic."""
     payload = {
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.20-experimental-beta-0304-reasoning",
         "messages": [
             {"role": "user", "content": "Calculate 123 * 456 using the calculator."}
         ],
@@ -188,7 +188,7 @@ def test_tool_invocation_calculate() -> None:
 def test_streaming_chat_completion() -> None:
     """Streaming response delivers SSE chunks ending with [DONE]."""
     payload = {
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.20-experimental-beta-0304-reasoning",
         "messages": [
             {"role": "user", "content": "Say 'hello' and nothing else."}
         ],

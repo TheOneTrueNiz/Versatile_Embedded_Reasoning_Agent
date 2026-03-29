@@ -304,6 +304,10 @@ class RecommendedAction:
     expires_at: Optional[str] = None
     acknowledged: bool = False
     executed: bool = False
+    suppression_count: int = 0
+    last_suppressed_at: Optional[str] = None
+    last_suppression_reason: str = ""
+    retry_not_before: Optional[str] = None
 
     def is_expired(self) -> bool:
         """Check if recommendation has expired."""
@@ -324,6 +328,10 @@ class RecommendedAction:
             "expires_at": self.expires_at,
             "acknowledged": self.acknowledged,
             "executed": self.executed,
+            "suppression_count": self.suppression_count,
+            "last_suppressed_at": self.last_suppressed_at,
+            "last_suppression_reason": self.last_suppression_reason,
+            "retry_not_before": self.retry_not_before,
         }
 
     @classmethod
@@ -340,6 +348,10 @@ class RecommendedAction:
             expires_at=data.get("expires_at"),
             acknowledged=data.get("acknowledged", False),
             executed=data.get("executed", False),
+            suppression_count=int(data.get("suppression_count", 0) or 0),
+            last_suppressed_at=data.get("last_suppressed_at"),
+            last_suppression_reason=str(data.get("last_suppression_reason", "") or ""),
+            retry_not_before=data.get("retry_not_before"),
         )
 
 
@@ -779,6 +791,16 @@ class ActionRecommender:
         self.recommendations: Dict[str, RecommendedAction] = {}
         self.recommendation_handlers: Dict[str, Callable] = {}
         self._lock = threading.Lock()
+        self._dedup_excluded_payload_keys = {
+            "events",
+            "event_count",
+            "timestamp",
+            "ts",
+            "created_at",
+            "updated_at",
+            "last_updated_at",
+            "event_id",
+        }
 
     def register_handler(
         self,
@@ -794,24 +816,23 @@ class ActionRecommender:
         triggering_events: List[Event],
     ) -> RecommendedAction:
         """Create a recommendation from a fired trigger."""
+        recommendation, _created = self.create_or_merge_recommendation(trigger, triggering_events)
+        return recommendation
+
+    def create_or_merge_recommendation(
+        self,
+        trigger: Trigger,
+        triggering_events: List[Event],
+    ) -> Tuple[RecommendedAction, bool]:
+        """Create a recommendation or merge into an existing pending one."""
         action_id = str(uuid.uuid4())
-
-        # Build payload from template and events
-        payload = {}
-        if trigger.action_template:
-            payload = trigger.action_template.copy()
-
-        # Add event data
-        payload["events"] = [e.to_dict() for e in triggering_events[:5]]
-        payload["event_count"] = len(triggering_events)
-
-        # Determine action type
-        action_type = payload.get("action_type") or payload.get("type") or "notify"
-
+        payload = self._build_recommendation_payload(trigger, triggering_events)
+        action_type = str(payload.get("action_type") or payload.get("type") or "notify").strip() or "notify"
+        description = self._generate_description(trigger, triggering_events)
         recommendation = RecommendedAction(
             action_id=action_id,
             trigger_id=trigger.trigger_id,
-            description=self._generate_description(trigger, triggering_events),
+            description=description,
             priority=trigger.priority,
             action_type=action_type,
             payload=payload,
@@ -820,9 +841,117 @@ class ActionRecommender:
         )
 
         with self._lock:
+            existing = self._find_merge_target(recommendation)
+            if existing is not None:
+                self._merge_recommendation(existing, recommendation)
+                return existing, False
             self.recommendations[action_id] = recommendation
+            return recommendation, True
 
-        return recommendation
+    def _build_recommendation_payload(
+        self,
+        trigger: Trigger,
+        triggering_events: List[Event],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if trigger.action_template:
+            payload = trigger.action_template.copy()
+        payload["events"] = [e.to_dict() for e in triggering_events[:5]]
+        payload["event_count"] = len(triggering_events)
+        return payload
+
+    def _find_merge_target(self, recommendation: RecommendedAction) -> Optional[RecommendedAction]:
+        target_signature = self._recommendation_signature(recommendation)
+        for existing in self.recommendations.values():
+            if existing.acknowledged or existing.executed or existing.is_expired():
+                continue
+            if self._recommendation_signature(existing) != target_signature:
+                continue
+            return existing
+        return None
+
+    def _merge_recommendation(
+        self,
+        existing: RecommendedAction,
+        incoming: RecommendedAction,
+    ) -> None:
+        merged_event_ids = list(existing.triggering_events)
+        for event_id in incoming.triggering_events:
+            if event_id and event_id not in merged_event_ids:
+                merged_event_ids.append(event_id)
+        existing.triggering_events = merged_event_ids
+        existing.description = incoming.description or existing.description
+        existing.priority = incoming.priority
+
+        existing_events = list(existing.payload.get("events") or [])
+        for event_row in incoming.payload.get("events") or []:
+            if not isinstance(event_row, dict):
+                continue
+            incoming_event_id = str(event_row.get("event_id") or "").strip()
+            duplicate = False
+            if incoming_event_id:
+                duplicate = any(
+                    str(row.get("event_id") or "").strip() == incoming_event_id
+                    for row in existing_events
+                    if isinstance(row, dict)
+                )
+            if not duplicate:
+                existing_events.append(event_row)
+        if existing_events:
+            existing.payload["events"] = existing_events[-5:]
+        existing.payload["event_count"] = max(
+            int(existing.payload.get("event_count", 0) or 0),
+            len(existing.triggering_events),
+        )
+        if incoming.expires_at:
+            current_expiry = self._parse_iso(existing.expires_at)
+            incoming_expiry = self._parse_iso(incoming.expires_at)
+            if current_expiry is None or (incoming_expiry is not None and incoming_expiry > current_expiry):
+                existing.expires_at = incoming.expires_at
+
+    def _recommendation_signature(self, recommendation: RecommendedAction) -> str:
+        payload = dict(recommendation.payload or {})
+        stable_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in self._dedup_excluded_payload_keys
+        }
+        signature_payload = {
+            "trigger_id": str(recommendation.trigger_id or "").strip(),
+            "action_type": str(recommendation.action_type or "").strip(),
+            "conversation_id": self._extract_recommendation_conversation_id(recommendation),
+            "stable_payload": stable_payload,
+        }
+        encoded = json.dumps(signature_payload, sort_keys=True, default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _extract_recommendation_conversation_id(self, recommendation: RecommendedAction) -> str:
+        payload = recommendation.payload or {}
+        for key in ("conversation_id", "vera_conversation_id", "session_key"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        events = payload.get("events")
+        if isinstance(events, list):
+            for item in events:
+                if not isinstance(item, dict):
+                    continue
+                event_payload = item.get("payload")
+                if not isinstance(event_payload, dict):
+                    continue
+                for key in ("conversation_id", "vera_conversation_id", "session_key"):
+                    value = str(event_payload.get(key) or "").strip()
+                    if value:
+                        return value
+        return ""
+
+    def _parse_iso(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
 
     def _generate_description(
         self,
@@ -1065,17 +1194,25 @@ class SentinelEngine:
 
         for trigger, events in fired:
             # Call trigger callback
+            skip_recommendation = False
             if self.on_trigger:
                 try:
-                    self.on_trigger(trigger, events)
+                    trigger_result = self.on_trigger(trigger, events)
+                    if trigger_result is False:
+                        skip_recommendation = True
+                    elif isinstance(trigger_result, dict) and bool(trigger_result.get("skip_recommendation")):
+                        skip_recommendation = True
                 except Exception as exc:
                     logger.debug("Suppressed %s: %s", type(exc).__name__, exc)
 
+            if skip_recommendation:
+                continue
+
             # Create recommendation
-            recommendation = self.recommender.create_recommendation(trigger, events)
+            recommendation, created = self.recommender.create_or_merge_recommendation(trigger, events)
 
             # Call recommendation callback
-            if self.on_recommendation:
+            if created and self.on_recommendation:
                 try:
                     self.on_recommendation(recommendation)
                 except Exception as exc:

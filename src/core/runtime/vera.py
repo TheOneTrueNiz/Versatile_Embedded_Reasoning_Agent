@@ -20,6 +20,7 @@ Integrates:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -28,9 +29,10 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Callable, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
@@ -53,6 +55,106 @@ SWARM_BLOCKLIST_PATTERNS = [
     ("financial actions", re.compile(r"\b(buy|purchase|order|payment|transfer|bank|credit card|billing)\b", re.IGNORECASE)),
     ("system control", re.compile(r"\b(shutdown|reboot|power off|restart|format disk)\b", re.IGNORECASE)),
 ]
+
+
+def _generated_media_root() -> Path:
+    raw = os.getenv("VERA_GENERATED_MEDIA_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path("vera_memory") / "generated_media"
+
+
+def _generated_media_manifest_path() -> Path:
+    return _generated_media_root() / "manifest.json"
+
+
+def _guess_generated_media_suffix(url: str, fallback: str) -> str:
+    try:
+        suffix = Path(urlparse(str(url or "")).path).suffix.strip().lower()
+    except Exception:
+        suffix = ""
+    if suffix and len(suffix) <= 10:
+        return suffix
+    return fallback
+
+
+def _slugify_generated_media_label(value: str, maximum: int = 48) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    if not cleaned:
+        cleaned = "generated"
+    return cleaned[:maximum].rstrip("-") or "generated"
+
+
+def _record_generated_media_manifest(items: List[Dict[str, Any]]) -> Path:
+    manifest_path = _generated_media_manifest_path()
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = safe_json_read(manifest_path, default={}) or {}
+    existing = payload.get("items")
+    rows = list(existing) if isinstance(existing, list) else []
+    rows.extend(items)
+    payload["items"] = rows[-500:]
+    payload["updated_at"] = datetime.now().astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    atomic_json_write(manifest_path, payload)
+    return manifest_path
+
+
+async def _cache_generated_media_urls(
+    media_kind: str,
+    prompt: str,
+    model: str,
+    urls: List[str],
+) -> Dict[str, Any]:
+    clean_urls = [str(url).strip() for url in (urls or []) if str(url).strip()]
+    if not clean_urls:
+        return {"local_paths": [], "items": [], "manifest_path": ""}
+
+    root = _generated_media_root()
+    now_utc = datetime.now().astimezone(timezone.utc)
+    kind_dir = root / media_kind / now_utc.strftime("%Y%m%d")
+    kind_dir.mkdir(parents=True, exist_ok=True)
+    prompt_slug = _slugify_generated_media_label(prompt)
+    prompt_hash = hashlib.sha256(str(prompt or "").encode("utf-8")).hexdigest()[:12]
+    timeout_seconds = max(5.0, float(os.getenv("VERA_GENERATED_MEDIA_DOWNLOAD_TIMEOUT_SECONDS", "120")))
+    items: List[Dict[str, Any]] = []
+
+    async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=True) as client:
+        for index, url in enumerate(clean_urls, start=1):
+            suffix = _guess_generated_media_suffix(
+                url,
+                ".mp4" if media_kind == "video" else ".png",
+            )
+            item_now_utc = datetime.now().astimezone(timezone.utc)
+            filename = f"{item_now_utc.strftime('%Y%m%dT%H%M%SZ')}_{prompt_slug}_{prompt_hash}_{index:02d}{suffix}"
+            target = kind_dir / filename
+            item: Dict[str, Any] = {
+                "created_at": item_now_utc.isoformat().replace("+00:00", "Z"),
+                "media_kind": media_kind,
+                "model": str(model or ""),
+                "prompt": str(prompt or ""),
+                "remote_url": url,
+                "local_path": str(target),
+                "status": "pending",
+            }
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                target.write_bytes(response.content)
+                item["status"] = "cached"
+                item["bytes"] = target.stat().st_size
+                item["content_type"] = str(response.headers.get("content-type") or "")
+            except Exception as exc:
+                logger.warning("Generated media cache download failed for %s: %s", url, exc)
+                item["status"] = "download_failed"
+                item["error"] = str(exc)
+            items.append(item)
+
+    manifest_path = _record_generated_media_manifest(items)
+    local_paths = [item["local_path"] for item in items if item.get("status") == "cached"]
+    return {
+        "local_paths": local_paths,
+        "items": items,
+        "manifest_path": str(manifest_path),
+    }
 
 # Ensure src/ is in path (for sibling modules)
 _src_path = Path(__file__).parent.parent.parent  # Go up to src/
@@ -487,6 +589,7 @@ class VERA:
 
         # Get model override from session
         model_override = session.model_override if session else None
+        tool_choice_override = self._extract_inbound_tool_choice(message)
 
         # Process through VERA
         try:
@@ -494,6 +597,7 @@ class VERA:
                 messages=messages,
                 model=model_override,
                 conversation_id=session_key,
+                tool_choice=tool_choice_override,
                 postprocess=False,
             )
         except Exception as e:
@@ -663,6 +767,25 @@ class VERA:
         if default_link:
             return default_link
         return ""
+
+    @staticmethod
+    def _extract_inbound_tool_choice(message) -> Any:
+        raw = getattr(message, "raw", {})
+        raw_map = raw if isinstance(raw, dict) else {}
+
+        direct = raw_map.get("tool_choice")
+        if isinstance(direct, (str, dict)):
+            return direct
+
+        for nested_key in ("metadata", "context", "session"):
+            nested = raw_map.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+            nested_choice = nested.get("tool_choice")
+            if isinstance(nested_choice, (str, dict)):
+                return nested_choice
+
+        return None
 
     @classmethod
     def _resolve_mapped_session_link_id(
@@ -1277,7 +1400,7 @@ class VERA:
                                     "overlap_chars": {"type": "integer", "description": "Overlap between chunks for context (default: 200)."},
                                     "target_chars": {"type": "integer", "description": "Target final summary length (default: 1800)."},
                                     "max_rounds": {"type": "integer", "description": "Max recursion depth (default: 4). Higher = more compression."},
-                                    "model": {"type": "string", "description": "Override model (default: grok-4-1-fast-reasoning)."},
+                                    "model": {"type": "string", "description": "Override model (default: grok-4.20-experimental-beta-0304-reasoning)."},
                                 },
                                 "required": ["text"],
                             },
@@ -1828,7 +1951,7 @@ User's request: {original_prompt}
 
 Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
 
-                text_model = os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
+                text_model = os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
                 try:
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         response = await client.post(
@@ -1914,7 +2037,17 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
 
                 urls = [item.get("url") for item in data.get("data", []) if item.get("url")]
                 markdown = "\n".join(f"![image]({url})" for url in urls) if urls else ""
-                return {"model": model, "urls": urls, "markdown": markdown}
+                cache_result = await _cache_generated_media_urls("image", prompt, model, urls)
+                local_paths = list(cache_result.get("local_paths") or [])
+                logger.info("Image generation complete: urls=%s local_paths=%s", urls, local_paths)
+                return {
+                    "model": model,
+                    "urls": urls,
+                    "markdown": markdown,
+                    "local_paths": local_paths,
+                    "cache_manifest_path": cache_result.get("manifest_path") or "",
+                    "cache_items": cache_result.get("items") or [],
+                }
 
             image_tool = [{
                 "type": "function",
@@ -2046,8 +2179,19 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
                     urls = [item.get("url") for item in data.get("data", []) if item.get("url")]
                 duration = video_obj.get("duration") if isinstance(video_obj, dict) else None
                 markdown = "\n".join(f"[Generated Video]({url})" for url in urls) if urls else ""
-                logger.info("Video generation complete: urls=%s duration=%s", urls, duration)
-                return {"model": model, "urls": urls, "markdown": markdown, "duration": duration, "status": "done"}
+                cache_result = await _cache_generated_media_urls("video", prompt, model, urls)
+                local_paths = list(cache_result.get("local_paths") or [])
+                logger.info("Video generation complete: urls=%s local_paths=%s duration=%s", urls, local_paths, duration)
+                return {
+                    "model": model,
+                    "urls": urls,
+                    "markdown": markdown,
+                    "duration": duration,
+                    "status": "done",
+                    "local_paths": local_paths,
+                    "cache_manifest_path": cache_result.get("manifest_path") or "",
+                    "cache_items": cache_result.get("items") or [],
+                }
 
             video_tool = [{
                 "type": "function",
@@ -3355,6 +3499,24 @@ Respond with ONLY the optimized image prompt (under 900 chars), nothing else."""
                 "Ask for Google email only when no onboarded workspace account is known."
             )
 
+        callme_default_phone = str(os.getenv("CALLME_USER_PHONE_NUMBER", "")).strip()
+        if callme_default_phone:
+            call_me_guidance_line = (
+                "Call-me default recipient is configured. For initiate_call/send_sms/send_mms, "
+                "use the default recipient when recipient_phone is omitted. "
+                "Do not ask for E.164 unless the partner wants to override the target."
+            )
+        else:
+            call_me_guidance_line = (
+                "If no call-me default recipient is configured and phone action is requested, "
+                "ask once for an E.164 number, then reuse it."
+            )
+
+        execution_integrity_line = (
+            "Execution integrity: never claim a reminder, task, event, or call is armed/queued/sent "
+            "unless the corresponding tool call succeeded in this turn."
+        )
+
         session_context = f"""
 I've been active for {uptime_str}. {health_str}
 {task_str} I've processed {events_total} events this session.
@@ -3371,6 +3533,8 @@ I've logged {decision_stats['total_decisions']} decisions and learned {pref_stat
 {time_of_day_line}
 {workspace_auth_line}
 {workspace_email_guidance_line}
+{call_me_guidance_line}
+{execution_integrity_line}
 {speaker_line}
 {milestone_line}
 {energy_line}
@@ -3886,11 +4050,11 @@ Tools:
         if workspace_email:
             email_status = workspace_email
         else:
-            email_status = "MISSING (set GOOGLE_WORKSPACE_USER_EMAIL or ~/Documents/creds/google/user_email)"
+            email_status = "MISSING (set GOOGLE_WORKSPACE_USER_EMAIL or provide the workspace email via your configured credentials source)"
         print(f"Workspace user_google_email: {email_status}")
         if not workspace_email:
             raise RuntimeError(
-                "Missing GOOGLE_WORKSPACE_USER_EMAIL (set env var or ~/Documents/creds/google/user_email)."
+                "Missing GOOGLE_WORKSPACE_USER_EMAIL (set the env var or provide the workspace email via your configured credentials source)."
             )
         print(f"Observability: {'Enabled' if self.config.observability else 'Disabled'}")
         print(f"Fault Tolerance: {'Enabled' if self.config.fault_tolerance else 'Disabled'}")

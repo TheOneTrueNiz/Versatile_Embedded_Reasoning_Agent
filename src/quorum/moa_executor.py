@@ -90,7 +90,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 DEFAULT_BASE_URL = os.getenv("VERA_LLM_BASE_URL") or os.getenv("XAI_API_BASE") or "https://api.x.ai/v1"
-DEFAULT_MODEL = "grok-4-1-fast-reasoning"  # Using latest available model
+DEFAULT_MODEL = "grok-4.20-experimental-beta-0304-reasoning"  # Using latest available model
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.7

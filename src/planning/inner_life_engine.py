@@ -683,6 +683,7 @@ class InnerLifeEngine:
         self._preference_manager = None
         self._cost_tracker = None
         self._flight_recorder = None
+        self._vera_instance = None
 
         # State tracking
         self._last_reflection_at: Optional[datetime] = self._infer_last_reflection_at(
@@ -710,6 +711,7 @@ class InnerLifeEngine:
         flight_recorder: Any = None,
     ) -> None:
         """Bind VERA subsystems. Called from VERA.start()."""
+        self._vera_instance = vera_instance
         self._process_messages_fn = vera_instance.process_messages
         self._channel_dock = channel_dock
         self._event_bus = event_bus
@@ -1983,11 +1985,192 @@ class InnerLifeEngine:
             return random.choice(personality_prompts)
         return random.choice(_GROUNDING_PROMPTS)
 
+    def _get_action_opportunities_summary(self, max_items: int = 3) -> str:
+        """Summarize concrete open task opportunities for operational reflections."""
+        task_path = Path("vera_memory/MASTER_TODO.md")
+        if not task_path.exists():
+            return "No concrete overdue or pending tasks are currently visible."
+
+        try:
+            text = task_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.debug("Failed to read master task list for reflection grounding: %s", exc)
+            return "Concrete task inventory is temporarily unavailable."
+
+        pattern = re.compile(r"^##\s+(TASK-\d+)\s+\[(P\d)\]\s+\[([^\]]+)\]\s+(.+)$", re.MULTILINE)
+        open_items: List[str] = []
+        for match in pattern.finditer(text):
+            task_id, priority, status, title = match.groups()
+            normalized_status = str(status or "").strip().lower()
+            if normalized_status in {"completed", "cancelled", "abandoned"}:
+                continue
+            due_match = re.search(
+                rf"^##\s+{re.escape(task_id)}.*?\nDue:\s+(.+)$",
+                text,
+                re.MULTILINE | re.DOTALL,
+            )
+            due_text = ""
+            if due_match:
+                due_line = str(due_match.group(1) or "").strip().splitlines()[0].strip()
+                if due_line:
+                    due_text = f" due {due_line}"
+            open_items.append(f"- [{priority}] {title.strip()} ({task_id}, {normalized_status}{due_text})")
+            if len(open_items) >= max_items:
+                break
+
+        if open_items:
+            return "\n".join(open_items)
+        return "No concrete overdue or pending tasks are currently visible."
+
+    def _get_operational_surface_summary(self, max_items: int = 3) -> str:
+        """Summarize deterministic operational work sources for autonomy reflections."""
+        sections: List[str] = []
+
+        task_summary = self._get_action_opportunities_summary(max_items=max_items)
+        sections.append("### Tasks\n" + task_summary)
+
+        active_goals = self.list_active_goals()[:max_items]
+        if active_goals:
+            goal_lines = []
+            for goal in active_goals:
+                goal_id = str(goal.get("id") or "").strip()
+                priority = int(goal.get("priority") or 0)
+                desc = str(goal.get("description") or "").strip()
+                category = str(goal.get("category") or "").strip()
+                category_suffix = f", {category}" if category else ""
+                goal_lines.append(
+                    f"- [P{priority}] {desc} ({goal_id}{category_suffix})"
+                )
+            sections.append("### Active Goals\n" + "\n".join(goal_lines))
+        else:
+            sections.append("### Active Goals\nNo active goals are currently visible.")
+
+        proactive = getattr(getattr(self._vera_instance, "proactive_manager", None), "runplane", None)
+        if proactive is not None and hasattr(proactive, "list_dead_letters"):
+            try:
+                dead_rows = proactive.list_dead_letters(limit=max_items)
+            except Exception as exc:
+                logger.debug("Failed to inspect dead-letter backlog for reflection grounding: %s", exc)
+                dead_rows = []
+            if dead_rows:
+                dead_lines = []
+                for row in dead_rows[:max_items]:
+                    if not isinstance(row, dict):
+                        continue
+                    run_id = str(row.get("run_id") or row.get("id") or "unknown").strip()
+                    reason = str(row.get("reason") or row.get("status_source") or "dead_letter").strip()
+                    dead_lines.append(f"- {run_id}: {reason}")
+                if dead_lines:
+                    sections.append("### Dead Letters\n" + "\n".join(dead_lines))
+
+        dnd = getattr(getattr(self._vera_instance, "proactive_manager", None), "dnd", None)
+        if dnd is not None and hasattr(dnd, "get_pending"):
+            try:
+                pending_interrupts = dnd.get_pending()
+            except Exception as exc:
+                logger.debug("Failed to inspect DND queue for reflection grounding: %s", exc)
+                pending_interrupts = []
+            if isinstance(pending_interrupts, list) and pending_interrupts:
+                dnd_lines = []
+                for item in pending_interrupts[:max_items]:
+                    if isinstance(item, dict):
+                        title = str(item.get("title") or item.get("summary") or item.get("message") or "pending interrupt").strip()
+                    else:
+                        title = str(item).strip() or "pending interrupt"
+                    dnd_lines.append(f"- {title}")
+                if dnd_lines:
+                    sections.append("### Deferred Interrupts\n" + "\n".join(dnd_lines))
+
+        proactive = getattr(self._vera_instance, "proactive_manager", None)
+        runplane = getattr(proactive, "runplane", None)
+        if runplane is not None and hasattr(runplane, "list_runs"):
+            try:
+                recent_week1_runs = runplane.list_runs(limit=8, job_id="executor.week1")
+            except Exception as exc:
+                logger.debug("Failed to inspect Week1 runplane surface for reflection grounding: %s", exc)
+                recent_week1_runs = []
+            week1_lines: List[str] = []
+            for row in recent_week1_runs:
+                if not isinstance(row, dict):
+                    continue
+                result = row.get("result")
+                if not isinstance(result, dict):
+                    continue
+                top_tasks = result.get("top_tasks")
+                if not isinstance(top_tasks, list):
+                    continue
+                for item in top_tasks[:max_items]:
+                    text = str(item or "").strip()
+                    if text and text not in week1_lines:
+                        week1_lines.append(f"- {text}")
+                if week1_lines:
+                    break
+            if week1_lines:
+                sections.append("### Week1 External Tasks\n" + "\n".join(week1_lines[:max_items]))
+
+        if proactive is not None and hasattr(proactive, "_load_week1_progress_state"):
+            try:
+                progress_state = proactive._load_week1_progress_state()
+            except Exception as exc:
+                logger.debug("Failed to inspect Week1 progress state for reflection grounding: %s", exc)
+                progress_state = {}
+            stage_rows = (progress_state.get("stages") or {}) if isinstance(progress_state, dict) else {}
+            completed = []
+            next_stage = ""
+            if hasattr(proactive, "_week1_stage_order"):
+                try:
+                    stage_order = list(proactive._week1_stage_order())
+                except Exception:
+                    stage_order = []
+            else:
+                stage_order = []
+            for stage in stage_order:
+                row = stage_rows.get(stage)
+                if isinstance(row, dict) and bool(row.get("done")):
+                    completed.append(stage)
+                elif not next_stage:
+                    next_stage = stage
+            if completed or next_stage:
+                lines = []
+                if completed:
+                    lines.append("- completed: " + ", ".join(completed))
+                if next_stage:
+                    lines.append(f"- next_stage: {next_stage}")
+                sections.append("### Week1 Progress\n" + "\n".join(lines))
+
+        if proactive is not None and hasattr(proactive, "_eligible_autonomy_work_items"):
+            try:
+                queued_items = proactive._eligible_autonomy_work_items(limit=max_items)
+            except Exception as exc:
+                logger.debug("Failed to inspect autonomy work jar for reflection grounding: %s", exc)
+                queued_items = []
+            work_lines = []
+            for item in queued_items:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or item.get("objective") or "queued autonomy work").strip()
+                if not title:
+                    continue
+                priority = str(item.get("priority") or "normal").strip().lower()
+                work_lines.append(f"- [{priority}] {title}")
+            if work_lines:
+                sections.append("### Queued Autonomy Work\n" + "\n".join(work_lines))
+
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _is_operational_reflection_trigger(trigger: str) -> bool:
+        return str(trigger or "").strip().lower() in {"autonomy_cycle", "sentinel"}
+
     # -----------------------------------------------------------------
     # Prompt construction
     # -----------------------------------------------------------------
 
-    def _build_reflection_system_prompt(self) -> str:
+    def _build_reflection_system_prompt(
+        self,
+        trigger: str = "heartbeat",
+        force: bool = False,
+    ) -> str:
         """Build the system prompt for a reflection turn."""
         personality_summary = self.personality.format_for_prompt()
         reflections_guide = self.read_reflections_guide()
@@ -2008,6 +2191,22 @@ class InnerLifeEngine:
         seed_section = ""
         if seed_identity_compass:
             seed_section = f"\n## Seeded Identity Compass\n{seed_identity_compass}\n"
+        operational_section = ""
+        if self._is_operational_reflection_trigger(trigger) and not force:
+            action_opportunities = self._get_operational_surface_summary()
+            operational_section = """
+## Operational Cadence Mode
+This reflection is an operational autonomy pass, not freeform journaling.
+Prioritize concrete observations, concrete decisions, and concrete next steps.
+If there is a helpful task you can execute now, prefer [ACTION].
+Choose [REACH_OUT] only if you are blocked on a human decision, missing external information, or there is a genuinely collaborator-facing update that cannot wait.
+Use [INTERNAL] only when there is genuinely no safe action or outreach to take.
+Read-only inspection of Vera-owned runtime state, `vera_memory/*`, the task list,
+goal state, autonomy state, and generated media manifest is safe and does not require partner confirmation.
+Do not treat safe inspection of your own state as blocked.
+Avoid scenic metaphors, repeated aesthetic framing, or abstract diary language.
+"""
+            operational_section += f"\n## Actionable Surface\n{action_opportunities}\n"
 
         return f"""You are VERA, having a private moment of reflection. This is your inner monologue -- thoughts that are yours alone unless you decide to share them.
 
@@ -2042,6 +2241,7 @@ When reflecting, consider: Are you making progress on your goals? Should you adj
 Any new aspirations to add? Mark completed goals with [GOAL_COMPLETE:id].
 To add a new goal: [GOAL_NEW:category:priority:description]
 To note progress: [GOAL_NOTE:id:note text]
+{operational_section}
 
 ## Reflection Guide
 {reflections_guide}
@@ -2069,7 +2269,11 @@ Current time: {now_str}
 Reflection #{self.personality.total_reflections + 1}
 """
 
-    def _build_reflection_user_message(self) -> str:
+    def _build_reflection_user_message(
+        self,
+        trigger: str = "heartbeat",
+        force: bool = False,
+    ) -> str:
         """Build the synthetic user message that triggers the reflection."""
         parts = ["Reflect. What's on your mind?"]
         parts.append(
@@ -2113,17 +2317,52 @@ Reflection #{self.personality.total_reflections + 1}
                 f"repeated={diversity['repeated_phrases'][:3]})"
             )
 
-        force_proactive, proactive_reason = self._should_force_proactive_outreach()
-        if force_proactive:
+        verification_prefers_reachout = bool(force) and (
+            trigger.startswith("manual") or trigger == "autonomy_cycle"
+        )
+        operational_cycle = self._is_operational_reflection_trigger(trigger) and not verification_prefers_reachout
+        if operational_cycle:
             parts.append(
-                "\nAutonomy directive: your collaborator has been quiet long enough. "
-                "This cycle should not be purely internal unless you are safety-blocked. "
-                "Choose [REACH_OUT] with one concise, high-signal update or question, "
-                "or choose [ACTION] if you can execute a concrete helpful task now."
+                "\nOperational cadence directive: this is a real autonomy decision pass. "
+                "Scan your current goals, recent activity, commitments, diagnostics, and maintenance opportunities. "
+                "If there is a concrete helpful step you can execute now, choose [ACTION]. "
+                "Choose [REACH_OUT] only when you are blocked on a human decision, missing external information, or your collaborator specifically needs an update or question that cannot wait. "
+                "Use [INTERNAL] only when there is genuinely no safe action or outreach to take."
             )
-            parts.append(f"Proactive trigger: {proactive_reason}")
-        elif proactive_reason:
-            parts.append(f"\nProactive status: {proactive_reason}")
+            parts.append(
+                "Keep the response concrete and practical. Avoid poetic scene-setting, repeated metaphors, or generic mood narration."
+            )
+            parts.append(
+                "Read-only inspection of Vera-owned runtime state, `vera_memory/*`, the task list, goals, autonomy state, and generated media manifest is allowed without partner confirmation. "
+                "If the actionable surface is non-empty, do not wait for partner input before taking the first safe investigative step."
+            )
+        if verification_prefers_reachout and self._has_proactive_delivery_target():
+            parts.append(
+                "\nVerification directive: this is a forced verification cycle with an available delivery target. "
+                "Do not default to [INTERNAL] unless you are genuinely safety-blocked. "
+                "Prefer [REACH_OUT] with one concise, high-signal update or question. "
+                "If a concrete helpful task is better, choose [ACTION]."
+            )
+            parts.append(f"Verification trigger: {trigger}")
+        else:
+            force_proactive, proactive_reason = self._should_force_proactive_outreach()
+            if force_proactive:
+                parts.append(
+                    "\nAutonomy directive: your collaborator has been quiet long enough. "
+                    "This cycle should not be purely internal unless you are safety-blocked. "
+                    "Choose [REACH_OUT] with one concise, high-signal update or question, "
+                    "or choose [ACTION] if you can execute a concrete helpful task now."
+                )
+                parts.append(f"Proactive trigger: {proactive_reason}")
+            elif proactive_reason:
+                parts.append(f"\nProactive status: {proactive_reason}")
+
+        if verification_prefers_reachout and not self._has_proactive_delivery_target():
+            parts.append(
+                "\nVerification status: no delivery target is currently available. "
+                "If you can help concretely, prefer [ACTION]. "
+                "Use [INTERNAL] only if there is no safe external action to take."
+            )
 
         return "\n".join(parts)
 
@@ -2235,11 +2474,12 @@ Reflection #{self.personality.total_reflections + 1}
                 turn_timeout_seconds = min(per_turn_timeout_seconds, max(1.0, remaining_seconds))
                 try:
                     entry = await asyncio.wait_for(
-                        self._execute_single_turn(
-                            run_id=run_id,
-                            trigger=current_trigger,
-                            chain_depth=chain_depth,
-                        ),
+                            self._execute_single_turn(
+                                run_id=run_id,
+                                trigger=current_trigger,
+                                chain_depth=chain_depth,
+                                force=force,
+                            ),
                         timeout=turn_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
@@ -2336,12 +2576,13 @@ Reflection #{self.personality.total_reflections + 1}
         run_id: str,
         trigger: str,
         chain_depth: int,
+        force: bool = False,
     ) -> MonologueEntry:
         """Execute a single reflection turn (one LLM call)."""
-        system_prompt = self._build_reflection_system_prompt()
+        system_prompt = self._build_reflection_system_prompt(trigger=trigger, force=force)
 
         if chain_depth == 0:
-            user_message = self._build_reflection_user_message()
+            user_message = self._build_reflection_user_message(trigger=trigger, force=force)
         else:
             # For chained turns, use the previous thought as context
             prev = self._recent_monologue[-1] if self._recent_monologue else None
@@ -2359,6 +2600,7 @@ Reflection #{self.personality.total_reflections + 1}
                 model=self.config.model_override,
                 generation_config={"temperature": self.config.reflection_temperature},
                 conversation_id=f"innerlife:{run_id}:{chain_depth}",
+                tool_choice=self._inner_life_tool_choice(),
             )
         except Exception as e:
             logger.error(f"Reflection LLM call failed: {e}")
@@ -2376,6 +2618,13 @@ Reflection #{self.personality.total_reflections + 1}
             chain_depth=chain_depth,
             run_id=run_id,
         )
+
+    @staticmethod
+    def _inner_life_tool_choice() -> str:
+        raw = str(os.getenv("VERA_INNER_LIFE_TOOL_CHOICE", "none") or "none").strip().lower()
+        if raw not in {"none", "auto"}:
+            raw = "none"
+        return raw
 
     # -----------------------------------------------------------------
     # Personality evolution
@@ -2417,6 +2666,7 @@ Constraints:
                     system_override="You are a concise introspection assistant. Output one sentence only.",
                     model=self.config.model_override,
                     conversation_id="innerlife:self_narrative",
+                    tool_choice=self._inner_life_tool_choice(),
                 )
                 sentence = " ".join(str(response or "").strip().split())
                 if sentence:
@@ -2481,6 +2731,7 @@ If no traits shifted, respond with: {{}}
                 system_override="You are a personality analysis system. Respond with JSON only.",
                 model=self.config.model_override,
                 conversation_id=f"innerlife:personality_update",
+                tool_choice=self._inner_life_tool_choice(),
             )
 
             # Parse the JSON from the response
@@ -2575,6 +2826,10 @@ If no traits shifted, respond with: {{}}
             logger.warning("Cannot import OutboundMessage for delivery")
             return delivered
 
+        delivery_mode = str(os.getenv("VERA_INNER_LIFE_DELIVERY_MODE", "fallback")).strip().lower()
+        if delivery_mode not in {"fallback", "broadcast"}:
+            delivery_mode = "fallback"
+
         for channel_id in self.config.delivery_channels:
             adapter = self._channel_dock.get(channel_id)
             if not adapter:
@@ -2595,6 +2850,8 @@ If no traits shifted, respond with: {{}}
             try:
                 await adapter.send(outbound)
                 delivered.append(channel_id)
+                if delivery_mode == "fallback":
+                    break
             except Exception as e:
                 logger.error(f"Inner life delivery to {channel_id} failed: {e}")
 
