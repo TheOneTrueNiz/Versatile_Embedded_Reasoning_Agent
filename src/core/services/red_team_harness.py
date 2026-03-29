@@ -250,7 +250,7 @@ def run_red_team(
     use_llm: bool = True,
     api_key: Optional[str] = None,
     base_url: str = "https://api.x.ai/v1",
-    model: str = "grok-4-1-fast-reasoning",
+    model: str = "grok-4.20-experimental-beta-0304-reasoning",
 ) -> Dict[str, Any]:
     transitions = _read_ndjson(transitions_path)
     failures = _collect_failures(transitions, failure_limit)

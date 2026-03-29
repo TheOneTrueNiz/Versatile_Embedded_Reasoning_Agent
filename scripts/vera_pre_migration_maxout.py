@@ -156,7 +156,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run pre-migration max coverage validation")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
-    parser.add_argument("--model", default="grok-4-1-fast-reasoning")
+    parser.add_argument("--model", default="grok-4.20-experimental-beta-0304-reasoning")
     parser.add_argument("--prompt-timeout", type=float, default=45.0)
     parser.add_argument("--call-timeout", type=float, default=20.0)
     parser.add_argument("--trainer-timeout", type=float, default=1800.0)

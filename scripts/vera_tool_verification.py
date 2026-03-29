@@ -229,7 +229,12 @@ def main() -> int:
                 base_url,
                 "sequential-thinking",
                 "sequentialthinking",
-                {"thought": "diagnostic test", "max_steps": 3},
+                {
+                    "thought": "diagnostic test",
+                    "nextThoughtNeeded": False,
+                    "thoughtNumber": 1,
+                    "totalThoughts": 1,
+                },
                 args.timeout,
             )
             record_ok("sequential-thinking") if ok else record_fail("sequential-thinking", detail)

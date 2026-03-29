@@ -31,7 +31,7 @@ def main() -> int:
     parser.add_argument("--failure-limit", type=int, default=10)
     parser.add_argument("--hard-count", type=int, default=10)
     parser.add_argument("--regression-count", type=int, default=20)
-    parser.add_argument("--model", type=str, default=os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning"))
+    parser.add_argument("--model", type=str, default=os.getenv("XAI_MODEL", "grok-4.20-experimental-beta-0304-reasoning"))
     parser.add_argument("--base-url", type=str, default=os.getenv("XAI_API_BASE", "https://api.x.ai/v1"))
     parser.add_argument("--no-llm", action="store_true")
     args = parser.parse_args()

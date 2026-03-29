@@ -426,6 +426,7 @@ class SafetyValidator:
     def _check_protected_resources(self, command: str, context: Dict) -> Optional[ValidationDecision]:
         """Check if command affects protected resources"""
         resources = self.protected_resources.get("resources", [])
+        operation = self._infer_protected_resource_operation(command, context)
 
         for resource in resources:
             path = resource.get("path")
@@ -435,13 +436,35 @@ class SafetyValidator:
             # Check if command mentions this path
             if path in command:
                 if rule == "block_all_modifications":
+                    if operation == "read":
+                        continue
                     return ValidationDecision(
                         result=ValidationResult.BLOCKED,
                         message=message,
                         matched_pattern=f"protected_resource:{path}",
                         severity=5
                     )
-                elif rule in ["require_confirmation_for_modification", "require_confirmation_for_deletion", "block_bulk_deletion"]:
+                elif rule == "require_confirmation_for_modification":
+                    if operation not in {"write", "modify", "delete"}:
+                        continue
+                    return ValidationDecision(
+                        result=ValidationResult.REQUIRES_CONFIRMATION,
+                        message=message,
+                        matched_pattern=f"protected_resource:{path}",
+                        severity=4
+                    )
+                elif rule == "require_confirmation_for_deletion":
+                    if operation != "delete":
+                        continue
+                    return ValidationDecision(
+                        result=ValidationResult.REQUIRES_CONFIRMATION,
+                        message=message,
+                        matched_pattern=f"protected_resource:{path}",
+                        severity=4
+                    )
+                elif rule == "block_bulk_deletion":
+                    if operation != "delete":
+                        continue
                     return ValidationDecision(
                         result=ValidationResult.REQUIRES_CONFIRMATION,
                         message=message,
@@ -450,6 +473,40 @@ class SafetyValidator:
                     )
 
         return None
+
+    @staticmethod
+    def _infer_protected_resource_operation(command: str, context: Dict) -> str:
+        tool_name = str((context or {}).get("tool_name") or "").strip().lower()
+        if tool_name in {
+            "read_file",
+            "read_text_file",
+            "read_media_file",
+            "read_multiple_files",
+            "get_file_info",
+            "list_directory",
+            "list_directory_with_sizes",
+            "directory_tree",
+            "search_files",
+            "list_allowed_directories",
+        }:
+            return "read"
+        if tool_name in {"write_file", "create_directory"}:
+            return "write"
+        if tool_name in {"edit_file", "move_file"}:
+            return "modify"
+        if tool_name in {"delete_file", "delete_directory", "remove_file"}:
+            return "delete"
+
+        lowered = str(command or "").strip().lower()
+        if re.search(r"\b(cat|less|more|head|tail|grep|rg|find|ls|stat|read_file|read_text_file)\b", lowered):
+            return "read"
+        if re.search(r"\b(rm|unlink|delete)\b", lowered):
+            return "delete"
+        if re.search(r"\b(mv|move|rename|sed\s+-i|perl\s+-pi|edit_file)\b", lowered):
+            return "modify"
+        if re.search(r"\b(tee|touch|mkdir|write_file|create_directory|cp)\b", lowered):
+            return "write"
+        return "unknown"
 
     def validate_file_operation(self, operation: str, paths: List[str], context: Dict = None) -> ValidationDecision:
         """

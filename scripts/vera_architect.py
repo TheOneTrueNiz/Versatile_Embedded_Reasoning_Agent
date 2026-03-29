@@ -114,7 +114,7 @@ def main() -> int:
     parser.add_argument("--genome", type=Path, default=DEFAULT_GENOME_PATH)
     parser.add_argument("--failure-limit", type=int, default=3)
     parser.add_argument("--base-url", type=str, default=os.getenv("XAI_API_BASE", "https://api.x.ai/v1"))
-    parser.add_argument("--model", type=str, default=os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning"))
+    parser.add_argument("--model", type=str, default=os.getenv("XAI_MODEL", "grok-4.20-experimental-beta-0304-reasoning"))
     parser.add_argument("--out-dir", type=Path, default=Path("vera_memory/flight_recorder/patch_candidates"))
     parser.add_argument("--candidate-dir", type=Path, default=Path("config/candidates"))
     args = parser.parse_args()

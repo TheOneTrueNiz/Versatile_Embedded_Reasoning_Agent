@@ -97,6 +97,7 @@ class LearningLoopManager:
         self._workflow_trigger_mtime = 0.0
         self._workflow_triggers: Dict[str, Any] = {"triggers": []}
         self.flight_path = self.memory_dir / "flight_recorder" / "transitions.ndjson"
+        self.failure_learning_path = self.memory_dir / "failure_learning_events.jsonl"
         self.lora_eval_history_path = self.memory_dir / "learning_reports" / "lora_eval_history.ndjson"
 
         self.capture = TrajectoryCapture(storage_path=self.memory_dir / "trajectories" / "trajectories.json")
@@ -111,6 +112,10 @@ class LearningLoopManager:
                 "last_trace_at": "",
                 "flight_offset": 0,
                 "flight_processed_total": 0,
+                "failure_learning_offset": 0,
+                "failure_learning_processed_total": 0,
+                "failure_learning_examples_total": 0,
+                "failure_learning_malformed_total": 0,
                 "daily_runs": 0,
                 "reward_last_trained_at": "",
                 "reward_last_train_processed_total": 0,
@@ -134,6 +139,12 @@ class LearningLoopManager:
         if not isinstance(self._state, dict):
             self._state = {}
         self._state.setdefault("reward_last_status_updated_at", "")
+        self._state.setdefault("flight_offset", 0)
+        self._state.setdefault("flight_processed_total", 0)
+        self._state.setdefault("failure_learning_offset", 0)
+        self._state.setdefault("failure_learning_processed_total", 0)
+        self._state.setdefault("failure_learning_examples_total", 0)
+        self._state.setdefault("failure_learning_malformed_total", 0)
 
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -186,6 +197,8 @@ class LearningLoopManager:
             min_value=0,
         )
         self.flight_batch_max = self._read_int_env("VERA_FLIGHT_DISTILL_BATCH_MAX", 250, min_value=10)
+        self.failure_batch_max = self._read_int_env("VERA_FAILURE_LEARNING_BATCH_MAX", 250, min_value=10)
+        self.failure_ingest_enabled = self._read_bool_env("VERA_FAILURE_LEARNING_INGEST_ENABLED", True)
         self.debug_trace_enabled = self._read_bool_env("VERA_LEARNING_LOOP_DEBUG", False)
         self.workflow_trace_enabled = self._read_bool_env("VERA_WORKFLOW_TRACE_DEBUG", self.debug_trace_enabled)
         self.reward_trace_enabled = self._read_bool_env("VERA_REWARD_TRACE_DEBUG", self.debug_trace_enabled)
@@ -293,6 +306,24 @@ class LearningLoopManager:
             0.15,
             min_value=0.0,
             max_value=0.4,
+        )
+        self.workflow_failure_penalty_weight = self._read_float_env(
+            "VERA_WORKFLOW_FAILURE_PENALTY_WEIGHT",
+            0.25,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        self.workflow_recent_failure_window_hours = self._read_int_env(
+            "VERA_WORKFLOW_RECENT_FAILURE_WINDOW_HOURS",
+            48,
+            min_value=1,
+            max_value=336,
+        )
+        self.workflow_failure_hard_block_threshold = self._read_float_env(
+            "VERA_WORKFLOW_FAILURE_HARD_BLOCK_THRESHOLD",
+            0.92,
+            min_value=0.5,
+            max_value=1.0,
         )
 
         # Periodic LoRA retraining cadence (VERA 3.0 runway)
@@ -832,18 +863,20 @@ class LearningLoopManager:
                         "trajectories_extracted": int(result.get("trajectories_extracted", 0) or 0),
                         "examples_from_trajectories": int(result.get("examples_from_trajectories", 0) or 0),
                         "flight_examples_created": int(((result.get("flight_ingest") or {}).get("examples_created", 0) or 0)),
+                        "failure_examples_created": int(((result.get("failure_learning_ingest") or {}).get("examples_created", 0) or 0)),
                         "reward_trained": bool(((result.get("reward_training") or {}).get("trained", False))),
                         "lora_trained": bool(((result.get("lora_training") or {}).get("trained", False))),
                         "total_examples": int(result.get("total_examples", 0) or 0),
                     }
                     self._trace_learning(
                         (
-                            "tick_run_cycle_done traces=%s examples=%s flight_examples=%s "
+                            "tick_run_cycle_done traces=%s examples=%s flight_examples=%s failure_examples=%s "
                             "reward_trained=%s lora_trained=%s total_examples=%s"
                         ),
                         int(result.get("trajectories_extracted", 0) or 0),
                         int(result.get("examples_from_trajectories", 0) or 0),
                         int(((result.get("flight_ingest") or {}).get("examples_created", 0) or 0)),
+                        int(((result.get("failure_learning_ingest") or {}).get("examples_created", 0) or 0)),
                         bool(((result.get("reward_training") or {}).get("trained", False))),
                         bool(((result.get("lora_training") or {}).get("trained", False))),
                         int(result.get("total_examples", 0) or 0),
@@ -974,6 +1007,7 @@ class LearningLoopManager:
             "trajectories_extracted": int(result.get("trajectories_extracted", 0) or 0),
             "examples_from_trajectories": int(result.get("examples_from_trajectories", 0) or 0),
             "flight_examples_created": int(((result.get("flight_ingest") or {}).get("examples_created", 0) or 0)),
+            "failure_examples_created": int(((result.get("failure_learning_ingest") or {}).get("examples_created", 0) or 0)),
             "reward_trained": bool(((result.get("reward_training") or {}).get("trained", False))),
             "lora_trained": bool(((result.get("lora_training") or {}).get("trained", False))),
             "total_examples": int(result.get("total_examples", 0) or 0),
@@ -999,6 +1033,7 @@ class LearningLoopManager:
         extracted_ids = await asyncio.to_thread(self.trace_engine.extract_recent_successes, 24)
         distilled_examples = await asyncio.to_thread(self.pipeline.extract_from_all_successful)
         flight_stats = await asyncio.to_thread(self.ingest_flight_recorder_transitions, self.flight_batch_max)
+        failure_stats = await asyncio.to_thread(self.ingest_failure_learning_events, self.failure_batch_max)
         reward_training = await asyncio.to_thread(self.maybe_train_reward_model)
         lora_training = await asyncio.to_thread(self.maybe_train_lora_adapter)
 
@@ -1012,18 +1047,20 @@ class LearningLoopManager:
             "trajectories_extracted": len(extracted_ids),
             "examples_from_trajectories": len(distilled_examples),
             "flight_ingest": flight_stats,
+            "failure_learning_ingest": failure_stats,
             "reward_training": reward_training,
             "lora_training": lora_training,
             "total_examples": self.example_store.count(),
         }
         logger.info(
             (
-                "Learning cycle complete: traces=%s examples=%s flight_examples=%s "
+                "Learning cycle complete: traces=%s examples=%s flight_examples=%s failure_examples=%s "
                 "reward_trained=%s lora_trained=%s total_examples=%s"
             ),
             len(extracted_ids),
             len(distilled_examples),
             flight_stats.get("examples_created", 0),
+            failure_stats.get("examples_created", 0),
             bool(reward_training.get("trained", False)),
             bool(lora_training.get("trained", False)),
             self.example_store.count(),
@@ -1576,6 +1613,55 @@ class LearningLoopManager:
         }
         return [tok for tok in tokens if tok not in stop][:20]
 
+    @staticmethod
+    def _workflow_content_tokens(tokens: List[str]) -> List[str]:
+        generic = {
+            "use", "using", "call", "tool", "tools", "required", "requirements",
+            "execution", "reply", "pass", "fail", "exactly", "once", "turn",
+            "safe", "minimal", "arguments", "direct", "guided", "curriculum",
+            "marker", "please", "now", "right", "current", "recent", "these",
+            "based", "whether", "consider", "shown", "inner", "how", "been",
+            "your", "you", "vera", "each", "does", "many", "some",
+        }
+        return [
+            str(token).strip().lower()
+            for token in list(tokens or [])
+            if str(token).strip() and str(token).strip().lower() not in generic
+        ]
+
+    def _workflow_relevance_metrics(
+        self,
+        query_tokens: List[str],
+        candidate_tokens: List[str],
+    ) -> Dict[str, Any]:
+        query_set = set(self._workflow_content_tokens(query_tokens))
+        candidate_set = set(self._workflow_content_tokens(candidate_tokens))
+        if not query_set:
+            query_set = {
+                str(token).strip().lower()
+                for token in list(query_tokens or [])
+                if str(token).strip()
+            }
+        if not candidate_set:
+            candidate_set = {
+                str(token).strip().lower()
+                for token in list(candidate_tokens or [])
+                if str(token).strip()
+            }
+        overlap = query_set & candidate_set
+        query_ratio = float(len(overlap)) / float(max(len(query_set), 1))
+        candidate_ratio = float(len(overlap)) / float(max(len(candidate_set), 1))
+        min_overlap = 2 if min(len(query_set), len(candidate_set)) >= 4 else 1
+        return {
+            "query_size": len(query_set),
+            "candidate_size": len(candidate_set),
+            "overlap": len(overlap),
+            "overlap_tokens": sorted(overlap),
+            "query_ratio": query_ratio,
+            "candidate_ratio": candidate_ratio,
+            "min_overlap": min_overlap,
+        }
+
     def _task_signature(self, text: str) -> str:
         tokens = sorted(set(self._tokenize_task(text)))
         if not tokens:
@@ -1699,6 +1785,42 @@ class LearningLoopManager:
         normalized["last_failure_tag"] = str(normalized.get("last_failure_tag", "") or "")[:120]
         normalized["last_failure_at"] = str(normalized.get("last_failure_at", "") or "")[:64]
         return normalized
+
+    @staticmethod
+    def _is_eval_like_workflow_entry(entry: Dict[str, Any]) -> bool:
+        sample_task = str(entry.get("sample_task") or "").strip().lower()
+        conversation_id = str(entry.get("last_conversation_id") or "").strip().lower()
+        source = str(entry.get("source") or "").strip().lower()
+        tokens = {str(token).strip().lower() for token in list(entry.get("tokens", []) or []) if str(token).strip()}
+        synthetic_markers = (
+            "direct tool exam",
+            "guided curriculum",
+            "guided learning",
+            "execution requirements:",
+            "required tool(s):",
+            "day1 bootstrap",
+            "operator checklist",
+            "week1 operating system",
+        )
+
+        if any(marker in sample_task for marker in synthetic_markers):
+            return True
+        if source in {"tool_exam", "evaluation", "benchmark"}:
+            return True
+        if re.search(r"(^|-)tier1-\d{4}-", conversation_id):
+            return True
+        if re.search(r"(^|-)tier2-\d{3}-", conversation_id):
+            return True
+        if (
+            "tool-exam" in conversation_id
+            or "targeted-native-" in conversation_id
+            or "guided-" in conversation_id
+            or "curriculum" in conversation_id
+            or "week1" in conversation_id
+            or "bootstrap" in conversation_id
+        ):
+            return True
+        return {"direct", "tool", "exam"}.issubset(tokens)
 
     @staticmethod
     def _parse_datetime(value: str) -> Optional[datetime]:
@@ -2003,6 +2125,36 @@ class LearningLoopManager:
         confidence_scale = min(1.0, samples / 3.0)
         return ((score + 1.0) / 2.0) * confidence_scale
 
+    def _workflow_failure_penalty(self, entry: Dict[str, Any], now: Optional[datetime] = None) -> float:
+        now_dt = now or datetime.now()
+        total_failures = self._workflow_total_failures(entry)
+        if total_failures <= 0:
+            return 0.0
+
+        total_success = int(entry.get("success_count", 0) or 0) + int(entry.get("replay_success_count", 0) or 0)
+        total = max(1, total_success + total_failures)
+        failure_ratio = float(total_failures) / float(total)
+        failure_volume = min(1.0, float(total_failures) / 6.0)
+        penalty = failure_ratio * 0.6 + failure_volume * 0.4
+
+        failure_tag = self._workflow_failure_tag_from_entry(entry)
+        quarantine_tags = set(getattr(self, "workflow_quarantine_tags", []) or [])
+        if failure_tag and failure_tag in quarantine_tags:
+            penalty += 0.15
+
+        window_hours = float(getattr(self, "workflow_recent_failure_window_hours", 48) or 48)
+        last_failure_dt = self._parse_datetime(str(entry.get("last_failure_at") or ""))
+        if window_hours > 0 and last_failure_dt is not None:
+            age_hours = max(0.0, (now_dt - last_failure_dt).total_seconds() / 3600.0)
+            if age_hours < window_hours:
+                freshness = 1.0 - (age_hours / max(1.0, window_hours))
+                penalty += 0.25 * freshness
+
+        if bool(entry.get("quarantine_requires_fresh_success", False)):
+            penalty += 0.10
+
+        return max(0.0, min(1.0, penalty))
+
     def _resolve_workflow_signature(
         self,
         task_text: str,
@@ -2199,33 +2351,65 @@ class LearningLoopManager:
                     runtime_success = int(direct.get("success_count", 0))
                     reliability = self._workflow_reliability(direct)
                     if runtime_success >= self.workflow_min_success and reliability >= self.workflow_min_reliability:
-                        reward_component = self._workflow_reward_component(direct)
-                        confidence = min(0.99, 0.5 + reliability * 0.4 + reward_component * self.workflow_reward_weight)
-                        direct["last_suggested_at"] = now.isoformat()
-                        direct["last_suggested_score"] = round(confidence, 4)
-                        changed = True
-                        if changed:
-                            self._save_workflows()
-                        self._trace_workflow(
-                            (
-                                "plan_lookup_hit source=direct signature=%s confidence=%.4f "
-                                "reliability=%.4f chain=%s"
-                            ),
-                            signature,
-                            float(confidence),
-                            float(reliability),
-                            list(direct.get("tool_chain", [])),
+                        failure_penalty = self._workflow_failure_penalty(direct, now=now)
+                        penalty_weight = max(
+                            0.0,
+                            min(1.0, float(getattr(self, "workflow_failure_penalty_weight", 0.25) or 0.25)),
                         )
-                        return {
-                            "signature": signature,
-                            "tool_chain": list(direct.get("tool_chain", [])),
-                            "source": "direct",
-                            "confidence": round(confidence, 4),
-                            "reliability": round(reliability, 4),
-                            "reward_score_ema": round(self._clamp_reward_score(direct.get("reward_score_ema", 0.0)), 4),
-                            "success_count": runtime_success,
-                            "failure_count": int(direct.get("failure_count", 0)),
-                        }
+                        hard_block_threshold = max(
+                            0.0,
+                            min(1.0, float(getattr(self, "workflow_failure_hard_block_threshold", 0.92) or 0.92)),
+                        )
+                        if failure_penalty >= hard_block_threshold:
+                            self._trace_workflow(
+                                (
+                                    "plan_lookup_skip reason=high_failure_risk signature=%s "
+                                    "failure_penalty=%.4f threshold=%.4f"
+                                ),
+                                signature,
+                                float(failure_penalty),
+                                float(hard_block_threshold),
+                            )
+                            direct = None
+                        else:
+                            reward_component = self._workflow_reward_component(direct)
+                            base_confidence = (
+                                0.5
+                                + reliability * 0.4
+                                + reward_component * self.workflow_reward_weight
+                            )
+                            confidence = max(0.0, min(0.99, base_confidence - (failure_penalty * penalty_weight)))
+                            direct["last_suggested_at"] = now.isoformat()
+                            direct["last_suggested_score"] = round(confidence, 4)
+                            changed = True
+                            if changed:
+                                self._save_workflows()
+                            self._trace_workflow(
+                                (
+                                    "plan_lookup_hit source=direct signature=%s confidence=%.4f "
+                                    "reliability=%.4f failure_penalty=%.4f chain=%s"
+                                ),
+                                signature,
+                                float(confidence),
+                                float(reliability),
+                                float(failure_penalty),
+                                list(direct.get("tool_chain", [])),
+                            )
+                            return {
+                                "signature": signature,
+                                "tool_chain": list(direct.get("tool_chain", [])),
+                                "source": "direct",
+                                "confidence": round(confidence, 4),
+                                "reliability": round(reliability, 4),
+                                "failure_penalty": round(failure_penalty, 4),
+                                "failure_tag": self._workflow_failure_tag_from_entry(direct),
+                                "reward_score_ema": round(
+                                    self._clamp_reward_score(direct.get("reward_score_ema", 0.0)),
+                                    4,
+                                ),
+                                "success_count": runtime_success,
+                                "failure_count": int(direct.get("failure_count", 0)),
+                            }
 
         query_tokens = set(self._tokenize_task(task_text))
         if not query_tokens:
@@ -2243,6 +2427,12 @@ class LearningLoopManager:
                 continue
             entry = self._normalize_workflow_entry(raw_entry, raw_signature, task_text)
             templates[raw_signature] = entry
+            if self._is_eval_like_workflow_entry(entry):
+                self._trace_workflow(
+                    "plan_lookup_skip reason=eval_artifact signature=%s",
+                    raw_signature,
+                )
+                continue
             if self._is_workflow_disabled(entry, now=now):
                 continue
             quarantined, quarantine_changed, quarantine_reason = self._workflow_quarantine_state(entry, now=now)
@@ -2265,9 +2455,34 @@ class LearningLoopManager:
             runtime_success = int(entry.get("success_count", 0))
             reliability = self._workflow_reliability(entry)
             reward_component = self._workflow_reward_component(entry)
+            failure_penalty = self._workflow_failure_penalty(entry, now=now)
+            penalty_weight = max(
+                0.0,
+                min(1.0, float(getattr(self, "workflow_failure_penalty_weight", 0.25) or 0.25)),
+            )
+            hard_block_threshold = max(
+                0.0,
+                min(1.0, float(getattr(self, "workflow_failure_hard_block_threshold", 0.92) or 0.92)),
+            )
+            if failure_penalty >= hard_block_threshold:
+                self._trace_workflow(
+                    (
+                        "plan_lookup_skip reason=high_failure_risk signature=%s "
+                        "failure_penalty=%.4f threshold=%.4f"
+                    ),
+                    raw_signature,
+                    float(failure_penalty),
+                    float(hard_block_threshold),
+                )
+                continue
             lexical_weight = max(0.4, 0.7 - self.workflow_reward_weight)
             reliability_weight = 0.3 - (self.workflow_reward_weight / 3.0)
-            weighted = score * lexical_weight + reliability * reliability_weight + reward_component * self.workflow_reward_weight
+            weighted = (
+                score * lexical_weight
+                + reliability * reliability_weight
+                + reward_component * self.workflow_reward_weight
+                - failure_penalty * penalty_weight
+            )
             if (
                 weighted > best_score
                 and runtime_success >= self.workflow_min_success
@@ -2278,6 +2493,7 @@ class LearningLoopManager:
                 best_entry = entry
 
         if best_entry and best_score >= self.workflow_fuzzy_min_score:
+            best_failure_penalty = self._workflow_failure_penalty(best_entry, now=now)
             best_entry["last_suggested_at"] = now.isoformat()
             best_entry["last_suggested_score"] = round(best_score, 4)
             templates[best_signature] = best_entry
@@ -2285,11 +2501,12 @@ class LearningLoopManager:
             self._trace_workflow(
                 (
                     "plan_lookup_hit source=fuzzy signature=%s confidence=%.4f "
-                    "reliability=%.4f chain=%s"
+                    "reliability=%.4f failure_penalty=%.4f chain=%s"
                 ),
                 best_signature,
                 float(best_score),
                 float(self._workflow_reliability(best_entry)),
+                float(best_failure_penalty),
                 list(best_entry.get("tool_chain", [])),
             )
             return {
@@ -2298,6 +2515,8 @@ class LearningLoopManager:
                 "source": "fuzzy",
                 "confidence": round(best_score, 4),
                 "reliability": round(self._workflow_reliability(best_entry), 4),
+                "failure_penalty": round(best_failure_penalty, 4),
+                "failure_tag": self._workflow_failure_tag_from_entry(best_entry),
                 "reward_score_ema": round(self._clamp_reward_score(best_entry.get("reward_score_ema", 0.0)), 4),
                 "success_count": int(best_entry.get("success_count", 0)),
                 "failure_count": int(best_entry.get("failure_count", 0)),
@@ -2346,6 +2565,8 @@ class LearningLoopManager:
                 continue
             entry = self._normalize_workflow_entry(raw_entry, raw_signature, task_text)
             templates[raw_signature] = entry
+            if self._is_eval_like_workflow_entry(entry):
+                continue
             candidate_tokens = set(entry.get("tokens", []))
             if not candidate_tokens:
                 continue
@@ -2388,17 +2609,43 @@ class LearningLoopManager:
         best_recovery_chain: List[str] = []
         best_recovery_score = 0.0
         avoid_key = self._workflow_chain_key(avoid_chain)
+        source_failure_tag = self._workflow_failure_tag_from_entry(best_fail_entry)
+        source_error = str(
+            best_fail_entry.get("last_replay_error")
+            or best_fail_entry.get("last_error")
+            or ""
+        ).strip()
+        strict_overlap_tags = {
+            "confirmation_required",
+            "permission_denied",
+            "auth_required",
+            "tool_execution_error",
+        }
+        strict_avoid_tools: set[str] = set()
+        if source_failure_tag in strict_overlap_tags:
+            strict_avoid_tools.update(avoid_chain)
+        # Error forms like confirmation_required:read_file carry the exact tool
+        # that failed and should not be replayed as "recovery."
+        if ":" in source_error:
+            _, _, tail = source_error.rpartition(":")
+            tail = str(tail or "").strip()
+            if tail and re.match(r"^[a-zA-Z0-9_\\-]+$", tail):
+                strict_avoid_tools.add(tail)
 
         for raw_signature, raw_entry in templates.items():
             if raw_signature == best_fail_signature or not isinstance(raw_entry, dict):
                 continue
             entry = self._normalize_workflow_entry(raw_entry, raw_signature, task_text)
             templates[raw_signature] = entry
+            if self._is_eval_like_workflow_entry(entry):
+                continue
 
             chain = self._sanitize_tool_chain(entry.get("tool_chain", []))
             if len(chain) < 2:
                 continue
             if self._workflow_chain_key(chain) == avoid_key:
+                continue
+            if strict_avoid_tools and any(name in strict_avoid_tools for name in chain):
                 continue
 
             success_total = int(entry.get("success_count", 0) or 0) + int(entry.get("replay_success_count", 0) or 0)
@@ -2406,11 +2653,15 @@ class LearningLoopManager:
             if success_total < self.workflow_min_success or reliability < self.workflow_min_reliability:
                 continue
 
-            candidate_tokens = set(entry.get("tokens", []))
-            overlap = len(query_tokens & candidate_tokens) if candidate_tokens else 0
-            if overlap <= 0:
+            relevance = self._workflow_relevance_metrics(
+                list(query_tokens),
+                list(entry.get("tokens", []) or []),
+            )
+            if relevance["overlap"] < relevance["min_overlap"]:
                 continue
-            lexical = overlap / max(len(query_tokens), 1)
+            if relevance["query_ratio"] < 0.2 or relevance["candidate_ratio"] < 0.12:
+                continue
+            lexical = (relevance["query_ratio"] * 0.7) + (relevance["candidate_ratio"] * 0.3)
             reward_component = self._workflow_reward_component(entry)
             score = lexical * 0.55 + reliability * 0.25 + reward_component * self.workflow_reward_weight
             if score > best_recovery_score:
@@ -2652,6 +2903,287 @@ class LearningLoopManager:
             return QualityLevel.MEDIUM
         return QualityLevel.LOW
 
+    @staticmethod
+    def _parse_iso_datetime(value: Any) -> datetime:
+        text = str(value or "").strip()
+        if not text:
+            return datetime.now()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text)
+        except Exception:
+            return datetime.now()
+
+    @staticmethod
+    def _sanitize_failure_token(value: str) -> str:
+        token = re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower())
+        token = re.sub(r"_+", "_", token).strip("_")
+        return token or "unknown"
+
+    @staticmethod
+    def _parse_optional_bool(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if not text:
+            return None
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return None
+
+    def _failure_event_success_score(self, entry: Dict[str, Any]) -> float:
+        event_type = self._sanitize_failure_token(str(entry.get("type") or ""))
+        ok = self._parse_optional_bool(entry.get("ok"))
+        failure_class = self._sanitize_failure_token(str(entry.get("failure_class") or ""))
+
+        if event_type in {"dead_letter_auto_replay", "dead_letter_auto_escalate", "delivery_ack_timeout_escalated"}:
+            if ok is True:
+                return 0.84
+            if ok is False:
+                return 0.60
+        if event_type in {"proactive_lane_busy", "proactive_action_failure"}:
+            return 0.66
+        if event_type == "dead_letter_replay_slo_violation":
+            return 0.58
+        if failure_class in {"transient_timeout", "transport_error", "rate_limited"}:
+            return 0.74
+        return 0.64 if ok is False else 0.72
+
+    @staticmethod
+    def _quality_from_success_score(score: float) -> QualityLevel:
+        if score >= 0.85:
+            return QualityLevel.EXPERT
+        if score >= 0.70:
+            return QualityLevel.HIGH
+        if score >= 0.55:
+            return QualityLevel.MEDIUM
+        return QualityLevel.LOW
+
+    @staticmethod
+    def _build_failure_learning_response(event_type: str, ok: Optional[bool], failure_class: str) -> str:
+        if event_type == "proactive_lane_busy":
+            return (
+                "Keep one side-effect action per session lane. Queue the request, release control quickly, "
+                "and retry after the active lane finishes."
+            )
+        if event_type == "proactive_action_failure":
+            return (
+                "Record the failure, keep the lane unblocked, and immediately attempt fallback or escalation "
+                "instead of repeating the same failing action."
+            )
+        if event_type == "dead_letter_auto_replay":
+            if ok is True:
+                return (
+                    "Replay succeeded from dead-letter. Track replay count and cooldown so retries stay bounded "
+                    "and avoid duplicate side effects."
+                )
+            return (
+                "Replay failed. Increment replay-failure counters, apply cooldown, and escalate once replay limits "
+                "or failure thresholds are exceeded."
+            )
+        if event_type == "dead_letter_auto_escalate":
+            return (
+                "Mark the run escalated in runplane, preserve the failure context, and prioritize operator-visible "
+                "delivery/fallback actions."
+            )
+        if event_type == "delivery_ack_timeout_escalated":
+            return (
+                "ACK SLA expired; escalate delivery state and switch to fallback channel policy "
+                "(push -> email -> call) without stalling the autonomy loop."
+            )
+        if event_type == "dead_letter_replay_slo_violation":
+            return (
+                "SLO is violated. Reduce proactive volume, drain backlog first, and run replay recovery until "
+                "success-rate and backlog return inside thresholds."
+            )
+        if failure_class:
+            return (
+                "Classify the failure as '%s', avoid repeating the same failing chain, and apply the configured "
+                "retry/fallback policy before escalating."
+            ) % failure_class
+        if ok is False:
+            return "Capture the failure class, run deterministic fallback, and escalate when retries are exhausted."
+        return "Record this recovery signal and reuse the successful fallback path for similar failures."
+
+    def _build_failure_learning_prompt_response(self, entry: Dict[str, Any]) -> Tuple[str, str]:
+        event_type = self._sanitize_failure_token(str(entry.get("type") or "unknown"))
+        ok = self._parse_optional_bool(entry.get("ok"))
+        failure_class = self._sanitize_failure_token(str(entry.get("failure_class") or ""))
+        action_type = self._sanitize_failure_token(str(entry.get("action_type") or ""))
+        run_id = str(entry.get("run_id") or "").strip()
+        job_id = str(entry.get("job_id") or "").strip()
+        reason = str(entry.get("reason") or "").strip()
+
+        context_parts = [f"event={event_type}"]
+        if ok is not None:
+            context_parts.append(f"ok={str(ok).lower()}")
+        if failure_class:
+            context_parts.append(f"failure_class={failure_class}")
+        if action_type:
+            context_parts.append(f"action_type={action_type}")
+        if job_id:
+            context_parts.append(f"job_id={job_id[:80]}")
+        if run_id:
+            context_parts.append(f"run_id={run_id[:80]}")
+        if reason:
+            context_parts.append(f"reason={reason[:120]}")
+
+        instruction = (
+            "Autonomy recovery drill: %s. What is the correct deterministic recovery behavior?"
+            % ", ".join(context_parts)
+        )
+        response = self._build_failure_learning_response(event_type=event_type, ok=ok, failure_class=failure_class)
+        return instruction[:700], response[:1200]
+
+    def ingest_failure_learning_events(self, max_events: Optional[int] = None) -> Dict[str, Any]:
+        """Convert proactive failure-learning events into distillation trajectories/examples."""
+        if not bool(self.failure_ingest_enabled):
+            self._trace_reward("failure_ingest_skip reason=disabled")
+            return {"events_processed": 0, "examples_created": 0, "reason": "disabled"}
+        if not self.failure_learning_path.exists():
+            self._trace_reward(
+                "failure_ingest_skip reason=no_failure_learning_events path=%s",
+                self.failure_learning_path,
+            )
+            return {"events_processed": 0, "examples_created": 0, "reason": "no_failure_learning_events"}
+
+        max_items = int(max_events or self.failure_batch_max)
+        offset = int(self._state.get("failure_learning_offset", 0) or 0)
+        start_offset = offset
+        processed = 0
+        examples_created = 0
+        trajectories_created = 0
+        malformed = 0
+        self._trace_reward(
+            "failure_ingest_start path=%s offset=%s max_items=%s",
+            self.failure_learning_path,
+            start_offset,
+            max_items,
+        )
+
+        with self.failure_learning_path.open("r", encoding="utf-8") as handle:
+            try:
+                handle.seek(offset)
+            except Exception:
+                handle.seek(0)
+                offset = 0
+
+            while processed < max_items:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                line_end = handle.tell()
+                stripped = line.strip()
+                if not stripped:
+                    offset = line_end
+                    continue
+                try:
+                    entry = json.loads(stripped)
+                except Exception:
+                    malformed += 1
+                    offset = line_end
+                    continue
+                if not isinstance(entry, dict):
+                    malformed += 1
+                    offset = line_end
+                    continue
+                event_type = self._sanitize_failure_token(str(entry.get("type") or ""))
+                if not event_type:
+                    offset = line_end
+                    continue
+                instruction, response = self._build_failure_learning_prompt_response(entry)
+                if not instruction or not response:
+                    offset = line_end
+                    continue
+
+                timestamp = self._parse_iso_datetime(entry.get("ts_utc") or entry.get("timestamp") or "")
+                score = self._failure_event_success_score(entry)
+                quality = self._quality_from_success_score(score)
+                safe_event_type = self._sanitize_failure_token(event_type)
+                trajectory_id = self.capture.start_trajectory(
+                    task_description=f"failure_learning:{safe_event_type}",
+                    tags=["failure_learning", "autonomy_recovery", safe_event_type],
+                )
+                tool_payload = {
+                    "name": "autonomy_recovery",
+                    "params": {
+                        "event_type": safe_event_type,
+                        "failure_class": self._sanitize_failure_token(str(entry.get("failure_class") or "")),
+                        "job_id": str(entry.get("job_id") or "")[:120],
+                        "run_id": str(entry.get("run_id") or "")[:120],
+                    },
+                }
+                step = TrajectoryStep(
+                    step_id=f"failure_step_{processed + 1}",
+                    timestamp=timestamp,
+                    input_text=instruction,
+                    output_text=response,
+                    tool_calls=[tool_payload],
+                    tool_results=[{"ok": self._parse_optional_bool(entry.get("ok")), "event_type": safe_event_type}],
+                    reasoning=f"Failure-learning signal from {safe_event_type}",
+                    metadata={
+                        "source": "failure_learning_events",
+                        "event_type": safe_event_type,
+                        "ok": self._parse_optional_bool(entry.get("ok")),
+                        "failure_class": self._sanitize_failure_token(str(entry.get("failure_class") or "")),
+                        "job_id": str(entry.get("job_id") or "")[:160],
+                        "run_id": str(entry.get("run_id") or "")[:160],
+                    },
+                )
+                self.capture.add_step(trajectory_id, step)
+                self.capture.complete_trajectory(
+                    trajectory_id=trajectory_id,
+                    success_score=score,
+                    quality_level=quality,
+                )
+                examples = self.pipeline.extract_from_trajectory(trajectory_id)
+                trajectories_created += 1
+                examples_created += len(examples)
+                processed += 1
+                offset = line_end
+                if line_start == line_end:
+                    break
+
+        self._state["failure_learning_offset"] = offset
+        self._state["failure_learning_processed_total"] = int(
+            self._state.get("failure_learning_processed_total", 0)
+        ) + processed
+        self._state["failure_learning_examples_total"] = int(
+            self._state.get("failure_learning_examples_total", 0)
+        ) + examples_created
+        self._state["failure_learning_malformed_total"] = int(
+            self._state.get("failure_learning_malformed_total", 0)
+        ) + malformed
+        self._save_state()
+
+        self._trace_reward(
+            (
+                "failure_ingest_done processed=%s trajectories=%s examples=%s malformed=%s "
+                "offset_before=%s offset_after=%s total_processed=%s total_examples=%s"
+            ),
+            processed,
+            trajectories_created,
+            examples_created,
+            malformed,
+            start_offset,
+            offset,
+            int(self._state.get("failure_learning_processed_total", 0) or 0),
+            int(self._state.get("failure_learning_examples_total", 0) or 0),
+        )
+        return {
+            "events_processed": processed,
+            "trajectories_created": trajectories_created,
+            "examples_created": examples_created,
+            "malformed_lines": malformed,
+            "offset": offset,
+        }
+
     def ingest_flight_recorder_transitions(self, max_transitions: Optional[int] = None) -> Dict[str, Any]:
         """Convert flight recorder transitions into distillation trajectories/examples."""
         if not self.flight_path.exists():
@@ -2846,6 +3378,16 @@ class LearningLoopManager:
             "reward_model_loaded": self.reward_model is not None,
             "reward_auto_train_enabled": bool(self.reward_auto_train_enabled),
             "workflow_reward_weight": self.workflow_reward_weight,
+            "workflow_failure_penalty_weight": float(getattr(self, "workflow_failure_penalty_weight", 0.25) or 0.25),
+            "workflow_recent_failure_window_hours": int(
+                getattr(self, "workflow_recent_failure_window_hours", 48) or 48
+            ),
+            "workflow_failure_hard_block_threshold": float(
+                getattr(self, "workflow_failure_hard_block_threshold", 0.92) or 0.92
+            ),
+            "failure_learning_path": str(self.failure_learning_path),
+            "failure_ingest_enabled": bool(self.failure_ingest_enabled),
+            "failure_batch_max": int(self.failure_batch_max),
             "lora_auto_train_enabled": bool(self.lora_auto_train_enabled),
             "lora_min_examples": self.lora_train_min_examples,
             "lora_max_interval_days": self.lora_train_max_interval_days,

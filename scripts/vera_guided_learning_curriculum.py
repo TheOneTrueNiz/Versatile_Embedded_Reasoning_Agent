@@ -93,7 +93,7 @@ def choose_model(v1_url: str, override: str | None, timeout: float) -> str:
             model = data[0].get("id")
             if isinstance(model, str) and model:
                 return model
-    return "grok-4-1-fast-reasoning"
+    return "grok-4.20-experimental-beta-0304-reasoning"
 
 
 def extract_reply(payload: Any) -> str:
