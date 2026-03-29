@@ -236,7 +236,7 @@ class LLMBridge:
         if not self.api_key and not self.registry and self._requires_key(base_url):
             raise ValueError("XAI_API_KEY or API_KEY is required (or provide a ProviderRegistry)")
 
-        self.model = model or os.getenv("VERA_MODEL", "grok-4-1-fast-reasoning")
+        self.model = model or os.getenv("VERA_MODEL", "grok-4.20-experimental-beta-0304-reasoning")
         self.base_url = base_url
         self.timeout = timeout
         self.max_tool_rounds = max_tool_rounds
@@ -245,6 +245,7 @@ class LLMBridge:
         self.last_model_used: Optional[str] = None
         self.last_tools_used: List[str] = []
         self.tool_execution_history: List[Dict[str, Any]] = []
+        self._active_request_tool_execution: List[Dict[str, Any]] = []
         self._tool_aliases: Dict[str, Dict[str, str]] = {}
         self._active_workflow_plan: Dict[str, Any] = {}
         self._request_workflow_hint: Optional[Dict[str, Any]] = None
@@ -283,10 +284,28 @@ class LLMBridge:
             total = int(raw.get("events_total", 0) or 0)
         except Exception:
             total = 0
+        override_applied = int(counts.get("failure_recovery_override_applied", 0) or 0)
+        override_success = int(counts.get("replay_override_done", 0) or 0)
+        override_failure = int(counts.get("replay_override_error", 0) or 0)
+        override_replayed = max(0, override_success + override_failure)
+        override_success_rate_pct: Optional[float] = None
+        override_replay_rate_pct: Optional[float] = None
+        if override_replayed > 0:
+            override_success_rate_pct = round((float(override_success) / float(override_replayed)) * 100.0, 2)
+        if override_applied > 0:
+            override_replay_rate_pct = round((float(override_replayed) / float(override_applied)) * 100.0, 2)
         return {
             "events_total": max(0, total),
             "counts": counts,
             "last_event": last_event,
+            "failure_recovery_override": {
+                "applied": override_applied,
+                "replayed": override_replayed,
+                "successes": override_success,
+                "failures": override_failure,
+                "success_rate_pct": override_success_rate_pct,
+                "replay_rate_pct": override_replay_rate_pct,
+            },
         }
 
     def _record_workflow_trace_event(self, event: str, **fields: Any) -> None:
@@ -401,6 +420,10 @@ class LLMBridge:
             "timed out after",
             "failed to start",
             "must authorize this application",
+            "recipient phone must be in e.164",
+            "recipient phone not in allowlist",
+            "callme_user_phone_number",
+            "missing required parameter",
         )
         return any(marker in lowered for marker in failure_markers)
 
@@ -789,6 +812,16 @@ class LLMBridge:
             overlap = [name for name in chain if name in avoid]
             if overlap:
                 return False, f"avoid_tools_overlap:{','.join(overlap[:3])}"
+
+        failure_penalty = self._parse_float(workflow_plan.get("failure_penalty"), 0.0)
+        max_failure_penalty = self._parse_float(
+            os.getenv("VERA_WORKFLOW_MAX_FAILURE_PENALTY", "0.70"),
+            0.70,
+        )
+        max_failure_penalty = max(0.0, min(1.0, max_failure_penalty))
+        recovery_override = bool(workflow_plan.get("failure_recovery_override", False))
+        if (not recovery_override) and failure_penalty >= max_failure_penalty:
+            return False, f"failure_penalty:{failure_penalty:.3f}>={max_failure_penalty:.3f}"
 
         source = str(workflow_plan.get("source") or "").strip().lower()
         if source == "fuzzy":
@@ -2532,6 +2565,61 @@ class LLMBridge:
                             if server_name not in selected_servers:
                                 selected_servers.append(server_name)
 
+        context_intents = self._tool_shortlist_intents(context_text)
+        if self._is_pure_calendar_intent(context_intents):
+            selected_categories = [
+                category
+                for category in selected_categories
+                if category in {"workspace", "time"}
+            ]
+            selected_servers = [
+                server_name
+                for server_name in selected_servers
+                if server_name in {"google-workspace", "time"}
+            ]
+            if "workspace" not in selected_categories:
+                selected_categories.append("workspace")
+            if "time" not in selected_categories:
+                selected_categories.append("time")
+            if "google-workspace" in available and "google-workspace" not in selected_servers:
+                selected_servers.append("google-workspace")
+            if "time" in available and "time" not in selected_servers:
+                selected_servers.append("time")
+        elif self._is_pure_web_research_intent(context_intents):
+            selected_categories = [
+                category
+                for category in selected_categories
+                if category in {"web", "long_context", "reasoning", "time"}
+            ]
+            selected_servers = [
+                server_name
+                for server_name in selected_servers
+                if server_name in {"brave-search", "searxng", "wikipedia", "grokipedia", "time"}
+            ]
+            for category in ("web", "long_context"):
+                if category not in selected_categories:
+                    selected_categories.append(category)
+            for server_name in ("brave-search", "searxng", "wikipedia", "grokipedia", "time"):
+                if server_name in available and server_name not in selected_servers:
+                    selected_servers.append(server_name)
+        elif self._is_pure_local_memory_intent(context_intents):
+            selected_categories = [
+                category
+                for category in selected_categories
+                if category in {"files", "memory", "reasoning", "long_context"}
+            ]
+            selected_servers = [
+                server_name
+                for server_name in selected_servers
+                if server_name in {"filesystem", "obsidian-vault", "memory", "marm-memory"}
+            ]
+            for category in ("files", "memory"):
+                if category not in selected_categories:
+                    selected_categories.append(category)
+            for server_name in ("filesystem", "obsidian-vault", "memory", "marm-memory"):
+                if server_name in available and server_name not in selected_servers:
+                    selected_servers.append(server_name)
+
         # Store routing metadata for learning signals
         self._last_routing_meta = {
             "category_confidence": locals().get("category_confidence", {}),
@@ -2755,6 +2843,87 @@ class LLMBridge:
                 if server_name not in selected_servers:
                     selected_servers.append(server_name)
 
+        shortlist_enabled = os.getenv("VERA_TOOL_SHORTLIST_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+        shortlist_limit = self._read_int_env("VERA_TOOL_SHORTLIST_MAX", 8, min_value=0)
+        shortlist_context_intents = sorted(self._tool_shortlist_intents(str(context or "").strip().lower()))
+        shortlist_preserve: List[str] = []
+        shortlist_candidates: Dict[str, Dict[str, str]] = {}
+        shortlist_applied = False
+        mcp_defs_count = len(mcp_defs)
+        shortlisted_server_tools: Dict[str, List[str]] = {
+            server_name: list(available.get(server_name, []) or [])
+            for server_name in selected_servers
+        }
+        mcp_shortlist_names: List[str] = sorted(mcp_defs.keys())
+        if shortlist_enabled and shortlist_limit > 0 and len(mcp_defs) > shortlist_limit:
+            shortlist_applied = True
+            shortlist_preserve.extend(
+                name for name in explicit_tools if name in mcp_defs
+            )
+            shortlist_preserve.extend(
+                name for name in inferred_required_tools if name in mcp_defs
+            )
+            if forced_tool and forced_tool in mcp_defs:
+                shortlist_preserve.append(forced_tool)
+            if self._live_data_forced_tool and self._live_data_forced_tool in mcp_defs:
+                shortlist_preserve.append(self._live_data_forced_tool)
+            if phone_hit and "initiate_call" in mcp_defs:
+                shortlist_preserve.append("initiate_call")
+            if reminder_signal:
+                for reminder_tool in ("create_event", "get_events", "list_calendars"):
+                    if reminder_tool in mcp_defs:
+                        shortlist_preserve.append(reminder_tool)
+            if push_signal:
+                for push_tool in ("send_native_push", "send_mobile_push", "send_sms", "send_mms"):
+                    if push_tool in mcp_defs:
+                        shortlist_preserve.append(push_tool)
+
+            for (server_name, tool_name), exposed_name in server_tool_to_exposed.items():
+                tool_def = mcp_defs.get(exposed_name) or {}
+                function_def = dict(tool_def.get("function") or {})
+                shortlist_candidates[exposed_name] = {
+                    "description": str(function_def.get("description") or ""),
+                    "server": str(server_name or ""),
+                    "raw_name": str(tool_name or ""),
+                }
+
+            shortlisted_exposed = set(
+                self._select_mcp_tool_shortlist(
+                    context=str(context or ""),
+                    candidates=shortlist_candidates,
+                    limit=shortlist_limit,
+                    preserve=shortlist_preserve,
+                )
+            )
+            shortlisted_exposed = {
+                name
+                for name in shortlisted_exposed
+                if not self._tool_shortlist_blocked(
+                    context_intents=set(shortlist_context_intents),
+                    context_text=str(context or "").strip().lower(),
+                    server_name=str((shortlist_candidates.get(name) or {}).get("server") or ""),
+                    exposed_name=name,
+                    raw_name=str((shortlist_candidates.get(name) or {}).get("raw_name") or name),
+                    haystack=" ".join(
+                        [
+                            name,
+                            str((shortlist_candidates.get(name) or {}).get("raw_name") or name),
+                            str((shortlist_candidates.get(name) or {}).get("server") or ""),
+                            str((shortlist_candidates.get(name) or {}).get("description") or ""),
+                        ]
+                    ).lower(),
+                )
+            }
+            shortlisted_server_tools = {}
+            for server_name in selected_servers:
+                kept: List[str] = []
+                for tool_name in list(available.get(server_name, []) or []):
+                    exposed_name = server_tool_to_exposed.get((server_name, tool_name))
+                    if exposed_name and exposed_name in shortlisted_exposed:
+                        kept.append(tool_name)
+                shortlisted_server_tools[server_name] = kept
+            mcp_shortlist_names = sorted(shortlisted_exposed)
+
         tools: List[Dict[str, Any]] = []
         seen = set()
         native_included = 0
@@ -2783,7 +2952,7 @@ class LLMBridge:
                 if filtered_native:
                     router_candidates["native"] = filtered_native
             for server_name in selected_servers:
-                router_candidates[server_name] = available.get(server_name, [])
+                router_candidates[server_name] = shortlisted_server_tools.get(server_name, [])
 
             router_tools = await self._route_tool_names(context or "", router_candidates, router_max)
             if router_tools and logger.isEnabledFor(logging.DEBUG):
@@ -2919,6 +3088,42 @@ class LLMBridge:
                     list(failure_learning_plan.get("avoid_tools", []) or []),
                     list(failure_learning_plan.get("suggested_recovery_chain", []) or []),
                 )
+        if workflow_suggested_chain and failure_learning_plan:
+            allowed_names = list(native_defs.keys()) + list(mcp_defs.keys())
+            override = self._apply_failure_recovery_override(
+                workflow_plan=workflow_plan,
+                workflow_chain=workflow_suggested_chain,
+                failure_plan=failure_learning_plan,
+                allowed_names=allowed_names,
+            )
+            if bool(override.get("applied")):
+                prior_chain = list(workflow_suggested_chain)
+                workflow_suggested_chain = list(override.get("tool_chain", []) or [])
+                workflow_plan = dict(workflow_plan or {})
+                workflow_plan["tool_chain"] = list(workflow_suggested_chain)
+                workflow_plan["failure_recovery_override"] = True
+                workflow_plan["failure_penalty"] = 0.0
+                workflow_plan["failure_tag"] = str(failure_learning_plan.get("source_failure_tag", "") or "")
+                source = str(workflow_plan.get("source") or "").strip()
+                workflow_plan["source"] = f"{source}+failure_recovery" if source else "failure_recovery"
+                self._record_workflow_trace_event(
+                    "failure_recovery_override_applied",
+                    reason=str(override.get("reason", "")),
+                    prior_chain=prior_chain,
+                    recovery_chain=workflow_suggested_chain,
+                    overlap=list(override.get("overlap", []) or []),
+                    signature=str(workflow_plan.get("signature", "")),
+                )
+                self._trace_workflow(
+                    (
+                        "failure_recovery_override reason=%s prior_chain=%s recovery_chain=%s "
+                        "overlap=%s"
+                    ),
+                    str(override.get("reason", "")),
+                    prior_chain,
+                    workflow_suggested_chain,
+                    list(override.get("overlap", []) or []),
+                )
         if workflow_suggested_chain:
             chain_ok, chain_reason = self._should_accept_workflow_chain(
                 context=str(context or ""),
@@ -3007,7 +3212,7 @@ class LLMBridge:
             if tool_max:
                 # Prioritize MCP tools when capped to avoid starving MCP visibility.
                 for server_name in selected_servers:
-                    tool_names = available.get(server_name, [])
+                    tool_names = shortlisted_server_tools.get(server_name, [])
                     remaining = max(tool_max - len(tools), 0)
                     if remaining <= 0:
                         break
@@ -3055,7 +3260,7 @@ class LLMBridge:
                     native_included += 1
 
                 for server_name in selected_servers:
-                    tool_names = available.get(server_name, [])
+                    tool_names = shortlisted_server_tools.get(server_name, [])
                     for tool_name in tool_names:
                         exposed_name = _resolve_exposed_name(server_name, tool_name)
                         if not exposed_name:
@@ -3191,6 +3396,18 @@ class LLMBridge:
                 "workflow_suggested_chain": workflow_suggested_chain,
                 "workflow_plan": workflow_plan,
                 "failure_learning_plan": failure_learning_plan,
+                "mcp_shortlist_enabled": shortlist_enabled,
+                "mcp_shortlist_limit": shortlist_limit,
+                "mcp_shortlist_applied": shortlist_applied,
+                "mcp_defs_count": mcp_defs_count,
+                "mcp_shortlist_context_intents": shortlist_context_intents,
+                "mcp_shortlist_count": len(mcp_shortlist_names),
+                "mcp_shortlist_names": mcp_shortlist_names,
+                "mcp_shortlist_preserve_names": sorted(set(shortlist_preserve)),
+                "mcp_shortlist_rows": {
+                    name: shortlist_candidates.get(name, {})
+                    for name in mcp_shortlist_names[:20]
+                },
             }
             workflow_recording = self._workflow_recording_snapshot()
             if workflow_recording:
@@ -3235,6 +3452,18 @@ class LLMBridge:
             tool_limit = int(os.getenv("VERA_TOOL_PAYLOAD_TOOL_LIMIT", "80"))
         except ValueError:
             tool_limit = 80
+        try:
+            row_limit = int(os.getenv("VERA_TOOL_PAYLOAD_ROW_LIMIT", "8"))
+        except ValueError:
+            row_limit = 8
+        try:
+            alias_limit = int(os.getenv("VERA_TOOL_PAYLOAD_ALIAS_LIMIT", "12"))
+        except ValueError:
+            alias_limit = 12
+        try:
+            text_limit = int(os.getenv("VERA_TOOL_PAYLOAD_TEXT_LIMIT", "220"))
+        except ValueError:
+            text_limit = 220
 
         names = payload.get("tool_names")
         if isinstance(names, list):
@@ -3254,7 +3483,413 @@ class LLMBridge:
             else:
                 payload["tools_truncated"] = False
 
+        shortlist_names = payload.get("mcp_shortlist_names")
+        if isinstance(shortlist_names, list):
+            payload["mcp_shortlist_names_total"] = len(shortlist_names)
+            if row_limit >= 0 and len(shortlist_names) > row_limit:
+                payload["mcp_shortlist_names"] = shortlist_names[:row_limit]
+                payload["mcp_shortlist_names_truncated"] = True
+            else:
+                payload["mcp_shortlist_names_truncated"] = False
+
+        preserve_names = payload.get("mcp_shortlist_preserve_names")
+        if isinstance(preserve_names, list):
+            payload["mcp_shortlist_preserve_names_total"] = len(preserve_names)
+            if row_limit >= 0 and len(preserve_names) > row_limit:
+                payload["mcp_shortlist_preserve_names"] = preserve_names[:row_limit]
+                payload["mcp_shortlist_preserve_names_truncated"] = True
+            else:
+                payload["mcp_shortlist_preserve_names_truncated"] = False
+
+        def _trim_text(value: Any) -> str:
+            text = str(value or "")
+            if text_limit >= 0 and len(text) > text_limit:
+                return text[:text_limit].rstrip() + "..."
+            return text
+
+        shortlist_rows = payload.get("mcp_shortlist_rows")
+        if isinstance(shortlist_rows, dict):
+            payload["mcp_shortlist_rows_total"] = len(shortlist_rows)
+            items = list(shortlist_rows.items())
+            if row_limit >= 0:
+                items = items[:row_limit]
+                payload["mcp_shortlist_rows_truncated"] = len(shortlist_rows) > row_limit
+            else:
+                payload["mcp_shortlist_rows_truncated"] = False
+            payload["mcp_shortlist_rows"] = {
+                key: {
+                    "server": str((value or {}).get("server") or ""),
+                    "raw_name": str((value or {}).get("raw_name") or ""),
+                    "description": _trim_text((value or {}).get("description") or ""),
+                }
+                for key, value in items
+            }
+
+        aliases = payload.get("tool_aliases")
+        if isinstance(aliases, dict):
+            payload["tool_aliases_total"] = len(aliases)
+            alias_items = list(aliases.items())
+            if alias_limit >= 0:
+                alias_items = alias_items[:alias_limit]
+                payload["tool_aliases_truncated"] = len(aliases) > alias_limit
+            else:
+                payload["tool_aliases_truncated"] = False
+            payload["tool_aliases"] = {
+                key: {
+                    "server": str((value or {}).get("server") or ""),
+                    "tool": str((value or {}).get("tool") or ""),
+                }
+                for key, value in alias_items
+            }
+
         return payload
+
+    @staticmethod
+    def _tool_shortlist_tokens(text: str) -> set[str]:
+        stopwords = {
+            "the", "and", "for", "with", "that", "this", "from", "into", "your",
+            "you", "use", "using", "tool", "tools", "vera", "layer", "design",
+            "most", "relevant", "bounded", "plan", "next", "then", "only",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-z0-9_]+", str(text or "").lower())
+            if len(token) >= 3 and token not in stopwords
+        }
+
+    @staticmethod
+    def _tool_shortlist_intents(text: str) -> set[str]:
+        lowered = str(text or "").lower()
+        intents = set()
+        if any(token in lowered for token in ("calendar", "event", "events", "reminder", "reminders", "schedule", "appointment")):
+            intents.add("calendar")
+        if any(token in lowered for token in ("email", "mail", "gmail", "drive", "docs", "sheets", "workspace")):
+            intents.add("workspace")
+        if any(
+            token in lowered
+            for token in (
+                "file",
+                "files",
+                "folder",
+                "folders",
+                "directory",
+                "directories",
+                "repo",
+                "repository",
+                "project files",
+                "project file",
+                "vault",
+            )
+        ):
+            intents.add("local")
+        if re.search(r"\blocal\s+(file|files|folder|folders|directory|directories|repo|repository|project|vault)\b", lowered):
+            intents.add("local")
+        if any(
+            token in lowered
+            for token in (
+                "memory",
+                "memories",
+                "note",
+                "notes",
+                "diary",
+                "checkpoint",
+                "archive",
+                "recall",
+            )
+        ):
+            intents.add("memory")
+        if any(token in lowered for token in ("phone", "call", "text", "sms", "message", "push", "notification")):
+            intents.add("messaging")
+        if any(token in lowered for token in ("search", "web", "research", "source", "sources", "citation", "citations")):
+            intents.add("web")
+        if any(token in lowered for token in ("auth", "oauth", "login", "sign in", "sign-in", "connect account")):
+            intents.add("auth")
+        return intents
+
+    @staticmethod
+    def _is_pure_calendar_intent(context_intents: set[str]) -> bool:
+        intents = set(context_intents or set())
+        return "calendar" in intents and not (intents & {"web", "auth", "messaging"})
+
+    @staticmethod
+    def _is_pure_local_memory_intent(context_intents: set[str]) -> bool:
+        intents = set(context_intents or set())
+        return bool(intents & {"local", "memory"}) and not (intents & {"calendar", "workspace", "web", "auth", "messaging"})
+
+    @staticmethod
+    def _is_pure_web_research_intent(context_intents: set[str]) -> bool:
+        intents = set(context_intents or set())
+        return "web" in intents and not (intents & {"calendar", "workspace", "auth", "messaging", "local", "memory"})
+
+    @staticmethod
+    def _web_research_prefers_local_results(context_text: str) -> bool:
+        lowered = str(context_text or "").lower()
+        return any(
+            token in lowered
+            for token in (
+                "near me",
+                "nearby",
+                "near ",
+                "local businesses",
+                "local business",
+                "restaurants",
+                "coffee shops",
+                "address",
+                "addresses",
+                "hours",
+                "map",
+                "maps",
+                "poi",
+            )
+        )
+
+    @staticmethod
+    def _web_research_prefers_video_results(context_text: str) -> bool:
+        lowered = str(context_text or "").lower()
+        return any(
+            token in lowered
+            for token in (
+                "video",
+                "videos",
+                "youtube",
+                "watch",
+                "tutorial",
+                "tutorials",
+                "lecture",
+                "lectures",
+                "talk",
+                "talks",
+                "demo",
+                "demos",
+            )
+        )
+
+    @staticmethod
+    def _tool_shortlist_blocked(
+        *,
+        context_intents: set[str],
+        context_text: str,
+        server_name: str,
+        exposed_name: str,
+        raw_name: str,
+        haystack: str,
+    ) -> bool:
+        normalized_haystack = re.sub(r"[_/:-]+", " ", str(haystack or "").lower())
+
+        def _has_term(term: str) -> bool:
+            normalized_term = str(term or "").lower().replace("_", " ").strip()
+            if not normalized_term:
+                return False
+            return re.search(rf"\b{re.escape(normalized_term)}\b", normalized_haystack) is not None
+
+        calendar_terms = ("calendar", "event", "events", "reminder", "reminders", "appointment", "appointments")
+        drive_terms = (
+            "drive",
+            "file",
+            "files",
+            "folder",
+            "folders",
+            "docs",
+            "sheets",
+            "slides",
+            "public_access",
+            "public access",
+        )
+        mail_terms = ("gmail", "email", "mail", "inbox", "draft", "filter", "filters", "thread", "threads", "message", "messages")
+        auth_terms = ("auth", "oauth", "login", "sign in", "sign-in", "connect")
+        lowered_exposed = str(exposed_name or "").lower()
+        lowered_raw = str(raw_name or "").lower()
+
+        if "calendar" in context_intents and "web" not in context_intents:
+            if server_name in {
+                "brave-search",
+                "searxng",
+                "browserbase",
+                "stealth-browser",
+                "youtube-transcript",
+                "filesystem",
+                "obsidian-vault",
+                "sequential-thinking",
+                "marm-memory",
+                "memory",
+                "memvid",
+            }:
+                return True
+            if server_name == "google-workspace":
+                has_calendar_shape = any(_has_term(token) for token in calendar_terms)
+                has_drive_shape = any(_has_term(token) for token in drive_terms)
+                has_mail_shape = (
+                    any(_has_term(token) for token in mail_terms)
+                    or "gmail" in lowered_raw
+                    or "gmail" in lowered_exposed
+                )
+                has_auth_shape = (
+                    any(_has_term(token) for token in auth_terms)
+                    or "auth" in lowered_raw
+                    or "auth" in lowered_exposed
+                    or "oauth" in lowered_raw
+                    or "oauth" in lowered_exposed
+                )
+                if "workspace" not in context_intents and "auth" not in context_intents and not has_calendar_shape:
+                    return True
+                if has_drive_shape and not has_calendar_shape:
+                    return True
+                if "workspace" not in context_intents and has_mail_shape and not has_calendar_shape:
+                    return True
+                if "auth" not in context_intents and has_auth_shape and not has_calendar_shape:
+                    return True
+        if LLMBridge._is_pure_local_memory_intent(context_intents):
+            if server_name in {
+                "brave-search",
+                "searxng",
+                "browserbase",
+                "stealth-browser",
+                "youtube-transcript",
+                "google-workspace",
+                "github",
+                "memvid",
+                "sandbox",
+                "time",
+            }:
+                return True
+        if LLMBridge._is_pure_web_research_intent(context_intents):
+            wants_local_results = LLMBridge._web_research_prefers_local_results(context_text)
+            wants_video_results = LLMBridge._web_research_prefers_video_results(context_text)
+            if server_name in {
+                "browserbase",
+                "stealth-browser",
+                "youtube-transcript",
+                "filesystem",
+                "obsidian-vault",
+                "memory",
+                "marm-memory",
+                "memvid",
+                "github",
+                "sandbox",
+                "google-workspace",
+                "sequential-thinking",
+            }:
+                return True
+            if any(token in lowered_raw for token in ("local_search", "local-search")) and not wants_local_results:
+                return True
+            if any(token in lowered_raw for token in ("video_search", "video-search")) and not wants_video_results:
+                return True
+        return False
+
+    def _select_mcp_tool_shortlist(
+        self,
+        *,
+        context: str,
+        candidates: Dict[str, Dict[str, str]],
+        limit: int,
+        preserve: Optional[List[str]] = None,
+    ) -> List[str]:
+        max_items = max(0, int(limit or 0))
+        if max_items <= 0:
+            return []
+        preserve_list = [str(name).strip() for name in (preserve or []) if str(name).strip()]
+        preserved = []
+        seen = set()
+        for name in preserve_list:
+            if name in candidates and name not in seen:
+                preserved.append(name)
+                seen.add(name)
+        context_text = str(context or "").strip().lower()
+        context_tokens = self._tool_shortlist_tokens(context_text)
+        context_intents = self._tool_shortlist_intents(context_text)
+        pure_web_research = self._is_pure_web_research_intent(context_intents)
+        wants_local_results = self._web_research_prefers_local_results(context_text)
+        wants_video_results = self._web_research_prefers_video_results(context_text)
+        ranked: List[Tuple[float, str]] = []
+        for exposed_name, row in candidates.items():
+            if exposed_name in seen:
+                continue
+            description = str((row or {}).get("description") or "")
+            server_name = str((row or {}).get("server") or "")
+            raw_name = str((row or {}).get("raw_name") or exposed_name)
+            haystack = " ".join([exposed_name, raw_name, server_name, description]).lower()
+            if self._tool_shortlist_blocked(
+                context_intents=context_intents,
+                context_text=context_text,
+                server_name=server_name,
+                exposed_name=exposed_name,
+                raw_name=raw_name,
+                haystack=haystack,
+            ):
+                continue
+            hay_tokens = self._tool_shortlist_tokens(haystack)
+            overlap = len(context_tokens & hay_tokens)
+            score = float(overlap * 4)
+            weak_overlap = overlap == 0
+            for token in context_tokens:
+                if token and token in exposed_name.lower():
+                    score += 2.5
+                if token and token in raw_name.lower():
+                    score += 2.0
+                if token and token in description.lower():
+                    score += 1.0
+            if context_text:
+                if raw_name.lower() in context_text:
+                    score += 8.0
+                if exposed_name.lower() in context_text:
+                    score += 8.0
+                if server_name and server_name.lower() in context_text:
+                    score += 3.0
+            if "calendar" in context_intents:
+                calendar_terms = ("calendar", "event", "events", "reminder", "reminders", "appointment", "appointments")
+                drive_terms = (
+                    "drive",
+                    "file",
+                    "files",
+                    "folder",
+                    "folders",
+                    "docs",
+                    "sheets",
+                    "slides",
+                    "content",
+                    "public_access",
+                    "public access",
+                )
+                if any(token in haystack for token in calendar_terms):
+                    score += 6.0
+                    if server_name == "google-workspace":
+                        score += 4.0
+                elif server_name == "google-workspace":
+                    score += 1.0
+                if any(token in haystack for token in drive_terms):
+                    score -= 5.0
+                if any(token in haystack for token in ("spellcheck", "clone_element", "extract_element", "browser", "screenshot")):
+                    score -= 4.0
+                if "web" not in context_intents and server_name in {"brave-search", "searxng", "browserbase", "stealth-browser"}:
+                    score -= 4.5
+            if "workspace" in context_intents and server_name == "google-workspace":
+                score += 3.0
+            if "messaging" in context_intents and server_name == "call-me":
+                score += 4.0
+            if "web" in context_intents and server_name in {"brave-search", "searxng", "wikipedia", "grokipedia"}:
+                score += 3.0
+            if pure_web_research:
+                if server_name in {"brave-search", "searxng", "wikipedia", "grokipedia"}:
+                    score += 4.0
+                elif server_name not in {"native"}:
+                    score -= 3.0
+                if any(token in raw_name.lower() for token in ("local_search", "local-search", "local")) and not wants_local_results:
+                    score -= 10.0
+                if any(token in raw_name.lower() for token in ("video_search", "video-search", "video")) and not wants_video_results:
+                    score -= 7.0
+            if weak_overlap and context_intents:
+                score -= 2.0
+            ranked.append((score, exposed_name))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        target_size = max(max_items, len(preserved))
+        selected = list(preserved)
+        for _, exposed_name in ranked:
+            if len(selected) >= target_size:
+                break
+            if exposed_name not in seen:
+                selected.append(exposed_name)
+                seen.add(exposed_name)
+        return selected[:target_size]
 
     async def _route_tool_names(
         self,
@@ -3653,7 +4288,93 @@ class LLMBridge:
             detail,
         )
 
-    def _sanitize_response_text(self, text: str) -> str:
+    @staticmethod
+    def _successful_request_tools(request_tool_exec: Optional[List[Dict[str, Any]]]) -> set[str]:
+        if not isinstance(request_tool_exec, list):
+            return set()
+        successful: set[str] = set()
+        for entry in request_tool_exec:
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status") or "").strip().lower()
+            if status not in {"success", "ok", "completed"}:
+                continue
+            for key in ("resolved_tool_name", "tool_name"):
+                name = str(entry.get(key) or "").strip()
+                if name:
+                    successful.add(name)
+        return successful
+
+    @staticmethod
+    def _claims_action_completed(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+        completion_tokens = (
+            " queued",
+            "scheduled for",
+            "is scheduled",
+            "has been scheduled",
+            "reminder set for",
+            "event created for",
+            "task created for",
+            "is armed",
+            "has been armed",
+            "all set for",
+        )
+        return any(token in lowered for token in completion_tokens)
+
+    def _sanitize_unverified_action_claims(
+        self,
+        text: str,
+        request_tool_exec: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        if not text or not self._claims_action_completed(text):
+            return text
+
+        lowered = text.lower()
+        successful_tools = self._successful_request_tools(request_tool_exec)
+        call_success = bool(
+            successful_tools.intersection({"initiate_call", "send_sms", "send_mms"})
+        )
+        scheduler_success = bool(
+            successful_tools.intersection(
+                {"create_event", "set_reminder", "create_task", "create_task_list", "modify_event"}
+            )
+        )
+
+        call_claim = bool(
+            re.search(r"\b(wake(?:-|\s)?up call|wake call|phone call|call)\b", lowered)
+        )
+        scheduler_claim = bool(
+            re.search(r"\b(reminder|calendar event|event|task|schedule|scheduled|queued|armed)\b", lowered)
+        )
+
+        missing_call_confirmation = call_claim and not call_success
+        missing_scheduler_confirmation = scheduler_claim and not (scheduler_success or call_success)
+        if not (missing_call_confirmation or missing_scheduler_confirmation):
+            return text
+
+        if missing_call_confirmation and missing_scheduler_confirmation:
+            return (
+                "I haven't confirmed successful call/scheduler tool execution yet, "
+                "so this is not armed. I need to run those tools first."
+            )
+        if missing_call_confirmation:
+            return (
+                "I haven't confirmed a successful call tool execution yet, "
+                "so the wake call is not armed."
+            )
+        return (
+            "I haven't confirmed a successful scheduler tool execution yet, "
+            "so the schedule/reminder is not armed."
+        )
+
+    def _sanitize_response_text(
+        self,
+        text: str,
+        request_tool_exec: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         enabled = os.getenv("VERA_RESPONSE_SANITIZE", "1").strip().lower() in {"1", "true", "yes", "on"}
         if not enabled or not text:
             return text
@@ -3690,22 +4411,38 @@ class LLMBridge:
         if allow_tokens:
             for token in allow_tokens:
                 if token.lower() in lowered_last:
-                    return text.rstrip()
+                    return self._sanitize_unverified_action_claims(
+                        text.rstrip(),
+                        request_tool_exec=request_tool_exec,
+                    )
 
         if skip_tokens:
             lowered_text = text.lower()
             for token in skip_tokens:
                 if token.lower() in lowered_text:
-                    return text.rstrip()
+                    return self._sanitize_unverified_action_claims(
+                        text.rstrip(),
+                        request_tool_exec=request_tool_exec,
+                    )
 
         for pattern in patterns:
             if re.search(pattern, last_line, re.IGNORECASE):
                 stripped_lines = lines[:last_index]
                 sanitized = self._sanitize_tool_availability_claims("\n".join(stripped_lines).rstrip())
-                return self._sanitize_push_manual_fallback(sanitized)
+                sanitized = self._sanitize_push_manual_fallback(sanitized)
+                sanitized = self._sanitize_callme_default_recipient_prompt(sanitized)
+                return self._sanitize_unverified_action_claims(
+                    sanitized,
+                    request_tool_exec=request_tool_exec,
+                )
 
         sanitized = self._sanitize_tool_availability_claims(text.rstrip())
-        return self._sanitize_push_manual_fallback(sanitized)
+        sanitized = self._sanitize_push_manual_fallback(sanitized)
+        sanitized = self._sanitize_callme_default_recipient_prompt(sanitized)
+        return self._sanitize_unverified_action_claims(
+            sanitized,
+            request_tool_exec=request_tool_exec,
+        )
 
     def _sanitize_tool_availability_claims(self, text: str) -> str:
         if not text:
@@ -3869,6 +4606,53 @@ class LLMBridge:
         if not cleaned:
             return advisory
         if "immediate native push" not in cleaned.lower():
+            cleaned = f"{cleaned}\n\n{advisory}"
+        return cleaned
+
+    def _sanitize_callme_default_recipient_prompt(self, text: str) -> str:
+        if not text:
+            return text
+
+        default_phone = str(os.getenv("CALLME_USER_PHONE_NUMBER", "")).strip()
+        if not default_phone:
+            return text
+
+        payload = self.last_tool_payload if isinstance(self.last_tool_payload, dict) else {}
+        tool_names = payload.get("tool_names") if isinstance(payload, dict) else []
+        if not isinstance(tool_names, list):
+            return text
+
+        tool_set = {str(name).strip() for name in tool_names if isinstance(name, str)}
+        has_callme = bool(tool_set.intersection({"initiate_call", "send_sms", "send_mms"}))
+        if not has_callme:
+            return text
+
+        lowered = text.lower()
+        ask_tokens = (
+            "e.164",
+            "recipient_phone",
+            "reply your",
+            "confirm \"arm default\"",
+            "arm default",
+            "phone number to call",
+        )
+        if not any(token in lowered for token in ask_tokens):
+            return text
+
+        filtered: List[str] = []
+        for line in text.splitlines():
+            lower_line = line.strip().lower()
+            if any(token in lower_line for token in ask_tokens):
+                continue
+            filtered.append(line)
+        cleaned = "\n".join(filtered).strip()
+        advisory = (
+            "Call-me default recipient is already configured, so no phone number is needed unless "
+            "you want to override the target."
+        )
+        if not cleaned:
+            return advisory
+        if advisory.lower() not in cleaned.lower():
             cleaned = f"{cleaned}\n\n{advisory}"
         return cleaned
 
@@ -4098,6 +4882,7 @@ class LLMBridge:
             self._trace_workflow("record_replay_skip reason=empty_workflow_plan")
             return
         forced_steps = int(workflow_plan.get("forced_steps", 0) or 0)
+        override_active = bool(workflow_plan.get("failure_recovery_override", False))
         chain = workflow_plan.get("tool_chain", [])
         if forced_steps <= 0 or not isinstance(chain, list) or len(chain) < 2:
             self._record_workflow_trace_event(
@@ -4130,6 +4915,7 @@ class LLMBridge:
             chain=list(chain),
             conversation_id=str(conversation_id or "default"),
             signature=str(workflow_plan.get("signature") or ""),
+            failure_recovery_override=bool(override_active),
             error=str(error or "")[:120],
         )
         self._trace_workflow(
@@ -4157,7 +4943,17 @@ class LLMBridge:
                 chain=list(chain),
                 conversation_id=str(conversation_id or "default"),
                 signature=str(workflow_plan.get("signature") or ""),
+                failure_recovery_override=bool(override_active),
             )
+            if override_active:
+                self._record_workflow_trace_event(
+                    "replay_override_done",
+                    success=bool(success),
+                    forced_steps=forced_steps,
+                    chain=list(chain),
+                    conversation_id=str(conversation_id or "default"),
+                    signature=str(workflow_plan.get("signature") or ""),
+                )
             self._trace_workflow("record_replay_done")
         except Exception:
             self._record_workflow_trace_event(
@@ -4167,8 +4963,19 @@ class LLMBridge:
                 chain=list(chain),
                 conversation_id=str(conversation_id or "default"),
                 signature=str(workflow_plan.get("signature") or ""),
+                failure_recovery_override=bool(override_active),
                 error=str(error or "")[:120],
             )
+            if override_active:
+                self._record_workflow_trace_event(
+                    "replay_override_error",
+                    success=bool(success),
+                    forced_steps=forced_steps,
+                    chain=list(chain),
+                    conversation_id=str(conversation_id or "default"),
+                    signature=str(workflow_plan.get("signature") or ""),
+                    error=str(error or "")[:120],
+                )
             self._trace_workflow("record_replay_error")
             logger.debug("Suppressed Exception in llm_bridge")
 
@@ -4238,6 +5045,82 @@ class LLMBridge:
             ordered = safe + risky
 
         return ordered
+
+    @staticmethod
+    def _apply_failure_recovery_override(
+        workflow_plan: Dict[str, Any],
+        workflow_chain: List[str],
+        failure_plan: Dict[str, Any],
+        allowed_names: List[str],
+    ) -> Dict[str, Any]:
+        chain = [
+            str(name).strip()
+            for name in list(workflow_chain or [])
+            if str(name).strip()
+        ]
+        if len(chain) < 2:
+            return {"applied": False, "reason": "chain_too_short", "tool_chain": chain}
+        if not isinstance(failure_plan, dict):
+            return {"applied": False, "reason": "no_failure_plan", "tool_chain": chain}
+
+        allowed = {
+            str(name).strip()
+            for name in list(allowed_names or [])
+            if str(name).strip()
+        }
+        avoid_tools = {
+            str(name).strip()
+            for name in list(failure_plan.get("avoid_tools", []) or [])
+            if str(name).strip()
+        }
+        recovery_chain_raw = [
+            str(name).strip()
+            for name in list(failure_plan.get("suggested_recovery_chain", []) or [])
+            if str(name).strip() and str(name).strip() in allowed
+        ]
+        if len(recovery_chain_raw) < 2:
+            return {"applied": False, "reason": "recovery_chain_unavailable", "tool_chain": chain}
+        recovery_overlap = [name for name in recovery_chain_raw if name in avoid_tools]
+        recovery_chain = [name for name in recovery_chain_raw if name not in avoid_tools]
+        if len(recovery_chain) < 2:
+            return {
+                "applied": False,
+                "reason": "recovery_chain_avoid_overlap",
+                "tool_chain": chain,
+                "overlap": recovery_overlap,
+            }
+
+        overlap = [name for name in chain if name in avoid_tools]
+        failure_penalty = 0.0
+        try:
+            failure_penalty = float(workflow_plan.get("failure_penalty", 0.0) or 0.0)
+        except Exception:
+            failure_penalty = 0.0
+        override_min_penalty = 0.0
+        try:
+            override_min_penalty = float(os.getenv("VERA_WORKFLOW_RECOVERY_OVERRIDE_MIN_PENALTY", "0.60") or 0.60)
+        except Exception:
+            override_min_penalty = 0.60
+        override_min_penalty = max(0.0, min(1.0, override_min_penalty))
+
+        if not overlap and failure_penalty < override_min_penalty:
+            return {"applied": False, "reason": "no_override_trigger", "tool_chain": chain}
+
+        deduped_recovery = []
+        seen = set()
+        for name in recovery_chain:
+            if name in seen:
+                continue
+            deduped_recovery.append(name)
+            seen.add(name)
+        if len(deduped_recovery) < 2:
+            return {"applied": False, "reason": "recovery_chain_too_short", "tool_chain": chain}
+        return {
+            "applied": True,
+            "reason": "avoid_overlap" if overlap else "high_failure_penalty",
+            "tool_chain": deduped_recovery,
+            "overlap": overlap,
+        }
 
     @staticmethod
     def _failure_plan_system_addendum(failure_plan: Dict[str, Any]) -> str:
@@ -4426,6 +5309,7 @@ class LLMBridge:
         generation_config: Optional[Dict[str, Any]],
         conversation_id: str,
         fallback_reason: str = "",
+        request_tool_exec: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         if not isinstance(history_ref, list) or not history_ref:
             return ""
@@ -4466,7 +5350,10 @@ class LLMBridge:
                     conversation_id=str(conversation_id or "default"),
                 )
                 return ""
-            sanitized = self._sanitize_response_text(content)
+            sanitized = self._sanitize_response_text(
+                content,
+                request_tool_exec=request_tool_exec,
+            )
             if sanitized != content:
                 message["content"] = sanitized
             history_ref.append(message)
@@ -4504,6 +5391,8 @@ class LLMBridge:
         self.history.append({"role": "user", "content": user_message})
         tools_used: List[str] = []
         tools_failed: set[str] = set()
+        request_tool_exec: List[Dict[str, Any]] = []
+        self._active_request_tool_execution = request_tool_exec
         self.last_tools_used = []
         workflow_failed = False
         workflow_error = ""
@@ -4728,7 +5617,10 @@ class LLMBridge:
                     error=replay_error,
                 )
                 self._active_workflow_plan = dict(workflow_plan)
-                sanitized = self._sanitize_response_text(content)
+                sanitized = self._sanitize_response_text(
+                    content,
+                    request_tool_exec=request_tool_exec,
+                )
                 if sanitized != content:
                     message["content"] = sanitized
                 return sanitized
@@ -4804,6 +5696,7 @@ class LLMBridge:
 
                 exec_entry = {
                     "tool_name": tool_name,
+                    "resolved_tool_name": resolved_tool_name or tool_name,
                     "server": getattr(self, "_tool_to_server", {}).get(tool_name, ""),
                     "status": "success" if exec_status == "ok" else "error",
                     "duration_ms": int((time.time() - exec_start) * 1000),
@@ -4852,6 +5745,7 @@ class LLMBridge:
                 self.tool_execution_history.append(exec_entry)
                 if len(self.tool_execution_history) > 100:
                     self.tool_execution_history = self.tool_execution_history[-100:]
+                request_tool_exec.append(dict(exec_entry))
 
                 self.history.append({
                     "role": "tool",
@@ -4947,8 +5841,10 @@ class LLMBridge:
                 generation_config=self._genome_generation_config,
                 conversation_id="default",
                 fallback_reason=workflow_error or str(workflow_plan.get("abandon_reason") or ""),
+                request_tool_exec=request_tool_exec,
             )
         self._active_workflow_plan = dict(workflow_plan)
+        self._active_request_tool_execution = []
         if fallback_response:
             return fallback_response
         return self._final_failure_response(workflow_error)
@@ -4973,6 +5869,8 @@ class LLMBridge:
 
         tools_used: List[str] = []
         tools_failed: set[str] = set()
+        request_tool_exec: List[Dict[str, Any]] = []
+        self._active_request_tool_execution = request_tool_exec
         workflow_failed = False
         workflow_error = ""
         effective_generation_config = generation_config or self._genome_generation_config
@@ -5285,7 +6183,10 @@ class LLMBridge:
                     error=replay_error,
                 )
                 self._active_workflow_plan = dict(workflow_plan)
-                sanitized = self._sanitize_response_text(content)
+                sanitized = self._sanitize_response_text(
+                    content,
+                    request_tool_exec=request_tool_exec,
+                )
                 if sanitized != content:
                     message["content"] = sanitized
                 return sanitized
@@ -5362,6 +6263,7 @@ class LLMBridge:
                 # Record execution in history
                 exec_entry = {
                     "tool_name": tool_name,
+                    "resolved_tool_name": resolved_tool_name or tool_name,
                     "server": getattr(self, "_tool_to_server", {}).get(tool_name, ""),
                     "status": "success" if exec_status == "ok" else "error",
                     "duration_ms": int((time.time() - exec_start) * 1000),
@@ -5411,6 +6313,7 @@ class LLMBridge:
                 # Cap at 100 entries
                 if len(self.tool_execution_history) > 100:
                     self.tool_execution_history = self.tool_execution_history[-100:]
+                request_tool_exec.append(dict(exec_entry))
 
                 working_history.append({
                     "role": "tool",
@@ -5510,8 +6413,10 @@ class LLMBridge:
                 generation_config=effective_generation_config,
                 conversation_id=conversation_id or "default",
                 fallback_reason=workflow_error or str(workflow_plan.get("abandon_reason") or ""),
+                request_tool_exec=request_tool_exec,
             )
         self._active_workflow_plan = dict(workflow_plan)
+        self._active_request_tool_execution = []
         if fallback_response:
             if persist_history:
                 self.history = working_history

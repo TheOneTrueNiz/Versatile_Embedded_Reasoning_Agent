@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
 import threading
@@ -140,6 +141,42 @@ def _parse_path_list(raw_value: str) -> List[str]:
         seen.add(normalized_path)
         normalized.append(normalized_path)
     return normalized
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    value = str(os.getenv(name, default)).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _default_filesystem_roots() -> List[str]:
+    """
+    Return broad but user-scoped filesystem roots for day-to-day operation.
+
+    These defaults expand Desktop/Documents access without granting raw system
+    roots like /etc, /proc, or /.
+    """
+    home = Path.home()
+    candidates = [
+        home,
+        home / "Desktop",
+        home / "Documents",
+        home / "Downloads",
+        Path("/media"),
+        Path("/mnt"),
+        Path("/tmp"),
+    ]
+    roots: List[str] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = str(candidate.expanduser().resolve())
+        except Exception:
+            continue
+        if resolved in seen or not Path(resolved).exists():
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+    return roots
 
 
 # ============================================================================
@@ -815,7 +852,12 @@ class MCPOrchestrator:
 
     def _augment_filesystem_args(self, args: List[str]) -> List[str]:
         """Add env-configured filesystem roots without clobbering configured defaults."""
+        source_label = "VERA_FILESYSTEM_EXTRA_ROOTS"
         extra_roots = _parse_path_list(os.getenv("VERA_FILESYSTEM_EXTRA_ROOTS", ""))
+        if not extra_roots and _truthy_env("VERA_FILESYSTEM_AUTO_EXPAND_HOME", "1"):
+            extra_roots = _default_filesystem_roots()
+            source_label = "auto-expanded defaults"
+
         if not extra_roots:
             return list(args or [])
 
@@ -838,7 +880,7 @@ class MCPOrchestrator:
             appended += 1
 
         if appended > 0:
-            print(f"📁 Filesystem MCP: appended {appended} extra root(s) from VERA_FILESYSTEM_EXTRA_ROOTS")
+            print(f"📁 Filesystem MCP: appended {appended} extra root(s) from {source_label}")
         return augmented
 
     def _load_configs(self):
@@ -891,6 +933,155 @@ class MCPOrchestrator:
             print(f"❌ Invalid JSON in MCP config file: {e}")
         except Exception as e:
             print(f"❌ Failed to load MCP configs: {e}")
+
+    @staticmethod
+    def _load_server_runtime_status(server_name: str) -> Dict[str, Any]:
+        if server_name != "call-me":
+            return {}
+        status_path = Path(os.getenv("CALLME_RUNTIME_STATUS_PATH", "vera_memory/callme_runtime_status.json"))
+        try:
+            if not status_path.exists():
+                return {}
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception as exc:
+            logger.warning("Failed to load runtime status for %s: %s", server_name, exc)
+            return {}
+
+    @staticmethod
+    def _extract_tool_error_text(result: Any) -> str:
+        """Best-effort extraction of MCP tool error text."""
+        if isinstance(result, dict):
+            parts: List[str] = []
+            content = result.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text.strip())
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                text = structured.get("content")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+            if parts:
+                return " | ".join(parts)
+        return str(result or "")
+
+    @staticmethod
+    def _path_within_root(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except Exception:
+            return False
+
+    def _filesystem_allowed_roots(self) -> List[Path]:
+        config = self.configs.get("filesystem")
+        if not config:
+            return []
+        args = list(config.args or [])
+        marker = "@modelcontextprotocol/server-filesystem"
+        root_start = 0
+        if marker in args:
+            root_start = args.index(marker) + 1
+
+        roots: List[Path] = []
+        for item in args[root_start:]:
+            if not isinstance(item, str):
+                continue
+            try:
+                root = Path(item).expanduser().resolve()
+            except Exception:
+                continue
+            if root.exists():
+                roots.append(root)
+        return roots
+
+    def _path_allowed_for_filesystem(self, path: Path) -> bool:
+        roots = self._filesystem_allowed_roots()
+        if not roots:
+            return False
+        return any(self._path_within_root(path, root) for root in roots)
+
+    def _fallback_move_file_cross_device(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback for EXDEV move_file errors: copy + verify + delete."""
+        source_raw = str(params.get("source", "")).strip()
+        destination_raw = str(params.get("destination", "")).strip()
+        if not source_raw or not destination_raw:
+            return {
+                "content": [{"type": "text", "text": "move_file fallback failed: source and destination are required"}],
+                "isError": True,
+            }
+
+        source = Path(source_raw).expanduser()
+        destination = Path(destination_raw).expanduser()
+        if not source.is_absolute():
+            source = (Path.cwd() / source).resolve()
+        else:
+            source = source.resolve()
+        if not destination.is_absolute():
+            destination = (Path.cwd() / destination).resolve()
+        else:
+            destination = destination.resolve()
+
+        if not source.exists():
+            return {
+                "content": [{"type": "text", "text": f"move_file fallback failed: source not found ({source})"}],
+                "isError": True,
+            }
+
+        dest_parent = destination.parent.resolve()
+        if not dest_parent.exists():
+            return {
+                "content": [{"type": "text", "text": f"move_file fallback failed: destination parent does not exist ({dest_parent})"}],
+                "isError": True,
+            }
+
+        if not self._path_allowed_for_filesystem(source):
+            return {
+                "content": [{"type": "text", "text": f"move_file fallback denied: source outside allowed roots ({source})"}],
+                "isError": True,
+            }
+        if not self._path_allowed_for_filesystem(destination):
+            return {
+                "content": [{"type": "text", "text": f"move_file fallback denied: destination outside allowed roots ({destination})"}],
+                "isError": True,
+            }
+
+        size_before = source.stat().st_size if source.is_file() else None
+        try:
+            moved_path = Path(shutil.move(str(source), str(destination))).resolve()
+        except Exception as exc:
+            return {
+                "content": [{"type": "text", "text": f"move_file fallback failed during copy/delete: {exc}"}],
+                "isError": True,
+            }
+
+        verified = moved_path.exists() and not source.exists()
+        if verified and size_before is not None and moved_path.is_file():
+            verified = moved_path.stat().st_size == size_before
+
+        if not verified:
+            return {
+                "content": [{"type": "text", "text": "move_file fallback copy/delete could not be verified"}],
+                "isError": True,
+            }
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Moved {source} -> {moved_path} (fallback: cross-device copy+delete)"
+            }],
+            "structuredContent": {
+                "source": str(source),
+                "destination": str(destination),
+                "moved_path": str(moved_path),
+                "fallback": "copy_delete",
+                "verified": True,
+            },
+        }
 
     def _get_missing_env(self, config: MCPServerConfig) -> List[str]:
         """Return list of missing required env keys for a config."""
@@ -987,7 +1178,7 @@ class MCPOrchestrator:
 
             # Best-effort initialize handshake (some servers require it)
             try:
-                connection.initialize(timeout=5)
+                connection.initialize(timeout=self._compute_initialize_timeout(config))
             except Exception as exc:
                 logger.debug("Suppressed %s: %s", type(exc).__name__, exc)
 
@@ -1007,7 +1198,7 @@ class MCPOrchestrator:
                 thread.start()
                 self._stderr_threads[server_name] = thread
 
-            # Initial health check
+            # Initial health check with bounded warm-up polling.
             if not self._interruptible_sleep(float(config.startup_grace)):
                 print(f"⏹️  MCP startup interrupted during shutdown: {server_name}")
                 self._cleanup_server(server_name)
@@ -1016,12 +1207,23 @@ class MCPOrchestrator:
                 print(f"⏹️  MCP startup interrupted during shutdown: {server_name}")
                 self._cleanup_server(server_name)
                 return False
-            if self._health_check(server_name):
-                print(f"✅ MCP server {server_name} started successfully (PID: {process.pid})")
-                return True
-            else:
-                print(f"⚠️  MCP server {server_name} started but failed health check")
-                return False
+            health_deadline = time.time() + self._compute_list_tools_timeout(config, connection)
+            while True:
+                if self._health_check(server_name):
+                    print(f"✅ MCP server {server_name} started successfully (PID: {process.pid})")
+                    return True
+                if self._shutdown_requested:
+                    print(f"⏹️  MCP startup interrupted during shutdown: {server_name}")
+                    self._cleanup_server(server_name)
+                    return False
+                if time.time() >= health_deadline:
+                    print(f"⚠️  MCP server {server_name} started but failed health check")
+                    self._cleanup_server(server_name)
+                    return False
+                if not self._interruptible_sleep(1.0):
+                    print(f"⏹️  MCP startup interrupted during shutdown: {server_name}")
+                    self._cleanup_server(server_name)
+                    return False
 
         except Exception as e:
             print(f"❌ Failed to start MCP server {server_name}: {e}")
@@ -1059,6 +1261,23 @@ class MCPOrchestrator:
             if remaining <= 0:
                 return True
             time.sleep(min(max(0.05, poll_interval), remaining))
+
+    @staticmethod
+    def _compute_initialize_timeout(config: MCPServerConfig) -> float:
+        """Compute a per-server initialize handshake timeout."""
+        tool_timeout = max(5.0, float(getattr(config, "tool_timeout", 30.0) or 30.0))
+        startup_grace = max(0.0, float(getattr(config, "startup_grace", 1) or 1.0))
+        return max(10.0, min(tool_timeout, startup_grace + 20.0))
+
+    @staticmethod
+    def _compute_list_tools_timeout(config: Optional[MCPServerConfig], connection: MCPConnection) -> float:
+        """Compute a per-server list-tools timeout."""
+        base = float(getattr(connection, "LIST_TOOLS_TIMEOUT", 10.0) or 10.0)
+        if config is None:
+            return base
+        tool_timeout = max(base, float(getattr(config, "tool_timeout", base) or base))
+        startup_grace = max(0.0, float(getattr(config, "startup_grace", 1) or 1.0))
+        return max(base, min(tool_timeout, startup_grace + 20.0))
 
     def _start_server_with_timeout(self, server_name: str, timeout_seconds: float) -> bool:
         """Start a server with a hard timeout so one hung start does not block all autostarts."""
@@ -1247,7 +1466,10 @@ class MCPOrchestrator:
         elif response == "timeout":
             # Non-blocking timeout - server may be slow or unresponsive
             try:
-                connection.list_tools(timeout=connection.LIST_TOOLS_TIMEOUT, strict=True)
+                connection.list_tools(
+                    timeout=self._compute_list_tools_timeout(server.config, connection),
+                    strict=True,
+                )
                 server.health_status = "healthy"
                 server.last_health_check = datetime.now()
                 return True
@@ -1351,10 +1573,23 @@ class MCPOrchestrator:
         try:
             # Call tool
             result = connection.call_tool(tool_name, params, timeout=timeout)
+            if server_name == "filesystem" and tool_name == "move_file":
+                error_text = self._extract_tool_error_text(result).lower()
+                if isinstance(result, dict) and result.get("isError") and (
+                    "exdev" in error_text or "cross-device link" in error_text
+                ):
+                    logger.info("Applying filesystem move_file EXDEV fallback (copy+delete)")
+                    return self._fallback_move_file_cross_device(params)
             return result
 
         except Exception as e:
             err_str = str(e).lower()
+
+            if server_name == "filesystem" and tool_name == "move_file" and (
+                "exdev" in err_str or "cross-device link" in err_str
+            ):
+                logger.info("Applying filesystem move_file EXDEV exception fallback (copy+delete)")
+                return self._fallback_move_file_cross_device(params)
 
             if self._shutdown_requested:
                 raise Exception(f"MCP shutdown in progress ({server_name}.{tool_name})") from e
@@ -1536,6 +1771,13 @@ class MCPOrchestrator:
 
         for server_name, connection in list(self.connections.items()):
             try:
+                server = self.servers.get(server_name)
+                if server is None or server.process.poll() is not None:
+                    tools[server_name] = []
+                    continue
+                if str(getattr(server, "health_status", "") or "").strip().lower() not in {"healthy", "unknown"}:
+                    tools[server_name] = []
+                    continue
                 timeout = None
                 config = self.configs.get(server_name)
                 if config and config.tool_timeout:
@@ -1585,11 +1827,33 @@ class MCPOrchestrator:
             is_alive = server is not None and server.process.poll() is None
             uptime = (datetime.now() - server.started_at).total_seconds() if server else 0.0
             missing_env = self._get_missing_env(config)
+            runtime_status = self._load_server_runtime_status(server_name)
+            health = server.health_status if server else ("starting" if is_starting else "stopped")
+            effective_health = health
+            health_source = "mcp"
+            warning = ""
+            if runtime_status.get("degraded"):
+                tunnel_kind = str(runtime_status.get("tunnel_kind") or "").strip()
+                degraded_reason = str(runtime_status.get("degraded_reason") or "").strip()
+                if tunnel_kind:
+                    warning = f"{server_name} running in degraded tunnel mode via {tunnel_kind}"
+                    if degraded_reason:
+                        warning += f" ({degraded_reason})"
+            if (
+                server_name == "call-me"
+                and runtime_status.get("connected") is True
+                and str(runtime_status.get("phase") or "").strip().lower() == "ready"
+                and str(health or "").strip().lower() in {"unknown", "starting"}
+            ):
+                effective_health = "healthy"
+                health_source = "runtime_status"
 
             status["servers"][server_name] = {
                 "running": is_alive,
                 "pid": server.process.pid if is_alive else None,
-                "health": server.health_status if server else ("starting" if is_starting else "stopped"),
+                "health": health,
+                "effective_health": effective_health,
+                "health_source": health_source,
                 "uptime_seconds": uptime if is_alive else 0.0,
                 "restart_count": server.restart_count if server else 0,
                 "last_health_check": server.last_health_check.isoformat() if server and server.last_health_check else None,
@@ -1598,7 +1862,9 @@ class MCPOrchestrator:
                 "required_env": list(config.required_env),
                 "missing_env": missing_env,
                 "categories": list(config.categories or []),
-                "description": config.description or ""
+                "description": config.description or "",
+                "runtime_status": runtime_status,
+                "warning": warning,
             }
 
         return status
